@@ -16,6 +16,7 @@ import {
   recordProviderSuccess,
 } from "../providerBudget";
 import { resolveCredential } from "../config/providerConfig";
+import { profileNaicsCodes } from "../providers/profileQueryTerms";
 
 const TANGO_BASE_URL = "https://tango.makegov.com";
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -61,8 +62,9 @@ interface TangoForecastRaw {
   is_active?: boolean | null;
   status?: string | null;
   primary_contact?: TangoForecastContact | null;
-  place_of_performance?: TangoForecastPlace | null;
-  estimated_period?: TangoForecastPeriod | null;
+  // Tango's data dictionary documents these four as display strings; older payloads used objects, so both are read.
+  place_of_performance?: TangoForecastPlace | string | null;
+  estimated_period?: TangoForecastPeriod | string | null;
   set_aside?: string | null;
   contract_vehicle?: string | null;
   organization?: TangoForecastOrg | null;
@@ -91,6 +93,9 @@ export interface TangoForecastRecord {
   naics: string | null;
   setAside: string | null;
   state: string | null;
+  placeOfPerformance: string | null;
+  estimatedPeriod: string | null;
+  contractVehicle: string | null;
   valueRangeText: string | null;
   valueLow: null;
   valueHigh: null;
@@ -121,7 +126,46 @@ function asNumber(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function normalizeTangoForecast(raw: TangoForecastRaw): TangoForecastRecord {
+const US_STATE_SUFFIX = /(?:,|\s)\s*([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s*$/;
+
+/** Place of performance as one display string, from either the documented string or an object payload. */
+export function tangoPlaceText(value: unknown): string | null {
+  if (typeof value === "string") return asString(value);
+  if (value && typeof value === "object") {
+    const place = value as TangoForecastPlace;
+    const parts = [asString(place.city), asString(place.state), asString(place.country)].filter(
+      (part): part is string => part !== null,
+    );
+    return parts.length > 0 ? parts.join(", ") : null;
+  }
+  return null;
+}
+
+/** Two-letter state: from an object payload, or from a trailing ", ST" in a display string. */
+export function tangoPlaceState(value: unknown): string | null {
+  if (value && typeof value === "object") return asString((value as TangoForecastPlace).state);
+  if (typeof value === "string") {
+    const match = US_STATE_SUFFIX.exec(value.trim());
+    return match?.[1] ?? null;
+  }
+  return null;
+}
+
+function tangoPeriodText(value: unknown): string | null {
+  if (typeof value === "string") return asString(value);
+  if (value && typeof value === "object") {
+    const period = value as TangoForecastPeriod;
+    const base = asNumber(period.base_years);
+    const option = asNumber(period.option_years);
+    const parts: string[] = [];
+    if (base !== null && period.base_years != null) parts.push(`${base} base year${base === 1 ? "" : "s"}`);
+    if (option !== null && period.option_years != null) parts.push(`${option} option year${option === 1 ? "" : "s"}`);
+    return parts.length > 0 ? parts.join(" + ") : null;
+  }
+  return null;
+}
+
+export function normalizeTangoForecast(raw: TangoForecastRaw): TangoForecastRecord {
   const rawId = String(raw.id ?? "");
   const source = asString(raw.source_system) ?? "tango";
   const externalId = asString(raw.external_id) ?? rawId;
@@ -134,7 +178,7 @@ function normalizeTangoForecast(raw: TangoForecastRaw): TangoForecastRecord {
     raw.organization?.name && raw.agency && raw.organization.name !== raw.agency
       ? asString(raw.agency)
       : null;
-  const state = asString(raw.place_of_performance?.state);
+  const state = tangoPlaceState(raw.place_of_performance);
   const status = raw.is_active === false ? "archived" : (asString(raw.status) ?? "forecast");
   const awardDate = asString(raw.anticipated_award_date);
 
@@ -149,6 +193,9 @@ function normalizeTangoForecast(raw: TangoForecastRaw): TangoForecastRecord {
     naics: asString(raw.naics_code),
     setAside: asString(raw.set_aside),
     state,
+    placeOfPerformance: tangoPlaceText(raw.place_of_performance),
+    estimatedPeriod: tangoPeriodText(raw.estimated_period),
+    contractVehicle: asString(raw.contract_vehicle),
     valueRangeText: null,
     valueLow: null,
     valueHigh: null,
@@ -268,8 +315,10 @@ export async function fetchTangoForecasts(
       endpoint.searchParams.set("naics_code", filters.naics);
     }
   } else {
-    // Default: occupational health / professional services NAICS prefixes
-    endpoint.searchParams.set("naics_starts_with", "541");
+    // Default: the Occu-Med NAICS codes from the relevance profile (Tango accepts "|" for OR). With no profile
+    // codes the request stays unfiltered by NAICS and the relevance gate decides.
+    const profileCodes = await profileNaicsCodes(12);
+    if (profileCodes.length > 0) endpoint.searchParams.set("naics_code", profileCodes.join("|"));
   }
 
   if (filters.fiscalYear) {
@@ -319,35 +368,4 @@ export async function fetchTangoForecasts(
       error: error instanceof Error ? error.message : String(error),
     };
   }
-}
-
-/**
- * Recompete variant: fetches all active Tango forecasts and returns those that
- * have an anticipated_award_date in the near future (within 3 years). Tango's
- * forecast data does not include incumbent info, so isRecompete is always false
- * here — but these records still feed into the unified ranking pipeline for the
- * Recompete Watch page so analysts see upcoming displacement opportunities.
- */
-export async function fetchTangoForecastsForRecompete(
-  focus?: string,
-  filters: { agency?: string; naics?: string } = {},
-): Promise<TangoForecastPoolResult> {
-  const result = await fetchTangoForecasts(focus, filters);
-  if (result.error && result.records.length === 0) return result;
-
-  const now = Date.now();
-  const THREE_YEARS_MS = 3 * 365 * 86_400_000;
-  const filtered = result.records.filter((record) => {
-    if (!record.estimatedAwardFiscalYear) return true;
-    const currentFy =
-      new Date().getUTCMonth() >= 9
-        ? new Date().getUTCFullYear() + 1
-        : new Date().getUTCFullYear();
-    return (
-      record.estimatedAwardFiscalYear >= currentFy &&
-      record.estimatedAwardFiscalYear <= currentFy + 3
-    );
-  });
-
-  return { ...result, records: filtered };
 }

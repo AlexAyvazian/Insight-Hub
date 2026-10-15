@@ -65,7 +65,18 @@ function deterministicScore(record: GovConRankableRecord, mode: GovConIntelligen
   const reasons = result.rejected
     ? [result.rejectReason ?? decision.reason]
     : result.reasons.slice(0, 4);
-  if (decision.discovery) reasons.push(`Occu-Med classification code ${decision.discovery.system} ${decision.discovery.code}`);
+  if (result.rejected && decision.verdict === "review") {
+    // Say what actually happened: nothing in the title/description named an Occu-Med service, and the record is only
+    // here because of its classification code or a partial signal. "Insufficient evidence" read like a rejection.
+    reasons.length = 0;
+    reasons.push(
+      decision.discovery
+        ? `Kept for review on classification code ${decision.discovery.system} ${decision.discovery.code} alone: no Occu-Med service wording in the title or description`
+        : "Borderline: partial Occu-Med signals, not enough to accept",
+    );
+  } else if (decision.discovery) {
+    reasons.push(`Occu-Med classification code ${decision.discovery.system} ${decision.discovery.code}`);
+  }
   if (mode === "recompete" && (record.incumbentName || record.isRecompete)) {
     reasons.push("Published recompete or incumbent signal");
   }

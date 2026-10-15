@@ -14,8 +14,12 @@ import {
 import { verifyRecompete } from "../lib/intelligence/recompeteVerification";
 import {
   fetchTangoForecasts,
-  fetchTangoForecastsForRecompete,
+  type TangoForecastRecord,
 } from "../lib/intelligence/tangoForecastProvider";
+import {
+  fetchTangoExpiringContracts,
+  type TangoExpiringContractRecord,
+} from "../lib/intelligence/tangoExpiringContracts";
 import { indexVectorDocuments } from "../lib/search/vectorIndex";
 import {
   providerBudgetAvailable,
@@ -359,10 +363,13 @@ async function fetchForecasts(
         clearTimeout(timer);
       }
     })(),
+    // Recompete Watch needs an incumbent: Tango forecasts never carry one, so recompete mode reads Tango's
+    // expiring contracts instead of relabelling the same forecast list the Forecasts page shows.
     mode === "recompete"
-      ? fetchTangoForecastsForRecompete(focus, tangoFilters)
+      ? fetchTangoExpiringContracts(focus, tangoFilters)
       : fetchTangoForecasts(focus, tangoFilters),
   ]);
+  const tangoRecords: Array<TangoForecastRecord | TangoExpiringContractRecord> = tangoResult.records;
 
   // If both sources failed, throw so the caller gets a proper error
   if (govconResult.error && tangoResult.error && govconResult.data.length === 0 && tangoResult.records.length === 0) {
@@ -377,8 +384,9 @@ async function fetchForecasts(
   const normalized = data.map(normalizeForecast);
   const semantic = normalized.filter((record) => isGovConSemanticCandidate(record, mode));
 
-  // Merge tango records into the candidate pool before suppression/ranking
-  const allCandidates = [...semantic, ...tangoResult.records];
+  // Tango records pass the same forward-looking / recompete gate as GovCon records before suppression and ranking.
+  const tangoCandidates = tangoRecords.filter((record) => isGovConSemanticCandidate(record, mode));
+  const allCandidates = [...semantic, ...tangoCandidates];
 
   const suppressions = await loadGovConSuppressions(mode).catch((error) => {
     logger.warn({ err: error, mode }, "GovCon feedback could not be loaded; continuing without persistent suppression");
@@ -396,7 +404,7 @@ async function fetchForecasts(
     pagination: {
       limit: asNumber(pagination.limit) ?? boundedInteger(searchParams.get("limit"), 50, 1, 100),
       offset: asNumber(pagination.offset) ?? boundedInteger(searchParams.get("offset"), 0, 0, 100_000),
-      total: asNumber(pagination.total) ?? (data.length + tangoResult.records.length),
+      total: asNumber(pagination.total) ?? (data.length + tangoRecords.length),
       hasNext: asBoolean(pagination.has_next),
     },
     sourcePageRecords: normalized.length + tangoResult.rawCount,
