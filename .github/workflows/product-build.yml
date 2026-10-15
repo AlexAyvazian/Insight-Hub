@@ -81,6 +81,9 @@ jobs:
       - name: Typecheck
         run: pnpm run typecheck
 
+      - name: News provider and Company Watch regressions
+        run: pnpm --filter @workspace/api-server run test:news
+
       - name: Hardening regressions
         run: pnpm --filter @workspace/api-server run test:hardening
 
