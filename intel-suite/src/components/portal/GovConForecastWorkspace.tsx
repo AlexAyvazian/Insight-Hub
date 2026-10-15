@@ -264,6 +264,23 @@ async function verifyOfficialAward(record: ForecastRecord): Promise<Verification
   return payload;
 }
 
+/** How long the incumbent contract has left; the nearer the end, the more urgent the chip. */
+function expiryInfo(value: string | null | undefined): { text: string; months: number; className: string } | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return null;
+  const months = Math.round((ms - Date.now()) / (30.44 * 86_400_000));
+  if (months < 0) return { text: "Contract ended", months, className: "border-white/10 bg-white/5 text-white/60" };
+  const text = months === 0 ? "Ends this month" : `Ends in ${months} mo`;
+  const className =
+    months <= 6
+      ? "border-red-300/25 bg-red-300/10 text-red-100"
+      : months <= 12
+        ? "border-amber-300/25 bg-amber-300/10 text-amber-100"
+        : "border-cyan-300/25 bg-cyan-300/10 text-cyan-100";
+  return { text, months, className };
+}
+
 function relevanceClass(relevance: Relevance): string {
   if (relevance.classification === "strong") return "border-emerald-300/25 bg-emerald-300/10 text-emerald-100";
   if (relevance.classification === "possible") return "border-amber-300/25 bg-amber-300/10 text-amber-100";
@@ -293,6 +310,7 @@ function ForecastCard({
   const solicitationDate = displayDate(record.estimatedSolicitationDate);
   const expirationDate = displayDate(record.incumbentAward?.expires ?? null);
   const currentValue = displayMoney(record.incumbentAward?.currentValue ?? null);
+  const expiry = expiryInfo(record.incumbentAward?.expires);
   const timing = solicitationDate || record.estimatedAwardQuarter || (record.estimatedAwardFiscalYear ? `FY ${record.estimatedAwardFiscalYear}` : "—");
   const value = record.valueRangeText || displayMoney(record.valueHigh) || displayMoney(record.valueLow) || "—";
 
@@ -320,6 +338,9 @@ function ForecastCard({
               {record.relevance.provider === "gemini" && <Sparkles className="h-3 w-3" />}
               {record.relevance.score}% fit
             </span>
+            {mode === "recompete" && expiry && (
+              <span className={`inline-flex items-center rounded-full border px-2.5 py-1 ${expiry.className}`}>{expiry.text}</span>
+            )}
           </div>
           <h2 className="line-clamp-2 text-xl font-semibold leading-snug text-white md:text-2xl">{record.title}</h2>
           <div className="mt-2.5 flex items-start gap-2 text-sm text-white/75">
@@ -493,9 +514,15 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
     const strong = visibleRecords.filter((record) => record.relevance.classification === "strong").length;
     const possible = visibleRecords.filter((record) => record.relevance.classification === "possible").length;
     const sourceLinked = visibleRecords.filter((record) => Boolean(record.sourceUrl)).length;
-    const withTiming = visibleRecords.filter((record) =>
-      Boolean(record.estimatedSolicitationDate || record.estimatedAwardQuarter || record.estimatedAwardFiscalYear),
-    ).length;
+    // Forecasts: records with forecast timing. Recompetes: contracts ending within 12 months, which is the actionable window.
+    const withTiming = isRecompete
+      ? visibleRecords.filter((record) => {
+          const expiry = expiryInfo(record.incumbentAward?.expires);
+          return expiry !== null && expiry.months >= 0 && expiry.months <= 12;
+        }).length
+      : visibleRecords.filter((record) =>
+          Boolean(record.estimatedSolicitationDate || record.estimatedAwardQuarter || record.estimatedAwardFiscalYear),
+        ).length;
     return {
       count,
       strong,
@@ -519,7 +546,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
         <h1 className="text-4xl font-bold tracking-tight text-white md:text-5xl">{isRecompete ? "Recompete Watch" : "Forecasts"}</h1>
         <p className="mt-3 max-w-3xl text-base leading-relaxed text-white/50 md:text-lg">
           {isRecompete
-            ? "Track forecasted requirements, verify incumbent positions against official federal award records, and identify likely displacement opportunities."
+            ? "Track federal contracts nearing expiration, verify incumbent positions against official federal award records, and identify likely displacement opportunities."
             : "See agency procurement forecasts before solicitations are posted, ranked against Occu-Med’s actual service profile."}
         </p>
       </section>
@@ -617,9 +644,9 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
                 <p className="mt-1 text-xs text-white/55">{visualSummary.sourceLinked} records link back to the originating source</p>
               </div>
               <div className="rounded-xl border border-white/10 bg-black/35 p-3">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/50">Timing known</p>
-                <p className="mt-1 text-2xl font-bold text-white">{visualSummary.timingPct}%</p>
-                <p className="mt-1 text-xs text-white/55">{visualSummary.withTiming} records include forecast timing</p>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/50">{isRecompete ? "Ending within 12 months" : "Timing known"}</p>
+                <p className="mt-1 text-2xl font-bold text-white">{isRecompete ? visualSummary.withTiming : `${visualSummary.timingPct}%`}</p>
+                <p className="mt-1 text-xs text-white/55">{isRecompete ? `${visualSummary.withTiming} contracts expire within the next year` : `${visualSummary.withTiming} records include forecast timing`}</p>
               </div>
             </div>
           </div>
@@ -648,7 +675,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
       )}
 
       {!query.isLoading && !query.isError && records.length === 0 && (
-        <div className="glass-card rounded-2xl border border-white/10 p-10 text-center text-base text-white/65">No matching {isRecompete ? "recompetes" : "forecasts"}. Choose All industries, turn off Occu-Med fit only, or broaden the search terms.</div>
+        <div className="glass-card rounded-2xl border border-white/10 p-10 text-center text-base text-white/65">No matching {isRecompete ? "recompetes" : "forecasts"}. Choose Occu-Med NAICS codes, turn off Occu-Med fit only, or broaden the search terms.</div>
       )}
 
       {!query.isLoading && !query.isError && records.length > 0 && visibleRecords.length === 0 && (

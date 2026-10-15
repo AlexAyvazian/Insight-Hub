@@ -107,6 +107,13 @@ function classify(verdict: RelevanceVerdict): GovConRelevance["classification"] 
   return verdict === "accept" ? "strong" : verdict === "review" ? "possible" : "low";
 }
 
+/** Incumbent contract end date in ms; records without one sort after every dated record. */
+function expiryMs(record: unknown): number {
+  const expires = (record as { incumbentAward?: { expires?: string | null } | null }).incumbentAward?.expires;
+  const parsed = expires ? Date.parse(expires) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
+}
+
 export async function rankGovConRecords<T extends GovConRankableRecord>(
   records: T[],
   mode: GovConIntelligenceMode,
@@ -180,6 +187,8 @@ export async function rankGovConRecords<T extends GovConRankableRecord>(
       return (
         rank(right.relevance) - rank(left.relevance) ||
         right.relevance.score - left.relevance.score ||
+        // Recompetes: the contract that ends soonest is the one to act on first.
+        (mode === "recompete" ? expiryMs(left) - expiryMs(right) : 0) ||
         // Search priority only (Neon): preferred agencies first among equally relevant records.
         agencyPriority(String((right as { agency?: unknown }).agency ?? "")) - agencyPriority(String((left as { agency?: unknown }).agency ?? "")) ||
         (right.relevance.semanticSimilarity ?? 0) - (left.relevance.semanticSimilarity ?? 0)
