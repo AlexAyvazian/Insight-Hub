@@ -37,12 +37,24 @@ function providerError(reason: unknown): string {
   if (status === '429') return 'rate limit reached (HTTP 429); try again shortly';
   return status ? `request failed (HTTP ${status})` : 'request failed; try again shortly';
 }
-router.post('/company-watch/search', async (req, res) => {
-  const companies: string[] = Array.isArray(req.body?.companies)
-    ? req.body.companies.filter((value: unknown) => typeof value === 'string')
-      .map((value: string) => value.trim()).filter(Boolean).slice(0, 100) : [];
-  const sources = cleanSources(req.body?.sources);
-  if (!companies.length) return res.status(400).json({ error: 'Add at least one company.' });
+type CompanySearchResult = {
+  articles: Article[];
+  companies: string[];
+  sources: Source[];
+  providers: Array<{ name: string; status: string; count: number; error: string | null }>;
+  updatedAt: string | null;
+  warnings: string[];
+};
+
+// Avoid spending provider quota on the same search repeatedly (or concurrently).
+// Partial/outage results get only a brief cache; full results retain the news feed TTL.
+const SEARCH_CACHE_TTL_MS = 15 * 60_000;
+const PARTIAL_CACHE_TTL_MS = 60_000;
+const MAX_SEARCH_CACHE_ENTRIES = 150;
+const searchCache = new Map<string, { expiresAt: number; result: CompanySearchResult }>();
+const inFlightSearches = new Map<string, Promise<CompanySearchResult>>();
+
+async function searchCompanies(companies: string[], sources: Source[]): Promise<CompanySearchResult> {
   const query = companies.map(name => `"${name.replace(/"/g, '')}"`).join(' OR ')
     + ' (contract OR award OR spending OR acquisition OR expansion OR workforce OR facility OR aerospace OR defense)';
   const settled = await Promise.allSettled([tinyfish(query, sources), keen(query, sources)]);
@@ -57,7 +69,43 @@ router.post('/company-watch/search', async (req, res) => {
     .map(provider => `${provider.name === 'tinyfish' ? 'TinyFish news' : 'Keenable news'}: ${provider.error}.`);
   const unique = [...new Map(articles.map(article => [article.url, article])).values()]
     .sort((a, b) => (Date.parse(b.publishedAt ?? '') || 0) - (Date.parse(a.publishedAt ?? '') || 0));
-  return res.json({ articles: unique.slice(0, 100), companies, sources, providers,
-    updatedAt: providers.some(provider => provider.status === 'ok') ? new Date().toISOString() : null, warnings });
+  return { articles: unique.slice(0, 100), companies, sources, providers,
+    updatedAt: providers.some(provider => provider.status === 'ok') ? new Date().toISOString() : null, warnings };
+}
+
+router.post('/company-watch/search', async (req, res) => {
+  const companies: string[] = Array.isArray(req.body?.companies)
+    ? req.body.companies.filter((value: unknown) => typeof value === 'string')
+      .map((value: string) => value.trim()).filter(Boolean).slice(0, 100) : [];
+  const sources = cleanSources(req.body?.sources);
+  if (!companies.length) return res.status(400).json({ error: 'Add at least one company.' });
+
+  const cacheKey = JSON.stringify([companies.map(name => name.toLowerCase()), sources.map(source => source.url)]);
+  const now = Date.now();
+  const cached = searchCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return res.json({ ...cached.result, cached: true });
+  if (cached) searchCache.delete(cacheKey);
+
+  let pending = inFlightSearches.get(cacheKey);
+  if (!pending) {
+    pending = searchCompanies(companies, sources);
+    inFlightSearches.set(cacheKey, pending);
+  }
+  try {
+    const result = await pending;
+    const ttl = result.warnings.length ? PARTIAL_CACHE_TTL_MS : SEARCH_CACHE_TTL_MS;
+    searchCache.set(cacheKey, { expiresAt: Date.now() + ttl, result });
+    for (const [key, entry] of searchCache) {
+      if (entry.expiresAt <= Date.now()) searchCache.delete(key);
+    }
+    while (searchCache.size > MAX_SEARCH_CACHE_ENTRIES) {
+      const oldest = searchCache.keys().next().value;
+      if (oldest === undefined) break;
+      searchCache.delete(oldest);
+    }
+    return res.json({ ...result, cached: false });
+  } finally {
+    if (inFlightSearches.get(cacheKey) === pending) inFlightSearches.delete(cacheKey);
+  }
 });
 export default router;
