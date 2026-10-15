@@ -1,9 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { CircleAlert, Clock3, ExternalLink, Loader2, Plus, Search, X } from "lucide-react";
 
 type Company = { name: string };
-type Article = { id: string; title: string; url: string; snippet: string; publisher: string | null; publishedAt: string | null; provider: string; image?: string | null; companyNames?: string[] };
+type DemandEvidence = { kind: string; label: string; terms: string[]; source: string };
+type Demand = { level: "high" | "medium" | "low" | "excluded" | "unknown"; summary: string; evidence: DemandEvidence[]; uncertainty: string };
+type NewsAssessment = { signal: "award" | "solicitation" | null; attribution: "reported_awardee" | "not_awardee" | "mentioned" | "potentially_related" | "none"; attributionNote: string; fresh: boolean; demand: Demand };
+type Article = { id: string; title: string; url: string; snippet: string; publisher: string | null; publishedAt: string | null; provider: string; image?: string | null; companyNames?: string[]; companyMatch?: "verified" | "search_result"; assessments?: Record<string, NewsAssessment> };
+type AwardLead = {
+  awardKey: string; source: string; sourceLabel: string; sourceUrl: string | null;
+  attribution: "confirmed_awardee" | "documented_incumbent" | "possible_match"; attributionNote: string;
+  matchedRecipient: string; recipientUei: string | null; awardingAgency: string | null; amount: number | null;
+  contractNumber: string | null; modification: boolean | null; actionDate: string | null; workLocation: string | null;
+  popCountry: string | null; completionDate: string | null; description: string; firstSeenAt: string;
+  newlyDetected: boolean; missing: string[]; demand: Demand;
+};
+type AwardsResponse = { companies: Record<string, AwardLead[]>; warnings?: string[]; lastPass?: { finishedAt: string | null } | null; generatedAt: string };
 type ProviderResult = { name: string; status: string; count: number; error?: string | null };
 type SearchResult = { articles: Article[]; updatedAt: string | null; warnings?: string[]; providers?: ProviderResult[] };
 type CompanyCheck = { updatedAt: string | null; warnings: string[]; providers: ProviderResult[] };
@@ -43,6 +55,90 @@ function newsSignal(article: Article): NewsSignal {
     && /\b(?:contract|award|task order|delivery order|logcap|afcap)\b/i.test(full)) return "award";
   if (/\b(?:solicitation|request for proposals?|request for bids?|invitation to bid|rfp|recompete|re-competition|seeking bids|issues? (?:a |an )?(?:tender|solicitation))\b/i.test(headline)) return "solicitation";
   return null;
+}
+
+/** Server assessment for this company when available; the local headline check is the fallback for older responses. */
+function articleSignal(article: Article, company: string): NewsSignal {
+  const assessment = article.assessments?.[company];
+  if (assessment) return assessment.fresh ? assessment.signal : null;
+  if (article.companyMatch === "search_result") return null;
+  return newsSignal(article);
+}
+
+const ATTRIBUTION_LABEL: Record<string, string> = {
+  confirmed_awardee: "Confirmed awardee (official record)",
+  documented_incumbent: "Documented incumbent (modification)",
+  possible_match: "Possible match: verify recipient",
+  reported_awardee: "Reported winner (news)",
+  not_awardee: "Not the winner",
+  mentioned: "Mentioned only",
+  potentially_related: "Potentially related",
+};
+const DEMAND_LABEL: Record<Demand["level"], string> = {
+  high: "Occu-Med demand: high", medium: "Occu-Med demand: possible", low: "Occu-Med demand: low",
+  excluded: "Out of Occu-Med scope", unknown: "Occu-Med relevance not assessed",
+};
+const DEMAND_STYLE: Record<Demand["level"], string> = {
+  high: "border-emerald-300/50 bg-emerald-400/15 text-emerald-100", medium: "border-amber-300/50 bg-amber-400/15 text-amber-100",
+  low: "border-white/25 bg-white/5 text-slate-200", excluded: "border-red-300/50 bg-red-400/15 text-red-100", unknown: "border-white/25 bg-white/5 text-slate-300",
+};
+
+function money(value: number | null) {
+  return value === null ? null : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
+}
+function dayLabel(value: string | null) {
+  if (!value) return null;
+  const date = new Date(`${value.slice(0, 10)}T12:00:00Z`);
+  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date);
+}
+const NOT_STATED = <span className="italic text-slate-400">Not stated in source</span>;
+
+function DemandPanel({ demand }: { demand: Demand }) {
+  return (
+    <div className="mt-3 rounded-lg border border-white/15 bg-black/15 p-3 text-sm">
+      <span className={`inline-flex rounded-full border px-2 py-0.5 font-semibold ${DEMAND_STYLE[demand.level]}`}>{DEMAND_LABEL[demand.level]}</span>
+      <p className="mt-2 text-slate-200">{demand.summary}</p>
+      {demand.evidence.length > 0 && <ul className="mt-2 space-y-1 text-slate-300">
+        {demand.evidence.map(item => <li key={`${item.kind}:${item.label}`}><span className="font-semibold text-slate-100">{item.label}</span>{item.terms.length ? `: ${item.terms.join(", ")}` : ""} <span className="text-slate-400">({item.source === "official_record" ? "official record" : item.source === "award_text" ? "award text" : "article text"})</span></li>)}
+      </ul>}
+      <p className="mt-2 text-slate-400">{demand.uncertainty}</p>
+    </div>
+  );
+}
+
+function ArticleEvidence({ assessment }: { assessment?: NewsAssessment }) {
+  if (!assessment) return null;
+  return <>
+    <p className="mt-3 text-sm"><span className="rounded-full border border-white/25 px-2 py-0.5 font-semibold text-white">{ATTRIBUTION_LABEL[assessment.attribution] ?? "Mentioned only"}</span> <span className="text-slate-300">{assessment.attributionNote}</span></p>
+    <DemandPanel demand={assessment.demand} />
+  </>;
+}
+
+function AwardLeadCard({ lead }: { lead: AwardLead }) {
+  return (
+    <article className={`rounded-xl border p-4 ${lead.newlyDetected ? "border-emerald-300/60 bg-[#14402f]" : "border-primary/30 bg-[#183663]"}`}>
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        {lead.newlyDetected && <span className="rounded-full bg-emerald-300 px-2 py-0.5 font-bold text-[#08251a]">Newly detected</span>}
+        <span className="rounded-full border border-white/25 px-2 py-0.5 font-semibold text-white">{ATTRIBUTION_LABEL[lead.attribution]}</span>
+        <span className="text-slate-300">{lead.sourceLabel}</span>
+      </div>
+      <h4 className="mt-2 text-lg font-semibold text-white">{lead.matchedRecipient}{lead.amount !== null ? ` · ${money(lead.amount)}` : ""}</h4>
+      <p className="mt-1 text-sm text-slate-200">{lead.attributionNote}</p>
+      <dl className="mt-3 grid gap-x-4 gap-y-1 text-sm sm:grid-cols-2">
+        <div><dt className="inline text-slate-400">Award date: </dt><dd className="inline text-slate-100">{dayLabel(lead.actionDate) ?? NOT_STATED}</dd></div>
+        <div><dt className="inline text-slate-400">Amount: </dt><dd className="inline text-slate-100">{money(lead.amount) ?? NOT_STATED}</dd></div>
+        <div className="sm:col-span-2"><dt className="inline text-slate-400">Awarding agency: </dt><dd className="inline text-slate-100">{lead.awardingAgency ?? NOT_STATED}</dd></div>
+        <div className="sm:col-span-2"><dt className="inline text-slate-400">Work location: </dt><dd className="inline text-slate-100">{lead.workLocation ?? NOT_STATED}{lead.popCountry && lead.popCountry !== "USA" ? " (outside the U.S.)" : ""}</dd></div>
+        <div><dt className="inline text-slate-400">Contract: </dt><dd className="inline text-slate-100">{lead.contractNumber ?? NOT_STATED}{lead.modification === true ? " (modification)" : lead.modification === false ? " (new award)" : ""}</dd></div>
+        <div><dt className="inline text-slate-400">Recipient UEI: </dt><dd className="inline text-slate-100">{lead.recipientUei ?? NOT_STATED}</dd></div>
+        <div className="sm:col-span-2"><dt className="inline text-slate-400">First detected: </dt><dd className="inline text-slate-100">{ago(lead.firstSeenAt)}</dd></div>
+      </dl>
+      {lead.description && <p className="mt-3 line-clamp-4 text-sm text-slate-200">{lead.description}</p>}
+      <DemandPanel demand={lead.demand} />
+      {lead.sourceUrl ? <a href={lead.sourceUrl} target="_blank" rel="noopener noreferrer" className="mt-3 inline-flex min-h-11 items-center gap-2 text-primary">Open official record <ExternalLink className="h-4 w-4" /></a>
+        : <p className="mt-3 text-sm italic text-slate-400">Source link not stated in the record.</p>}
+    </article>
+  );
 }
 
 function CompanyImage({ name }: { name: string }) {
@@ -93,6 +189,29 @@ export default function CompanyWatchPage() {
   useEffect(() => { try { localStorage.setItem(key, JSON.stringify(companies.map(company => company.name))); } catch {} }, [companies]);
   useEffect(() => { try { localStorage.setItem(timesKey, JSON.stringify(times)); } catch {} }, [times]);
 
+  // Official contract awards come from Insight Hub's own store (DoD announcements, USAspending): one request for all
+  // watched companies, no news-API calls.
+  const [awards, setAwards] = useState<Record<string, AwardLead[]>>({});
+  const [awardsState, setAwardsState] = useState<{ loading: boolean; error: string | null; generatedAt: string | null }>({ loading: false, error: null, generatedAt: null });
+  const companyNamesKey = companies.map(company => company.name).join("\u0000");
+  const loadAwards = useCallback(async () => {
+    const names = companyNamesKey ? companyNamesKey.split("\u0000") : [];
+    if (!names.length) { setAwards({}); return; }
+    setAwardsState(previous => ({ ...previous, loading: true, error: null }));
+    try {
+      const response = await fetch(`${baseUrl}/api/company-watch/awards`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ companies: names }), signal: AbortSignal.timeout(40_000),
+      });
+      const result: AwardsResponse & { error?: string } = await response.json();
+      if (!response.ok) throw new Error(result.error || "Official award records are unavailable.");
+      setAwards(result.companies ?? {});
+      setAwardsState({ loading: false, error: null, generatedAt: result.generatedAt });
+    } catch (error) {
+      setAwardsState(previous => ({ ...previous, loading: false, error: error instanceof Error ? error.message : "Official award records are unavailable." }));
+    }
+  }, [companyNamesKey]);
+  useEffect(() => { void loadAwards(); }, [loadAwards]);
+
   const mutation = useMutation({
     mutationFn: async (names: string[]): Promise<void> => {
       stopSearch.current = false;
@@ -130,8 +249,11 @@ export default function CompanyWatchPage() {
                 if (companyNames.length) merged.set(article.url, { ...article, companyNames });
               }
               for (const article of result.articles) {
-                const companyNames = [...new Set([...(merged.get(article.url)?.companyNames ?? []), name])];
-                merged.set(article.url, { ...article, companyNames });
+                const existing = merged.get(article.url);
+                const companyNames = [...new Set([...(existing?.companyNames ?? []), name])];
+                // A shared article must retain a separate verified assessment for every watched company.
+                const assessments = { ...(existing?.assessments ?? {}), ...(article.assessments ?? {}) };
+                merged.set(article.url, { ...existing, ...article, companyNames, assessments });
               }
               return [...merged.values()];
             });
@@ -147,6 +269,7 @@ export default function CompanyWatchPage() {
       }
       setProgress(null);
     },
+    onSettled: () => { void loadAwards(); },
   });
   useEffect(() => {
     if (!auto || !companies.length) return;
@@ -238,6 +361,10 @@ export default function CompanyWatchPage() {
                 <div className="p-5">
                   <h2 className="ui-break-anywhere text-2xl font-semibold leading-snug text-white">{company.name}</h2>
                   <p className="mt-2 text-base text-slate-200">{check?.updatedAt ? "Last checked " + ago(check.updatedAt) : "Ready to search"}</p>
+                  {(awards[company.name]?.length ?? 0) > 0 && <p className="mt-2 inline-flex flex-wrap items-center gap-2 text-base font-semibold text-emerald-200">
+                    {awards[company.name]!.length} official contract award{awards[company.name]!.length === 1 ? "" : "s"}
+                    {awards[company.name]!.some(lead => lead.newlyDetected) && <span className="rounded-full bg-emerald-300 px-2 py-0.5 text-sm font-bold text-[#08251a]">New</span>}
+                  </p>}
                   <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-white/15 pt-4 text-base">
                     <span className="text-slate-200">{count ? `${count} relevant update${count === 1 ? "" : "s"}` : check?.warnings.length ? "Search needs retry" : check?.updatedAt ? "No news found in the past 7 days" : "Not searched yet"}</span>
                     <span className="font-semibold text-primary">View updates →</span>
@@ -262,8 +389,34 @@ export default function CompanyWatchPage() {
           </div>
           <button type="button" onClick={() => mutation.mutate([selected.name])} disabled={mutation.isPending} className="mt-4 inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-5 text-base font-semibold text-[#09163a] disabled:opacity-50"><Search className="h-5 w-5" />{mutation.isPending ? "Searching…" : "Search this company"}</button>
           {checks[selected.name]?.warnings.map(warning => <p key={warning} role="status" className="mt-3 text-base text-amber-100">{warning}</p>)}
+          <section aria-label="Official contract awards" className="mt-6">
+            <div className="mb-3 flex flex-wrap items-center gap-3">
+              <h3 className="text-2xl font-bold text-white">Official Contract Awards</h3>
+              <span className="rounded-full border border-white/25 px-3 py-1 text-sm text-slate-200">{(awards[selected.name] ?? []).length} in the past 30 days</span>
+              {awardsState.loading && <Loader2 className="h-5 w-5 animate-spin text-primary" aria-label="Loading official awards" />}
+            </div>
+            <p className="mb-3 text-sm text-slate-300">Government award records naming this company as the recipient (Department of War daily contract announcements, USAspending.gov, and award notices already in Insight Hub). Newest first; newly detected awards are highlighted. These are records, not news reports.</p>
+            {awardsState.error && <p role="status" className="mb-3 text-sm text-amber-100">{awardsState.error}</p>}
+            {(awards[selected.name] ?? []).length ? <div className="grid gap-3 md:grid-cols-2">
+              {(awards[selected.name] ?? []).map(lead => <AwardLeadCard key={lead.awardKey} lead={lead} />)}
+            </div> : <p className="rounded-xl border border-dashed border-white/20 p-4 text-sm text-slate-300">No official award record naming this company in the past 30 days{awardsState.generatedAt ? ` (checked ${ago(awardsState.generatedAt)})` : ""}.</p>}
+          </section>
           {(["award", "solicitation"] as const).map(kind => {
-            const relevant = matching(selected.name).filter(article => newsSignal(article) === kind);
+            // A competitor's win (this company lost, protested, or was only mentioned) is never shown as this company's award;
+            // such articles stay under All Company News. Reported winners and higher Occu-Med demand come first.
+            const rank = (article: Article) => {
+              const assessment = article.assessments?.[selected.name];
+              const attribution = assessment?.attribution === "reported_awardee" || assessment?.attribution === "potentially_related" ? 0 : 1;
+              const demand = { high: 0, medium: 1, unknown: 2, low: 3, excluded: 4 }[assessment?.demand.level ?? "unknown"];
+              return attribution * 10 + demand;
+            };
+            const relevant = matching(selected.name)
+              .filter(article => articleSignal(article, selected.name) === kind)
+              .filter(article => {
+                const assessment = article.assessments?.[selected.name];
+                return kind !== "award" || assessment?.attribution === "reported_awardee";
+              })
+              .sort((left, right) => rank(left) - rank(right) || (Date.parse(right.publishedAt ?? "") || 0) - (Date.parse(left.publishedAt ?? "") || 0));
             return (
               <section key={kind} aria-label={kind === "award" ? "New government contract award announcements" : "New government bidding announcements"} className="mt-6">
                 <div className="mb-3 flex flex-wrap items-center gap-3">
@@ -278,6 +431,7 @@ export default function CompanyWatchPage() {
                     <p className="text-sm text-slate-300">{article.publisher || "Source"} · {ago(article.publishedAt)}</p>
                     <h4 className="mt-2 text-lg font-semibold text-white">{article.title}</h4>
                     {article.snippet && <p className="mt-2 text-sm text-slate-200">{article.snippet}</p>}
+                    <ArticleEvidence assessment={article.assessments?.[selected.name]} />
                     <a href={article.url} target="_blank" rel="noopener noreferrer" className="mt-3 inline-flex min-h-11 items-center gap-2 text-primary">Read announcement <ExternalLink className="h-4 w-4" /></a>
                   </article>)}
                 </div> : <p className="rounded-xl border border-dashed border-white/20 p-4 text-sm text-slate-300">No matching new announcements in the currently retrieved articles.</p>}

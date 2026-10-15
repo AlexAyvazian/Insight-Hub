@@ -143,6 +143,9 @@ export function expensiveRoutePolicy(
   if (method === "POST" && path === "/govcon/feedback") {
     return { bucket: "govcon-feedback", limit: 120, windowMs: 60_000 };
   }
+  if (method === "POST" && path === "/company-watch/awards/refresh") {
+    return { bucket: "company-watch-award-refresh", limit: 2, windowMs: 10 * 60_000 };
+  }
   return null;
 }
 
