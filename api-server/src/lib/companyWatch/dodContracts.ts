@@ -114,34 +114,43 @@ export function parseAnnouncement(html: string, sourceUrl: string, date: string 
     if (block.length < 80 || !/\$\s?\d/.test(block)) continue;
     const span = recipientSpan(block);
     if (!span) continue;
-    const contract = CONTRACT_NO.exec(block);
-    const contractNumber = contract ? `${contract[1]}-${contract[2]}-${contract[3]}-${contract[4]}` : null;
+    // Multi-awardee notices often list a separate contract number for each recipient
+    // but only one combined maximum ceiling. Never assign the first ID or shared
+    // maximum to every company.
+    const candidates = span.split(/;\s*(?:and\s+)?/i).map(value => value.trim()).filter(Boolean);
+    const individualContracts = candidates.length > 1 && candidates.every(value => CONTRACT_NO.test(value));
+    const recipients = individualContracts ? candidates : [span];
+    const sharedAmount = recipients.length > 1 || /\b(?:combined|aggregate|total)\s+(?:maximum|ceiling|value|amount)\b/i.test(block);
     const modNumber = firstMatch(MOD_NO, block);
     const modification = MODIFICATION.test(block) ? true : /\bcontract\b/i.test(block) ? false : null;
-    const amount = parseAmount(block);
+    const amount = sharedAmount ? null : parseAmount(block);
     const workLocation = firstMatch(/Work will be performed (?:at|in)\s+(.+?)(?:,?\s+(?:with an?|and is expected|and will be completed|with work expected)|\.\s|\.$)/i, block);
     const activity = firstMatch(/(?:^|\.\s+)([A-Z][^.;]{3,200}?),?\s+(?:is|are) the contracting (?:activity|activities)/i, block);
     const completionDate = firstMatch(/(?:expected to be completed|estimated completion date of|completion date of|be completed by|will be complete by)\s+(?:in\s+|by\s+|on\s+)?([A-Z][a-z]+\.?\s+(?:\d{1,2},\s+)?\d{4})/i, block);
-    const key = contractNumberKey(contractNumber);
-    const awardKey = key
-      ? `dod:${key}:${modNumber ?? (modification ? "mod" : "base")}:${date ?? "nodate"}:${amount ?? "na"}`
-      : `dod:${createHash("sha1").update(`${sourceUrl}\u0000${block}`).digest("hex").slice(0, 20)}`;
-    awards.push({
-      awardKey,
-      source: "dod_contract_announcement",
-      recipientText: span.slice(0, 1500),
-      recipientUei: null,
-      awardingAgency: [section, activity].filter(Boolean).join(" — ") || null,
-      amount,
-      contractNumber,
-      modification,
-      actionDate: date,
-      workLocation,
-      popCountry: locationCountry(workLocation),
-      description: block.slice(0, 3000),
-      sourceUrl,
-      completionDate,
-    });
+    for (const recipient of recipients) {
+      const contract = CONTRACT_NO.exec(individualContracts ? recipient : block);
+      const contractNumber = contract ? `${contract[1]}-${contract[2]}-${contract[3]}-${contract[4]}` : null;
+      const key = contractNumberKey(contractNumber);
+      const awardKey = key
+        ? `dod:${key}:${modNumber ?? (modification ? "mod" : "base")}:${date ?? "nodate"}:${amount ?? "na"}`
+        : `dod:${createHash("sha1").update(`${sourceUrl}\u0000${block}\u0000${recipient}`).digest("hex").slice(0, 20)}`;
+      awards.push({
+        awardKey,
+        source: "dod_contract_announcement",
+        recipientText: recipient.slice(0, 1500),
+        recipientUei: null,
+        awardingAgency: [section, activity].filter(Boolean).join(" — ") || null,
+        amount,
+        contractNumber,
+        modification,
+        actionDate: date,
+        workLocation,
+        popCountry: locationCountry(workLocation),
+        description: block.slice(0, 3000),
+        sourceUrl,
+        completionDate,
+      });
+    }
   }
   return awards;
 }
