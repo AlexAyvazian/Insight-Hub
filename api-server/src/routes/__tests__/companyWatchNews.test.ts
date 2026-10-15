@@ -56,7 +56,7 @@ test("Company Watch reuses shared GNews and APITube calls across multiple watche
   const calls = { gnews: 0, apitube: 0, tinyfish: 0, keen: 0 };
   const realFetch = globalThis.fetch;
   t.mock.method(keenableProvider, "search", async () => { calls.keen++; return []; });
-  t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL) => {
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
     const url = new URL(String(input));
     if (url.hostname === "gnews.io") {
       calls.gnews++;
