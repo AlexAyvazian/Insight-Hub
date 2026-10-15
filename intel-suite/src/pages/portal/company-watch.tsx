@@ -24,6 +24,25 @@ function ago(value: string | null) {
     month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit",
   }).format(date);
 }
+type NewsSignal = "award" | "solicitation" | null;
+
+/** Highlight only recent, explicit government procurement announcements in the existing feed.
+ * This makes no API calls. An article mentioning a company is not proof it bid on a solicitation.
+ */
+function newsSignal(article: Article): NewsSignal {
+  const date = article.publishedAt ? Date.parse(article.publishedAt) : NaN;
+  if (!Number.isFinite(date) || date > Date.now() + 86400_000 || date < Date.now() - 7 * 86400_000) return null;
+  const headline = article.title.toLowerCase();
+  const full = (article.title + " " + article.snippet).toLowerCase();
+  const government = /\b(?:federal|government|pentagon|department of defense|department of homeland security|dod|dhs|usaf|u\.?s\.?\s*(?:army|navy|air force|space force|marine corps)|military|defen[cs]e|sam\.gov|gsa|logcap|afcap)\b/i.test(full);
+  if (!government) return null;
+  const denied = /\b(?:not awarded|fails? to win|lost (?:the |a )?(?:bid|contract)|protests? (?:an? )?award|award (?:protest|challenged|overturned))\b/i.test(full);
+  if (!denied && /\b(?:awarded|wins?|won|secures?|receives?|lands?|selected for|task order awarded|contract award(?:ed|s)?)\b/i.test(headline)
+    && /\b(?:contract|award|task order|agreement|deal|logcap|afcap)\b/i.test(full)) return "award";
+  if (/\b(?:solicitation|request for proposals?|request for bids?|invitation to bid|rfp|recompete|re-competition|seeking bids|issues? (?:a |an )?(?:tender|solicitation))\b/i.test(headline)) return "solicitation";
+  return null;
+}
+
 function CompanyImage({ name }: { name: string }) {
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -237,13 +256,38 @@ export default function CompanyWatchPage() {
       </section>
 
       {selected && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="company-update-title" onClick={() => setSelected(null)}>
-        <div className="max-h-[85dvh] w-full max-w-4xl overflow-y-auto rounded-3xl border border-white/20 bg-[#102447] p-6 shadow-2xl" onClick={event => event.stopPropagation()}>
+        <div className="max-h-[94dvh] w-full max-w-6xl overflow-y-auto rounded-3xl border border-white/20 bg-[#102447] p-6 shadow-2xl" onClick={event => event.stopPropagation()}>
           <div className="flex items-start justify-between gap-4">
             <div><h2 id="company-update-title" className="text-3xl font-bold text-white">{selected.name}</h2><p className="mt-2 text-base text-slate-200">{checks[selected.name]?.updatedAt ? `Last checked ${ago(checks[selected.name].updatedAt)}` : "Search this company to load current coverage."}</p></div>
             <button type="button" aria-label="Close company updates" onClick={() => setSelected(null)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 text-white hover:bg-white/10"><X className="h-5 w-5" /></button>
           </div>
           <button type="button" onClick={() => mutation.mutate([selected.name])} disabled={mutation.isPending} className="mt-4 inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-5 text-base font-semibold text-[#09163a] disabled:opacity-50"><Search className="h-5 w-5" />{mutation.isPending ? "Searching…" : "Search this company"}</button>
           {checks[selected.name]?.warnings.map(warning => <p key={warning} role="status" className="mt-3 text-base text-amber-100">{warning}</p>)}
+          {(["award", "solicitation"] as const).map(kind => {
+            const relevant = matching(selected.name).filter(article => newsSignal(article) === kind);
+            return (
+              <section key={kind} aria-label={kind === "award" ? "New government contract award announcements" : "New government bidding announcements"} className="mt-6">
+                <div className="mb-3 flex flex-wrap items-center gap-3">
+                  <h3 className="text-2xl font-bold text-white">{kind === "award" ? "New Contract Award Announcements" : "New Bidding & Solicitation Announcements"}</h3>
+                  <span className="rounded-full border border-white/25 px-3 py-1 text-sm text-slate-200">{relevant.length} in the past 7 days</span>
+                </div>
+                <p className="mb-3 text-sm text-slate-300">{kind === "award"
+                  ? "Recent news reporting government contract awards to this company. Awards may indicate future mobilization or hiring; the article is the source, not a verified procurement record."
+                  : "Recent news mentioning solicitations related to this company. Appearance here does not establish that the company submitted a bid."}</p>
+                {relevant.length ? <div className="grid gap-3 md:grid-cols-2">
+                  {relevant.map(article => <article key={article.url} className="rounded-xl border border-primary/30 bg-[#183663] p-4">
+                    <p className="text-sm text-slate-300">{article.publisher || "Source"} · {ago(article.publishedAt)}</p>
+                    <h4 className="mt-2 text-lg font-semibold text-white">{article.title}</h4>
+                    {article.snippet && <p className="mt-2 text-sm text-slate-200">{article.snippet}</p>}
+                    <a href={article.url} target="_blank" rel="noopener noreferrer" className="mt-3 inline-flex min-h-11 items-center gap-2 text-primary">Read announcement <ExternalLink className="h-4 w-4" /></a>
+                  </article>)}
+                </div> : <p className="rounded-xl border border-dashed border-white/20 p-4 text-sm text-slate-300">No matching new announcements in the currently retrieved articles.</p>}
+              </section>
+            );
+          })}
+          <h3 className="mt-8 text-2xl font-bold text-white">All Company News</h3>
+          <p className="mt-1 text-sm text-slate-300">The original four-provider news feed is preserved below, including articles highlighted above.</p>
+
           <div className="mt-6 grid gap-5 md:grid-cols-2">
             {matching(selected.name).map(article => <article key={article.id} className="overflow-hidden rounded-2xl border border-white/15 bg-[#152f59]">
               {article.image && <div className="aspect-[16/7] overflow-hidden bg-white/5"><img src={article.image} alt="" loading="lazy" className="h-full w-full object-cover" /></div>}
