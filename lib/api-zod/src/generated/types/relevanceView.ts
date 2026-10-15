@@ -15,8 +15,10 @@ export interface RelevanceView {
   score: number;
   /** Human-readable reasons this result matched (or was ranked down) */
   reasons: string[];
-  /** Detected Occu-Med service category */
+  /** Primary testing type (most specific Occu-Med service category the record evidences); the UI group key */
   category?: string | null;
+  /** Every testing type the record evidences, best first (the primary type is first) */
+  testingTypes?: string[];
   /** True when no reliable publication date was detected */
   dateUnknown: boolean;
   /** True when the result appears to be from a past/historical period */

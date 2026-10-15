@@ -665,7 +665,12 @@ components:
         category:
           type: string
           nullable: true
-          description: Detected Occu-Med service category
+          description: Primary testing type (most specific Occu-Med service category the record evidences); the UI group key
+        testingTypes:
+          type: array
+          items:
+            type: string
+          description: Every testing type the record evidences, best first (the primary type is first)
         dateUnknown:
           type: boolean
           description: True when no reliable publication date was detected

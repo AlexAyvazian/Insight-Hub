@@ -32,7 +32,7 @@ function config(
 export const PROVIDER_TIERS: Record<ProviderName, ProviderTierConfig> = {
   samGov: config("samGov", "tier1", false, false, "Official federal government procurement source", 1),
   tango: config("tango", "tier1", true, false, "Independent structured federal procurement source", 2),
-  internationalPublicPortals: config("internationalPublicPortals", "tier1", false, false, "CanadaBuys official Canadian tenders plus anonymous TED European procurement search", 3),
+  internationalPublicPortals: config("internationalPublicPortals", "tier1", false, false, "CanadaBuys official Canadian tenders plus anonymous TED, UK Find a Tender, UK Contracts Finder, World Bank and live US city/county bid feeds (NYC, Los Angeles RAMP, Montgomery County MD, State of Delaware)", 3),
   texasEsbd: config("texasEsbd", "tier1", false, false, "Texas official procurement compatibility source", 4),
   nyScr: config("nyScr", "tier1", false, false, "New York official procurement compatibility source", 5),
   rssAggregator: config("rssAggregator", "tier1", false, false, "Explicit supplemental government RSS input", 6),

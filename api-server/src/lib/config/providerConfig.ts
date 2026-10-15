@@ -208,6 +208,9 @@ export const PROVIDER_DEFINITIONS: Record<RfpProviderName, ProviderDefinition> =
     [
       "CanadaBuys official tender discovery",
       "TED anonymous Search API",
+      "UK Find a Tender + Contracts Finder (OCDS)",
+      "World Bank procurement notices",
+      "Live US bid feeds: NYC City Record, LA RAMP, Montgomery County MD, State of Delaware",
       "EU CPV 85147000 Company health services",
       "Canada/Europe source telemetry",
     ],

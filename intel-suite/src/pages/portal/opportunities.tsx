@@ -14,6 +14,10 @@ import {
   Clock,
   Sparkles,
 } from "lucide-react";
+import {
+  additionalTestingTypes,
+  groupByTestingType,
+} from "./opportunityGroups";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
@@ -224,6 +228,7 @@ export default function OpportunitiesDashboard() {
   const [sourceFilter, setSourceFilter] = useState("all");
   const [dateFilter, setDateFilter] = useState("90");
   const [page, setPage] = useState(1);
+  const [testingTypeFilter, setTestingTypeFilter] = useState<string | null>(null);
   const PAGE_SIZE = 50;
 
   const [isFetchOpen, setIsFetchOpen] = useState(false);
@@ -812,19 +817,15 @@ export default function OpportunitiesDashboard() {
       ? (extractAgencyHint(opp.title) ?? "—")
       : (opp.agency ?? "—");
   const opportunities = oppsData?.data ?? [];
-  // Group by the server-assigned profile category, in first-seen (rank) order.
-  const getOpportunityCategory = (opp: any): string =>
-    getServiceFitLabel(opp) ?? "Uncategorized";
-  const groupedOpportunities = (() => {
-    const groups = new Map<string, any[]>();
-    for (const opp of opportunities) {
-      const category = getOpportunityCategory(opp);
-      const items = groups.get(category);
-      if (items) items.push(opp);
-      else groups.set(category, [opp]);
-    }
-    return Array.from(groups.entries()) as Array<readonly [string, any[]]>;
-  })();
+  // Group by the server-assigned primary testing type (largest group first, "Uncategorized" last). The UI never
+  // infers a type; the chips below filter the loaded page to one type.
+  const allTypeGroups = groupByTestingType(opportunities);
+  const activeTestingType = allTypeGroups.some((group) => group.type === testingTypeFilter)
+    ? testingTypeFilter
+    : null;
+  const groupedOpportunities = groupByTestingType(opportunities, activeTestingType).map(
+    (group) => [group.type, group.items] as const,
+  ) as Array<readonly [string, any[]]>;
   const currentRunIsStale = Boolean(
     currentRun &&
       isOpportunityRunActive(currentRun.status) &&
@@ -1097,6 +1098,48 @@ export default function OpportunitiesDashboard() {
             </p>
           </div>
         ) : (
+          <>
+          {allTypeGroups.length > 1 && (
+            <div
+              role="group"
+              aria-label="Filter by testing type"
+              className="mb-6 flex flex-wrap items-center gap-2"
+            >
+              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/50">
+                Testing type
+              </span>
+              <button
+                type="button"
+                aria-pressed={activeTestingType === null}
+                onClick={() => setTestingTypeFilter(null)}
+                className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                  activeTestingType === null
+                    ? "border-primary/50 bg-primary/20 text-white"
+                    : "border-white/10 bg-white/5 text-white/70 hover:border-primary/30 hover:text-white"
+                }`}
+              >
+                All <span className="tabular-nums text-white/60">{opportunities.length}</span>
+              </button>
+              {allTypeGroups.map((group) => (
+                <button
+                  key={group.type}
+                  type="button"
+                  aria-pressed={activeTestingType === group.type}
+                  onClick={() =>
+                    setTestingTypeFilter(activeTestingType === group.type ? null : group.type)
+                  }
+                  className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                    activeTestingType === group.type
+                      ? "border-primary/50 bg-primary/20 text-white"
+                      : "border-white/10 bg-white/5 text-white/70 hover:border-primary/30 hover:text-white"
+                  }`}
+                >
+                  {group.type}{" "}
+                  <span className="tabular-nums text-white/60">{group.items.length}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <AnimatePresence>
             {groupedOpportunities.map(([category, categoryOpportunities]) => (
               <section key={category} aria-labelledby={`opportunity-category-${category}`} className="mb-8 last:mb-0">
@@ -1210,6 +1253,12 @@ export default function OpportunitiesDashboard() {
                       <div className="text-[11px] text-primary/70 font-medium">
                         {[serviceFit, getSourceTypeLabel(opp)].filter(Boolean).join(" · ")}
                       </div>
+                      {additionalTestingTypes(opp).length > 0 && (
+                        <div className="text-[11px] text-white/70">
+                          <span className="text-muted-foreground">Also covers:</span>{" "}
+                          {additionalTestingTypes(opp).slice(0, 3).join(" · ")}
+                        </div>
+                      )}
                     </div>
 
                     <div
@@ -1305,6 +1354,7 @@ export default function OpportunitiesDashboard() {
               </section>
             ))}
           </AnimatePresence>
+          </>
         )}
 
         {Boolean((oppsData as any)?.ranking?.truncated) && (
@@ -1838,6 +1888,39 @@ export default function OpportunitiesDashboard() {
                     )}
                   </div>
                 </section>
+
+                {Array.isArray(summaryData.testsRequested) &&
+                  summaryData.testsRequested.length > 0 && (
+                    <section>
+                      <h4 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-1.5">
+                        Tests Requested
+                      </h4>
+                      <div className="flex flex-wrap gap-2">
+                        {summaryData.testsRequested.map(
+                          (test: string, index: number) => (
+                            <Badge
+                              key={index}
+                              className="bg-primary/10 text-primary border-primary/20 text-[11px]"
+                            >
+                              {test}
+                            </Badge>
+                          ),
+                        )}
+                      </div>
+                    </section>
+                  )}
+
+                {typeof summaryData.scope === "string" &&
+                  summaryData.scope.trim() !== "" && (
+                    <section>
+                      <h4 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-1.5">
+                        Scope
+                      </h4>
+                      <p className="text-sm text-white/90 leading-relaxed">
+                        {summaryData.scope}
+                      </p>
+                    </section>
+                  )}
 
                 <section>
                   <h4 className="text-[11px] uppercase tracking-wider text-muted-foreground mb-1.5">

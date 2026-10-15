@@ -24,7 +24,7 @@ import {
   summaryEvidenceFingerprint,
   summaryIneligibilityReason,
 } from "../lib/opportunityQuality";
-import { mergeSummaryWithVerifiedFacts } from "../lib/summaryEvidence";
+import { isUsableAiBrief, mergeSummaryWithVerifiedFacts } from "../lib/summaryEvidence";
 import { matchedServiceLines } from "../lib/search/profileServiceLines";
 import { judgeScopeBlock, profileServiceLabels } from "../lib/search/profileText";
 
@@ -163,7 +163,9 @@ function jsonOnly(text: string): any {
 }
 
 function promptFor(opp: any, base: any, extracted: string | null): string {
-  return `Write a practical bid/no-bid brief for Occu-Med. Occu-Med provides: ${profileServiceLabels().join("; ")}. Be direct and evidence-based. Do not invent missing dates, values, buyers, or scope. Avoid vague language.
+  return `You are the bid analyst for Occu-Med. Write a practical bid/no-bid brief for the procurement below.
+Occu-Med provides: ${profileServiceLabels().join("; ")}.
+Rules: use only facts stated in the material below. Never invent dates, dollar values, buyers, quantities, or scope. If the material does not state something, leave it null or list it under missingInfo. Name the specific tests or exams the buyer asks for instead of saying "occupational health". Do not hedge with "may" or "might" when the material is clear either way; state whether the scope fits and why.
 ${judgeScopeBlock()}
 
 Rule-check verdict: ${base.fitVerdict}
@@ -171,8 +173,8 @@ Rule-check confidence: ${base.confidence}
 Detected service lines: ${base.serviceLines.join(", ")}
 Missing info: ${base.missingInfo.join(", ") || "none"}
 
-Return only JSON:
-{"summary":"2-3 sentences","occumedFit":"direct fit/no-fit assessment","serviceLines":["specific services"],"keyDates":{"posted":"YYYY-MM-DD or null","due":"YYYY-MM-DD or null"},"buyer":"buyer or null","estimatedValue":"value or null","bidNotes":["action note","risk note"],"missingInfo":["missing item"]}
+Return only JSON with exactly these keys:
+{"summary":"2-3 sentences: who is buying what, for whom, and where","occumedFit":"1-2 sentences: does the scope match what Occu-Med delivers, and the single biggest reason it does or does not","serviceLines":["profile service lines the scope covers"],"testsRequested":["each specific test, exam or service the buyer asks for, e.g. DOT drug screen, audiogram, respirator fit test"],"scope":"quantities, locations, contract term and submission method if stated, else null","keyDates":{"posted":"YYYY-MM-DD or null","due":"YYYY-MM-DD or null"},"buyer":"buyer exactly as written in the material, or null","estimatedValue":"value exactly as written in the material, or null","bidNotes":["next action","main risk"],"missingInfo":["facts a bidder still needs"]}
 
 Title: ${opp.title ?? "N/A"}
 Buyer: ${base.buyer ?? "N/A"}
@@ -182,10 +184,13 @@ Classification: ${base.fitVerdict ? ((base as any).classification ?? "N/A") : "N
 Evidence source: ${(base as any).evidenceSource ?? "N/A"}
 Source authority: ${(base as any).sourceAuthority ?? "N/A"}
 Value: ${base.estimatedValue ?? "N/A"}
+NAICS: ${opp.naicsCode ?? "N/A"}${opp.naicsDescription ? ` (${cleanText(opp.naicsDescription, 120)})` : ""}
+PSC: ${opp.pscCode ?? "N/A"}
+Set-aside: ${opp.setAside ?? "N/A"}
 URL: ${base.sourceUrl ?? "N/A"}
-Description: ${cleanText(opp.description, 2200) || "N/A"}
+Description: ${cleanText(opp.description, 3000) || "N/A"}
 Notes: ${cleanText(opp.notes, 1200) || "N/A"}
-${extracted ? `Source text: ${cleanText(extracted, 4500)}` : "Source text unavailable."}`;
+${extracted ? `Source text: ${cleanText(extracted, 9000)}` : "Source text unavailable."}`;
 }
 
 router.post("/opportunities/:id/summary", async (req, res) => {
@@ -291,15 +296,16 @@ router.post("/opportunities/:id/summary", async (req, res) => {
       ].map((provider) => ({
         name: provider.name,
         isConfigured: () => provider.isConfigured(),
-        run: async () => jsonOnly(await provider.complete(prompt, 1_000)),
+        run: async () => jsonOnly(await provider.complete(prompt, 1_400)),
       })),
-      (value) => Boolean(value && typeof value === "object"),
+      isUsableAiBrief,
     );
     if (completion.value && completion.provider) {
       const merged = mergeSummaryWithVerifiedFacts(
         completion.value,
         verifiedBase,
         `${completion.provider}-v2`,
+        extracted,
       );
       cacheSummary(opp.id, merged);
       return res.json(merged);
