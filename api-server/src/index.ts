@@ -57,6 +57,7 @@ const HTTP_KEEP_ALIVE_TIMEOUT_MS = boundedIntegerEnv(
   30_000,
 );
 let server: Server | undefined;
+let dailyScheduler: { stop: () => void } | undefined;
 let shuttingDown = false;
 
 async function withDeadline<T>(
@@ -116,6 +117,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
   forceExit.unref?.();
 
   try {
+    dailyScheduler?.stop();
     await closeHttpServer();
     await rfpPool.end();
     logger.info({ signal }, "Graceful shutdown complete");
@@ -184,7 +186,7 @@ async function bootstrap(): Promise<void> {
     "Server listening",
   );
 
-  logger.info("Automatic crawler scheduler disabled; ingestion is manual-only");
+  logger.info("Automatic crawler scheduler disabled; the daily procurement run is a separate scheduler (below)");
 
   // Load the Neon relevance profile for the classifier, and keep it fresh. If Neon is unreachable the verified
   // last-known-good cache is used; with neither, relevance fails closed (everything is held for review).
@@ -198,6 +200,11 @@ async function bootstrap(): Promise<void> {
     afterProfileLoad();
   });
   setInterval(() => void ensureRelevanceProfile(true).then(afterProfileLoad), 10 * 60_000).unref();
+
+  // Once-a-day procurement run. Starts the same persisted run as the Fetch button, so one-active-run locking,
+  // deadlines and quota policy all still apply. Enabled by default in production; see dailySchedule.ts for knobs.
+  const { startDailyIngestionScheduler } = await import("./lib/ingestion/dailyScheduler");
+  dailyScheduler = startDailyIngestionScheduler();
 }
 
 bootstrap().catch((error) => {

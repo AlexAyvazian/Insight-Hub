@@ -12,6 +12,7 @@ import { classifyResult } from "../lib/search/relevance";
 import { decideRelevanceWithCodes } from "../lib/search/relevanceDecision";
 import { getRelevanceProfile } from "../lib/search/relevanceProfile";
 import { matchedServiceLines } from "../lib/search/profileServiceLines";
+import { classifyTestingTypes } from "../lib/search/testingTypes";
 import { judgeScopeBlock, profileServiceLabels } from "../lib/search/profileText";
 import { semanticRerank, isSemanticRerankEnabled } from "../lib/search/semanticRerank";
 import {
@@ -134,6 +135,13 @@ function buildRelevanceView(opp: any) {
     allowHistorical: true,
   });
 
+  // Group key for the UI: the most specific testing type the record evidences. The classifier's own `category` is the
+  // first profile category that matched, which is almost always the broad umbrella, so it is only the fallback.
+  const testing = classifyTestingTypes({
+    title: opp.title,
+    body: [opp.description, opp.naicsDescription, ...samClassificationEvidence].filter(Boolean).join(" "),
+  });
+
   const tags = parseTags(opp.tags);
   const storedScore = opp.relevanceScore != null ? parseFloat(opp.relevanceScore) : NaN;
   const score = Number.isFinite(storedScore) ? Math.round(storedScore) : cls.score;
@@ -182,7 +190,8 @@ function buildRelevanceView(opp: any) {
     reasons,
     why,
     decisionMethod,
-    category: cls.category,
+    category: testing.primary ?? cls.category,
+    testingTypes: testing.all,
     dateUnknown,
     stale,
     confidence,
@@ -393,6 +402,17 @@ router.get("/opportunities", async (req, res) => {
 });
 
 router.post("/opportunities/fetch", createStartIngestionHandler(startManualIngestion));
+
+// Daily procurement run schedule: next slot and what the scheduler last did. Registered before "/opportunities/:id".
+router.get("/opportunities/schedule", async (req, res) => {
+  try {
+    const { getDailySchedulerStatus } = await import("../lib/ingestion/dailyScheduler");
+    return res.json(await getDailySchedulerStatus());
+  } catch (error) {
+    req.log?.error(error);
+    return res.status(500).json({ error: "Unable to read the daily run schedule" });
+  }
+});
 
 router.get("/opportunities/ingestion-runs/current", async (req, res) => {
   try {
