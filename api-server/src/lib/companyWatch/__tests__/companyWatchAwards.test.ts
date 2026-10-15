@@ -109,7 +109,7 @@ const PAGE_URL = "https://www.war.gov/News/Contracts/Contract/Article/4300001/";
 
 test("DoD daily announcement paragraphs become official award records with sourced fields", () => {
   const awards = parseAnnouncement(ANNOUNCEMENT, PAGE_URL, "2026-10-14");
-  assert.equal(awards.length, 3);
+  assert.equal(awards.length, 5);
   const [leidos, kbr, navy] = awards;
   assert.equal(leidos!.recipientText, "Leidos Inc., Reston, Virginia");
   assert.equal(leidos!.amount, 48_215_330);
@@ -124,7 +124,12 @@ test("DoD daily announcement paragraphs become official award records with sourc
   assert.match(kbr!.awardKey, /^dod:W9124P22F0104:P00017:2026-10-14:/);
   assert.match(navy!.recipientText, /^Amentum Services Inc\./);
   assert.equal(navy!.popCountry, "Italy");
-  assert.equal(navy!.amount, 950_000_000);
+  assert.equal(navy!.amount, null, "combined IDIQ ceiling is not a single awardee amount");
+  assert.equal(navy!.contractNumber, "N62470-26-D-0101");
+  assert.equal(awards[3]!.contractNumber, "N62470-26-D-0102");
+  assert.equal(awards[4]!.contractNumber, "N62470-26-D-0103");
+  assert.equal(awards[3]!.amount, null);
+  assert.equal(awards[4]!.amount, null);
   // Same input, same key: re-processing a page never creates a second record.
   assert.deepEqual(parseAnnouncement(ANNOUNCEMENT, PAGE_URL, "2026-10-14").map(a => a.awardKey), awards.map(a => a.awardKey));
 });
@@ -150,8 +155,8 @@ test("USAspending rows are kept only when the recipient is verifiably the compan
   assert.deepEqual(body.filters.award_type_codes, ["A", "B", "C", "D"]);
   assert.equal(body.filters.time_period[0]!.date_type, "date_signed");
   const rows = [
-    { generated_internal_id: "CONT_AWD_1", "Award ID": "W91CRB26C0001", "Recipient Name": "KBR WYLE SERVICES, LLC", "Recipient UEI": "ABC123DEF456", "Award Amount": 3_000_000, "Start Date": "2026-09-20", "Awarding Agency": "Department of State", "Place of Performance Country Code": "IRQ", Description: "Life support services" },
-    { generated_internal_id: "CONT_AWD_2", "Award ID": "X1", "Recipient Name": "SKBR HOLDINGS LLC", "Award Amount": 50_000, "Start Date": "2026-09-21" },
+    { generated_internal_id: "CONT_AWD_1", "Award ID": "W91CRB26C0001", "Recipient Name": "KBR WYLE SERVICES, LLC", "Recipient UEI": "ABC123DEF456", "Award Amount": 3_000_000, "Base Obligation Date": "2026-09-19", "Start Date": "2026-09-20", "Awarding Agency": "Department of State", "Place of Performance Country Code": "IRQ", Description: "Life support services" },
+    { generated_internal_id: "CONT_AWD_2", "Award ID": "X1", "Recipient Name": "SKBR HOLDINGS LLC", "Award Amount": 50_000, "Base Obligation Date": "2026-09-21", "Start Date": "2026-09-22" },
   ];
   const calls: string[] = [];
   const fakeFetch = (async (input: string | URL | Request) => {
@@ -163,10 +168,32 @@ test("USAspending rows are kept only when the recipient is verifiably the compan
   assert.equal(result.awards.length, 1);
   assert.deepEqual(result.rejectedRecipients, ["SKBR HOLDINGS LLC"]);
   assert.equal(result.awards[0]!.recipientUei, "ABC123DEF456");
+  assert.equal(result.awards[0]!.actionDate, "2026-09-19", "must use signature date, never performance start");
   assert.equal(result.awards[0]!.popCountry, "IRQ");
   assert.equal(result.awards[0]!.sourceUrl, "https://www.usaspending.gov/award/CONT_AWD_1");
   assert.ok(calls.every(url => url.startsWith("https://api.usaspending.gov/")));
   assert.equal(normalizeUsaSpendingRow({}), null);
+});
+
+test("USAspending fetch paginates beyond 60 results without repeating page one", async () => {
+  const visited: number[] = [];
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { page: number; limit: number };
+    visited.push(body.page);
+    const length = body.page === 1 ? 100 : 3;
+    const rows = Array.from({ length }, (_, i) => ({
+      generated_internal_id: `CONT_AWD_${body.page}_${i}`, "Award ID": `W26${body.page}${i}`,
+      "Recipient Name": "KBR WYLE SERVICES, LLC",
+      "Base Obligation Date": "2026-10-10", "Start Date": "2026-11-01",
+      "Award Amount": 5000 + i,
+    }));
+    return Response.json({ results: rows, page_metadata: { hasNext: body.page === 1 } });
+  }) as typeof fetch;
+  const result = await fetchUsaSpendingAwards("KBR", new Date(NOW), fakeFetch);
+  assert.deepEqual(visited, [1, 2]);
+  assert.equal(result.rows, 103);
+  assert.equal(result.awards.length, 103);
+  assert.ok(result.awards.every(award => award.actionDate === "2026-10-10"));
 });
 
 // ── Leads, first-seen, de-duplication ─────────────────────────────────────────────────────────────────────────────
@@ -200,7 +227,7 @@ test("leads: confirmed awardee, documented incumbent, collision-safe, newest and
 test("the same contract from two official sources is one lead", () => {
   const dod = buildCompanyLeads("Leidos", stored(parseAnnouncement(ANNOUNCEMENT, PAGE_URL, "2026-10-14"), new Date(NOW).toISOString()), NOW);
   const usa = buildCompanyLeads("Leidos", [{
-    ...normalizeUsaSpendingRow({ generated_internal_id: "CONT_AWD_W52P1J26C0042", "Award ID": "W52P1J26C0042", "Recipient Name": "LEIDOS, INC.", "Recipient UEI": "LEIDOSUEI001", "Start Date": "2026-10-14" })!,
+    ...normalizeUsaSpendingRow({ generated_internal_id: "CONT_AWD_W52P1J26C0042", "Award ID": "W52P1J26C0042", "Recipient Name": "LEIDOS, INC.", "Recipient UEI": "LEIDOSUEI001", "Base Obligation Date": "2026-10-14", "Start Date": "2026-10-20" })!,
     firstSeenAt: new Date(NOW).toISOString(),
   }], NOW);
   const merged = dedupeLeads([...usa, ...dod]);
@@ -220,7 +247,7 @@ test("first-seen tracking: an award is new once; re-seeing it keeps the original
     return [{ inserted }];
   };
   const awards = parseAnnouncement(ANNOUNCEMENT, PAGE_URL, "2026-10-14");
-  assert.equal(await upsertAwards(run, awards), 3);
+  assert.equal(await upsertAwards(run, awards), 5);
   assert.equal(await upsertAwards(run, awards), 0);
   assert.ok(statements.every(sql => /ON CONFLICT \(award_key\) DO UPDATE SET last_seen_at = now\(\)/.test(sql)));
   assert.ok(statements.every(sql => !/first_seen_at\s*=/.test(sql)), "first_seen_at is never overwritten");
@@ -250,8 +277,8 @@ test("official awards and the background pass make no paid news API calls", asyn
   };
   const summary = await runAwardPass(run, fakeFetch);
   assert.equal(summary.dod.feedItems, 1);
-  assert.equal(summary.dod.awardsParsed, 3);
-  assert.equal(summary.dod.newAwards, 3);
+  assert.equal(summary.dod.awardsParsed, 5);
+  assert.equal(summary.dod.newAwards, 5);
   assert.equal(summary.usaspending.companies, 1);
   assert.deepEqual([...new Set(hosts)].sort(), ["api.usaspending.gov", "www.war.gov"]);
   for (const paid of ["gnews.io", "api.apitube.io", "api.search.tinyfish.ai"]) assert.ok(!hosts.includes(paid));
