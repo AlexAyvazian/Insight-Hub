@@ -37,6 +37,8 @@ type ForecastRecord = {
   naics: string | null;
   setAside: string | null;
   state: string | null;
+  placeOfPerformance?: string | null;
+  estimatedPeriod?: string | null;
   valueRangeText: string | null;
   valueLow: number | null;
   valueHigh: number | null;
@@ -117,7 +119,8 @@ type Filters = {
 };
 
 const PAGE_SIZE = 24;
-const DEFAULT_NAICS = "621";
+// Empty = the server uses the Occu-Med NAICS codes from the relevance profile, not one broad industry prefix.
+const DEFAULT_NAICS = "";
 
 const INDUSTRY_OPTIONS = [
   { value: "621", label: "Health & medical services (NAICS 621)" },
@@ -125,7 +128,7 @@ const INDUSTRY_OPTIONS = [
   { value: "623", label: "Residential care (NAICS 623)" },
   { value: "624", label: "Social assistance (NAICS 624)" },
   { value: "561", label: "Business support services (NAICS 561)" },
-  { value: "", label: "All industries" },
+  { value: "", label: "Occu-Med NAICS codes" },
 ];
 
 function displayDate(value: string | null): string | null {
@@ -369,10 +372,11 @@ function ForecastCard({
         <div className="rounded-lg border border-white/10 bg-black/30 p-2.5">
           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/55">Expected Timing</p>
           <p className="mt-1.5 line-clamp-2 font-medium text-white/90">{timing}</p>
+          {record.estimatedPeriod && <p className="mt-1 line-clamp-1 text-xs text-white/55">{record.estimatedPeriod}</p>}
         </div>
         <div className="rounded-lg border border-white/10 bg-black/30 p-2.5">
           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/55">Place of Performance</p>
-          <p className="mt-1.5 flex items-center gap-1.5 line-clamp-2 font-medium text-white/90"><MapPin className="h-3 w-3 shrink-0 text-primary/65" />{record.state || "Not listed"}</p>
+          <p className="mt-1.5 flex items-center gap-1.5 line-clamp-2 font-medium text-white/90"><MapPin className="h-3 w-3 shrink-0 text-primary/65" />{record.placeOfPerformance || record.state || "Not listed"}</p>
         </div>
       </div>
 
