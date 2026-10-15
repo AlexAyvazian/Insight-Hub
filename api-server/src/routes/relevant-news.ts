@@ -286,7 +286,7 @@ async function requestGNews(query: string, max: number, page: number, apiKey: st
   }
 }
 
-async function fetchGNewsFeed(query: string, max: number, page: number, allowFallback: boolean): Promise<unknown[]> {
+export async function fetchGNewsFeed(query: string, max: number, page: number, allowFallback: boolean): Promise<unknown[]> {
   const apiKey = process.env.GNEWS_API_KEY?.trim();
   if (!apiKey) throw Object.assign(new Error("GNEWS_API_KEY is not configured"), { statusCode: 503 });
   const limit = Math.min(max, boundedInteger(process.env.GNEWS_MAX_ARTICLES, 10, 1, 100));
