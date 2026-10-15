@@ -119,7 +119,7 @@ export default function CompanyWatchPage() {
         } catch (error) {
           const message = error instanceof Error && error.name === "TimeoutError"
             ? "Search timed out. Try this company again." : error instanceof Error ? error.message : "Search failed.";
-          setChecks(previous => ({ ...previous, [name]: { updatedAt: previous[name]?.updatedAt ?? null, warnings: [message], providers: ["tinyfish", "keenable"].map(name => ({ name, status: "error", count: 0, error: message })) } }));
+          setChecks(previous => ({ ...previous, [name]: { updatedAt: previous[name]?.updatedAt ?? null, warnings: [message], providers: ["tinyfish", "keenable", "gnews", "apitube"].map(name => ({ name, status: "error", count: 0, error: message })) } }));
           setWarnings(previous => [...new Set([...previous, `${name}: ${message}`])]);
         }
         setProgress({ completed: index + 1, total: names.length, company: name });
@@ -188,11 +188,12 @@ export default function CompanyWatchPage() {
 
       <div className="flex flex-wrap items-center gap-3 text-base text-slate-200" aria-live="polite">
         <span className="font-semibold text-white">Search providers:</span>
-        {["tinyfish", "keenable"].map(name => {
+        {["tinyfish", "keenable", "gnews", "apitube"].map(name => {
           const results = Object.values(checks).flatMap(check => check.providers).filter(provider => provider.name === name);
           const count = results.reduce((total, result) => total + result.count, 0);
           const failures = results.filter(result => result.status === "error").length;
-          return <span key={name} className="rounded-full border border-white/20 bg-white/5 px-3 py-2">{name === "tinyfish" ? "TinyFish" : "Keenable"} · {results.length ? `${count} results${failures ? ` · ${failures} failed` : ""}` : "Ready"}</span>;
+          const disabled = results.length > 0 && results.every(result => result.status === "disabled");
+          return <span key={name} className="rounded-full border border-white/20 bg-white/5 px-3 py-2">{name === "tinyfish" ? "TinyFish" : name === "keenable" ? "Keenable" : name === "gnews" ? "GNews" : "APITube"} · {disabled ? "Not configured" : results.length ? `${count} results${failures ? ` · ${failures} failed` : ""}` : "Ready"}</span>;
         })}
         {progress && <span role="status">{progress.completed}/{progress.total} checked · Searching {progress.company}…</span>}
         {mutation.isPending && <button type="button" onClick={() => { stopSearch.current = true; }} className="min-h-11 rounded-lg border border-white/20 px-3 text-white">Stop after this company</button>}
@@ -247,7 +248,7 @@ export default function CompanyWatchPage() {
             {matching(selected.name).map(article => <article key={article.id} className="overflow-hidden rounded-2xl border border-white/15 bg-[#152f59]">
               {article.image && <div className="aspect-[16/7] overflow-hidden bg-white/5"><img src={article.image} alt="" loading="lazy" className="h-full w-full object-cover" /></div>}
               <div className="p-5">
-                <p className="text-sm text-slate-300">{article.publisher || "Source"} · {article.provider === "tinyfish" ? "TinyFish" : "Keenable"} · {ago(article.publishedAt)}</p>
+                <p className="text-sm text-slate-300">{article.publisher || "Source"} · {article.provider === "tinyfish" ? "TinyFish" : article.provider === "keenable" ? "Keenable" : article.provider === "gnews" ? "GNews" : "APITube"} · {ago(article.publishedAt)}</p>
                 <h3 className="mt-3 text-xl font-semibold leading-snug text-white">{article.title}</h3>
                 {article.snippet && <p className="mt-3 text-base leading-relaxed text-slate-200">{article.snippet}</p>}
                 <a href={article.url} target="_blank" rel="noopener noreferrer" className="mt-4 inline-flex min-h-11 items-center gap-2 rounded-full border border-primary/40 bg-primary/10 px-4 text-base font-semibold text-primary">Read source <ExternalLink className="h-4 w-4" /></a>
