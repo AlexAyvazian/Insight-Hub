@@ -24,7 +24,13 @@ function validVector(value: unknown): value is number[] {
  */
 export class GeminiEmbeddingProvider {
   private async apiKey(): Promise<string | null> {
-    return resolveCredential("geminiApiKey", "GEMINI_API_KEY");
+    // Same key pool as Gemini generation: the first usable key wins, so one bad or missing key does not disable
+    // Gemini embeddings while GEMINI_KEY_2 / GEMINI_KEY_3 are configured.
+    return (
+      (await resolveCredential("geminiApiKey", "GEMINI_API_KEY")) ??
+      (await resolveCredential("geminiKey2", "GEMINI_KEY_2")) ??
+      (await resolveCredential("geminiKey3", "GEMINI_KEY_3"))
+    );
   }
 
   private async model(): Promise<string> {
