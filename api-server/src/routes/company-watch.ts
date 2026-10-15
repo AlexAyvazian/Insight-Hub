@@ -3,6 +3,9 @@ import { resolveCredential } from "../lib/config/providerConfig";
 import { keenableProvider } from "../lib/providers/keenable";
 import { apitubeKeys, fetchApitubeNews } from "../lib/news/apitube";
 import { fetchGNewsFeed } from "./relevant-news";
+import { matchesCompanyNews } from "../lib/companyWatch/companyIdentity";
+import { assessCompanyArticle, type NewsAssessment } from "../lib/companyWatch/newsAssessment";
+import { awardStatus, companyAwards, kickAwardPassIfStale, runAwardPass } from "../lib/companyWatch/awardWatcher";
 const router: IRouter = Router();
 router.get("/company-watch/logo/:domain", async (req, res) => {
   const domain = String(req.params.domain ?? "").toLowerCase().replace(/^www\./, "");
@@ -22,7 +25,7 @@ router.get("/company-watch/logo/:domain", async (req, res) => {
     return res.send(Buffer.from(bytes));
   } catch { return res.status(404).end(); }
 });
-type Source={name:string;url:string;domain:string}; type Article={id:string;title:string;url:string;snippet:string;publisher:string|null;publishedAt:string|null;provider:"tinyfish"|"keenable"|"gnews"|"apitube";sourceUrl?:string;image?:string|null};
+type Source={name:string;url:string;domain:string}; type Article={id:string;title:string;url:string;snippet:string;publisher:string|null;publishedAt:string|null;provider:"tinyfish"|"keenable"|"gnews"|"apitube";sourceUrl?:string;image?:string|null;companyMatch?:"verified"|"search_result";assessments?:Record<string,NewsAssessment>};
 function validUrl(value: unknown): string|null { try { const u=new URL(String(value)); return /^https?:$/.test(u.protocol)?u.href:null; } catch{return null;} }
 function normalize(value:unknown,provider:Article["provider"],source?:Source):Article|null { const r=(value&&typeof value==='object'?value:{}) as Record<string,unknown>; const url=validUrl(r.url); const title=typeof r.title==='string'?r.title.trim():''; if(!url||!title)return null; let publisher=typeof r.publisher==='string'?r.publisher:(typeof r.site_name==='string'?r.site_name:null); if(!publisher)try{publisher=new URL(url).hostname.replace(/^www\./,'')}catch{} return {id:`${provider}:${url}`,title,url,snippet:typeof r.snippet==='string'?r.snippet:(typeof r.description==='string'?r.description:''),publisher,publishedAt:typeof r.date==='string'?r.date:(typeof r.publishedAt==='string'?r.publishedAt:null),provider,sourceUrl:source?.url,image:validUrl(r.thumbnail_url??r.image)}; }
 function cleanSources(value:unknown):Source[]{ if(!Array.isArray(value))return []; return value.flatMap(v=>{const r=(v&&typeof v==='object'?v:{}) as Record<string,unknown>; const url=validUrl(r.url); const name=typeof r.name==='string'?r.name.trim():''; if(!url||!name)return []; try{return [{name,url,domain:new URL(url).hostname.replace(/^www\./,'')}]}catch{return []} }).slice(0,20); }
@@ -89,26 +92,8 @@ export function normalizeCompanyNews(value: unknown, provider: "gnews" | "apitub
   return { article, text };
 }
 
-/** Exact-name and established abbreviation matching; no loose substring matches. */
-export function matchesCompanyNews(text: string, company: string): boolean {
-  const aliases: Record<string, string[]> = {
-    "general dynamics information technology": ["GDIT"],
-    "sierra nevada corporation": ["Sierra Nevada", "SNC"],
-    "fluor corporation": ["Fluor"],
-    "caci international": ["CACI"],
-    "v2x": ["Vectrus"],
-    "mantech international": ["ManTech"],
-    "jacobs technology": ["Jacobs"],
-    "american bureau of shipping": ["ABS"],
-  };
-  const normalized = company.toLowerCase().trim();
-  const shortName = company.replace(/\s+(?:corporation|corp\.?|inc\.?|llc|ltd\.?|company)$/i, "").trim();
-  const variants = [...new Set([company, shortName, ...(aliases[normalized] ?? [])])].filter(value => value.length >= 3);
-  return variants.some(value => {
-    const escaped = value.replace(/[.*+?^$()|{}\[\]\\]/g, "\\$&");
-    return new RegExp("(^|[^\\p{L}\\p{N}])" + escaped + "(?=$|[^\\p{L}\\p{N}])", "iu").test(text);
-  });
-}
+/** Exact-name and established abbreviation matching; no loose substring matches (see lib/companyWatch/companyIdentity). */
+export { matchesCompanyNews };
 
 function disabled(): SharedProvider {
   return { status: "disabled", entries: [], warnings: [], error: null };
@@ -153,6 +138,24 @@ async function sharedNewsPool(): Promise<SharedPool> {
   return newsPoolInFlight;
 }
 
+/**
+ * Adds read-time evidence to an article that was already retrieved (no extra API calls):
+ *  - companyMatch: "verified" when the headline/summary names the company (exact name, core name or established
+ *    abbreviation); TinyFish/Keenable results that only came back for the query are kept as "search_result" so the
+ *    news feed is not reduced, but they never feed the award/solicitation highlights;
+ *  - assessments: per watched company, the award/solicitation signal, who the headline reports as the winner, and
+ *    OCCU_MED_AWARE demand evidence.
+ */
+export function annotateArticle(article: Article, companies: string[], now = Date.now()): Article {
+  const text = `${article.title} ${article.snippet}`;
+  const verified = companies.filter(company => matchesCompanyNews(text, company));
+  const assessments: Record<string, NewsAssessment> = {};
+  for (const company of verified) {
+    assessments[company] = assessCompanyArticle({ title: article.title, snippet: article.snippet, publishedAt: article.publishedAt }, company, now);
+  }
+  return { ...article, companyMatch: verified.length ? "verified" : "search_result", assessments };
+}
+
 // Reuse the existing short-lived exact-search cache and coalesce concurrent requests.
 async function searchCompanies(companies: string[], sources: Source[]): Promise<CompanySearchResult> {
   const query = companies.map(name => '"' + name.replace(/"/g, "") + '"').join(" OR ")
@@ -185,7 +188,8 @@ async function searchCompanies(companies: string[], sources: Source[]): Promise<
     warnings.push(...upstream.warnings);
   }
   const unique = [...new Map(articles.map(article => [article.url, article])).values()]
-    .sort((a, b) => (Date.parse(b.publishedAt ?? "") || 0) - (Date.parse(a.publishedAt ?? "") || 0));
+    .sort((a, b) => (Date.parse(b.publishedAt ?? "") || 0) - (Date.parse(a.publishedAt ?? "") || 0))
+    .map(article => annotateArticle(article, companies));
   return { articles: unique.slice(0, 100), companies, sources, providers,
     updatedAt: providers.some(provider => provider.status === "ok") ? new Date().toISOString() : null,
     warnings: [...new Set(warnings)] };
@@ -225,5 +229,38 @@ router.post('/company-watch/search', async (req, res) => {
   } finally {
     if (inFlightSearches.get(cacheKey) === pending) inFlightSearches.delete(cacheKey);
   }
+});
+/**
+ * Official contract awards for the watched companies, read from Neon (no paid news API calls). Records the requested
+ * companies so the background pass checks them, and starts a pass in the background if the last one is stale.
+ */
+router.post("/company-watch/awards", async (req, res) => {
+  const companies: string[] = Array.isArray(req.body?.companies)
+    ? [...new Set<string>(req.body.companies.filter((value: unknown) => typeof value === "string")
+      .map((value: string) => value.trim().slice(0, 120)).filter(Boolean))].slice(0, 150) : [];
+  if (!companies.length) return res.status(400).json({ error: "Add at least one company." });
+  try {
+    const result = await companyAwards(companies);
+    kickAwardPassIfStale();
+    return res.json(result);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "company_watch_awards_failed", error: error instanceof Error ? error.message.slice(0, 200) : String(error) }));
+    return res.status(503).json({ error: "Official award records are temporarily unavailable." });
+  }
+});
+
+/** Measured state of the official-award store and the last background pass (for verification). */
+router.get("/company-watch/awards/status", async (_req, res) => {
+  try {
+    return res.json(await awardStatus());
+  } catch (error) {
+    return res.status(503).json({ error: error instanceof Error ? error.message.slice(0, 200) : "unavailable" });
+  }
+});
+
+/** Runs one official-award pass now and returns its measured counts. */
+router.post("/company-watch/awards/refresh", async (_req, res) => {
+  const summary = await runAwardPass();
+  return res.json(summary);
 });
 export default router;

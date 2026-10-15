@@ -205,6 +205,10 @@ async function bootstrap(): Promise<void> {
   // deadlines and quota policy all still apply. Enabled by default in production; see dailySchedule.ts for knobs.
   const { startDailyIngestionScheduler } = await import("./lib/ingestion/dailyScheduler");
   dailyScheduler = startDailyIngestionScheduler();
+
+  // Company Watch official contract awards (DoD daily announcements + USAspending), stored in Neon. Free sources only.
+  const { startCompanyAwardWatcher } = await import("./lib/companyWatch/awardWatcher");
+  startCompanyAwardWatcher();
 }
 
 bootstrap().catch((error) => {
