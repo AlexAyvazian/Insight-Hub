@@ -34,12 +34,12 @@ function newsSignal(article: Article): NewsSignal {
   if (!Number.isFinite(date) || date > Date.now() + 86400_000 || date < Date.now() - 7 * 86400_000) return null;
   const headline = article.title.toLowerCase();
   const full = (article.title + " " + article.snippet).toLowerCase();
-  const government = /\\b(?:federal|government|pentagon|department of defense|department of homeland security|dod|dhs|usaf|u\\.?s\\.?\\s*(?:army|navy|air force|space force|marine corps)|military|defen[cs]e|sam\\.gov|gsa|logcap|afcap)\\b/i.test(full);
+  const government = /\b(?:federal|government|pentagon|department of defense|department of homeland security|dod|dhs|usaf|u\.?s\.?\s*(?:army|navy|air force|space force|marine corps)|military|defen[cs]e|sam\.gov|gsa|logcap|afcap)\b/i.test(full);
   if (!government) return null;
-  const denied = /\\b(?:not awarded|fails? to win|lost (?:the |a )?(?:bid|contract)|protests? (?:an? )?award|award (?:protest|challenged|overturned))\\b/i.test(full);
-  if (!denied && /\\b(?:awarded|wins?|won|secures?|receives?|lands?|selected for|task order awarded|contract award(?:ed|s)?)\\b/i.test(headline)
-    && /\\b(?:contract|award|task order|agreement|deal|logcap|afcap)\\b/i.test(full)) return "award";
-  if (/\\b(?:solicitation|request for proposals?|request for bids?|invitation to bid|rfp|recompete|re-competition|seeking bids|issues? (?:a |an )?(?:tender|solicitation))\\b/i.test(headline)) return "solicitation";
+  const denied = /\b(?:not awarded|fails? to win|lost (?:the |a )?(?:bid|contract)|protests? (?:an? )?award|award (?:protest|challenged|overturned))\b/i.test(full);
+  if (!denied && /\b(?:awarded|wins?|won|secures?|receives?|lands?|selected for|task order awarded|contract award(?:ed|s)?)\b/i.test(headline)
+    && /\b(?:contract|award|task order|agreement|deal|logcap|afcap)\b/i.test(full)) return "award";
+  if (/\b(?:solicitation|request for proposals?|request for bids?|invitation to bid|rfp|recompete|re-competition|seeking bids|issues? (?:a |an )?(?:tender|solicitation))\b/i.test(headline)) return "solicitation";
   return null;
 }
 
