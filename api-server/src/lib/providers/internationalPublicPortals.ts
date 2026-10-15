@@ -19,6 +19,7 @@ import {
   quotedOr,
 } from "./profileQueryTerms";
 import { summarizeSamVerification } from "./samGovPageVerification";
+import { fetchContractsFinder, fetchFindATender, fetchWorldBank } from "./openGovernmentTenderApis";
 
 const TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search";
 const TED_NOTICE_BASE = "https://ted.europa.eu/en/notice/-/detail";
@@ -367,7 +368,7 @@ export class InternationalPublicPortalsProvider implements DataSourceProvider {
   readonly name = "internationalPublicPortals" as const;
 
   async isConfigured(): Promise<boolean> {
-    // TED published-notice search is anonymous and requires no API key.
+    // TED, UK Find a Tender, UK Contracts Finder and World Bank notice search are all anonymous and need no API key.
     return true;
   }
 
@@ -375,12 +376,15 @@ export class InternationalPublicPortalsProvider implements DataSourceProvider {
     const settled = await Promise.allSettled([
       fetchCanadaBuys(options),
       fetchTed(options),
+      fetchFindATender(options),
+      fetchContractsFinder(options),
+      fetchWorldBank(options),
     ]);
     const records: NormalizedOpportunity[] = [];
     const errors: string[] = [];
     const sources: Record<string, unknown> = {};
 
-    const labels = ["canadaBuys", "ted"] as const;
+    const labels = ["canadaBuys", "ted", "findATender", "contractsFinder", "worldBank"] as const;
     settled.forEach((entry, index) => {
       const label = labels[index]!;
       if (entry.status === "rejected") {
@@ -412,7 +416,7 @@ export class InternationalPublicPortalsProvider implements DataSourceProvider {
       total: limited.length,
       errors: Array.from(new Set(errors)).slice(0, 20),
       diagnostics: {
-        mode: "canada-europe-first-class",
+        mode: "canada-europe-uk-worldbank-first-class",
         sources,
         candidatesBeforeDedupe: records.length,
         acceptedAfterDedupe: limited.length,
@@ -425,7 +429,7 @@ export class InternationalPublicPortalsProvider implements DataSourceProvider {
       name: this.name,
       configured: true,
       healthy: true,
-      recordCount: 2,
+      recordCount: 5,
       errorMessage: undefined,
     };
   }

@@ -208,6 +208,8 @@ export const PROVIDER_DEFINITIONS: Record<RfpProviderName, ProviderDefinition> =
     [
       "CanadaBuys official tender discovery",
       "TED anonymous Search API",
+      "UK Find a Tender + Contracts Finder (OCDS)",
+      "World Bank procurement notices",
       "EU CPV 85147000 Company health services",
       "Canada/Europe source telemetry",
     ],
