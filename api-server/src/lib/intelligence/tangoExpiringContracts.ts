@@ -15,7 +15,7 @@ import {
   recordProviderSuccess,
 } from "../providerBudget";
 import { resolveCredential } from "../config/providerConfig";
-import { profileNaicsCodes } from "../providers/profileQueryTerms";
+import { profileCodesFor, profileNaicsCodes } from "../providers/profileQueryTerms";
 
 const TANGO_BASE_URL = "https://tango.makegov.com";
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -281,16 +281,25 @@ export async function fetchTangoExpiringContracts(
   // A prefix that no Occu-Med code starts with is a valid empty answer, not a failure.
   if (naicsCodes === null) return { records: [], rawCount: 0, error: null };
 
+  // Two axes, merged: contracts classified by Occu-Med NAICS codes, and contracts classified by the profile's PSC
+  // codes. Medical services are often coded by PSC under an unrelated NAICS, so NAICS alone misses real recompetes.
+  // An analyst-chosen industry narrows to the NAICS axis only.
+  const axes: Array<{ param: "naics" | "psc"; values: string[] }> = [];
+  if (naicsCodes.length > 0) axes.push({ param: "naics", values: naicsCodes });
+  const pscCodes = filters.naics?.trim() ? [] : profileCodesFor("PSC").slice(0, 12);
+  if (pscCodes.length > 0) axes.push({ param: "psc", values: pscCodes });
+  if (axes.length === 0) axes.push({ param: "naics", values: [] });
+
   const windowEnd = new Date(now);
   windowEnd.setUTCMonth(windowEnd.getUTCMonth() + WINDOW_MONTHS);
 
-  const buildUrl = (withShape: boolean): URL => {
+  const buildUrl = (axis: { param: "naics" | "psc"; values: string[] }, withShape: boolean): URL => {
     const url = new URL(`${TANGO_BASE_URL}/api/contracts/`);
     url.searchParams.set("limit", String(PAGE_SIZE));
     url.searchParams.set("expiring_gte", dateOnly(now));
     url.searchParams.set("expiring_lte", dateOnly(windowEnd));
     url.searchParams.set("ordering", "-total_contract_value");
-    if (naicsCodes.length > 0) url.searchParams.set("naics", naicsCodes.join("|"));
+    if (axis.values.length > 0) url.searchParams.set(axis.param, axis.values.join("|"));
     if (filters.agency?.trim()) url.searchParams.set("awarding_agency", filters.agency.trim());
     if (focus?.trim()) url.searchParams.set("search", focus.trim().slice(0, 200));
     if (withShape) url.searchParams.set("shape", CONTRACT_SHAPE);
@@ -301,34 +310,43 @@ export async function fetchTangoExpiringContracts(
   const seen = new Set<string>();
   let rawCount = 0;
   let withShape = true;
+  const axisErrors: string[] = [];
 
   try {
-    let currentUrl: URL | null = buildUrl(true);
-    let pageCount = 0;
-    while (currentUrl && pageCount < MAX_PAGES) {
-      pageCount += 1;
-      let page: ContractsPage;
+    for (const axis of axes) {
       try {
-        page = await fetchPage(currentUrl, apiKey);
-      } catch (error) {
-        // A rejected ?shape= must not blank the page: retry once with Tango's default fields.
-        if (withShape && pageCount === 1 && error instanceof TangoHttpError && error.status === 400) {
-          withShape = false;
-          currentUrl = buildUrl(false);
-          page = await fetchPage(currentUrl, apiKey);
-        } else {
-          throw error;
+        let currentUrl: URL | null = buildUrl(axis, withShape);
+        let pageCount = 0;
+        while (currentUrl && pageCount < MAX_PAGES) {
+          pageCount += 1;
+          let page: ContractsPage;
+          try {
+            page = await fetchPage(currentUrl, apiKey);
+          } catch (error) {
+            // A rejected ?shape= must not blank the page: retry once with Tango's default fields.
+            if (withShape && pageCount === 1 && error instanceof TangoHttpError && error.status === 400) {
+              withShape = false;
+              currentUrl = buildUrl(axis, false);
+              page = await fetchPage(currentUrl, apiKey);
+            } else {
+              throw error;
+            }
+          }
+          rawCount += page.count;
+          for (const raw of page.results) {
+            const record = tangoContractToRecompete(raw);
+            if (!record || seen.has(record.id)) continue;
+            seen.add(record.id);
+            records.push(record);
+          }
+          currentUrl = page.next ? new URL(page.next) : null;
         }
+      } catch (error) {
+        // One axis failing must not hide what the other returned; it is reported if nothing came back at all.
+        axisErrors.push(error instanceof Error ? error.message : String(error));
       }
-      rawCount = Math.max(rawCount, page.count);
-      for (const raw of page.results) {
-        const record = tangoContractToRecompete(raw);
-        if (!record || seen.has(record.id)) continue;
-        seen.add(record.id);
-        records.push(record);
-      }
-      currentUrl = page.next ? new URL(page.next) : null;
     }
+    if (records.length === 0 && axisErrors.length === axes.length) throw new Error(axisErrors[0]);
     await recordProviderSuccess(BUDGET_NAME, records.length);
     return { records, rawCount: rawCount || records.length, error: null };
   } catch (error) {

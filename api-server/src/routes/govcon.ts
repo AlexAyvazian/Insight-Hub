@@ -385,7 +385,15 @@ async function fetchForecasts(
   const semantic = normalized.filter((record) => isGovConSemanticCandidate(record, mode));
 
   // Tango records pass the same forward-looking / recompete gate as GovCon records before suppression and ranking.
-  const tangoCandidates = tangoRecords.filter((record) => isGovConSemanticCandidate(record, mode));
+  // Tango has no offset here, so it joins the first source page only; otherwise page 2 repeated page 1's Tango cards.
+  // When GovCon returned nothing, Tango is the whole dataset and is paginated here instead.
+  const pageLimit = boundedInteger(searchParams.get("limit"), 50, 1, 100);
+  const pageOffset = boundedInteger(searchParams.get("offset"), 0, 0, 100_000);
+  const tangoOnly = data.length === 0;
+  const tangoCandidates =
+    tangoOnly || pageOffset === 0
+      ? tangoRecords.filter((record) => isGovConSemanticCandidate(record, mode))
+      : [];
   const allCandidates = [...semantic, ...tangoCandidates];
 
   const suppressions = await loadGovConSuppressions(mode).catch((error) => {
@@ -400,13 +408,15 @@ async function fetchForecasts(
     : ranked;
 
   return {
-    records,
-    pagination: {
-      limit: asNumber(pagination.limit) ?? boundedInteger(searchParams.get("limit"), 50, 1, 100),
-      offset: asNumber(pagination.offset) ?? boundedInteger(searchParams.get("offset"), 0, 0, 100_000),
-      total: asNumber(pagination.total) ?? (data.length + tangoRecords.length),
-      hasNext: asBoolean(pagination.has_next),
-    },
+    records: tangoOnly ? records.slice(pageOffset, pageOffset + pageLimit) : records,
+    pagination: tangoOnly
+      ? { limit: pageLimit, offset: pageOffset, total: records.length, hasNext: pageOffset + pageLimit < records.length }
+      : {
+          limit: asNumber(pagination.limit) ?? pageLimit,
+          offset: asNumber(pagination.offset) ?? pageOffset,
+          total: asNumber(pagination.total) ?? (data.length + tangoRecords.length),
+          hasNext: asBoolean(pagination.has_next),
+        },
     sourcePageRecords: normalized.length + tangoResult.rawCount,
     semanticRejectedCount: normalized.length - semantic.length,
     suppressedCount: allCandidates.length - unsuppressed.length,
