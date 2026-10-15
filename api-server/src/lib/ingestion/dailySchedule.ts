@@ -44,7 +44,7 @@ function boundedInt(
  *   SCHEDULED_INGESTION_HOUR_UTC         0-23              (default 10, about 6am US Eastern)
  *   SCHEDULED_INGESTION_MINUTE_UTC       0-59              (default 17)
  *   SCHEDULED_INGESTION_CATCH_UP_HOURS   1-23              (default 12)
- *   SCHEDULED_INGESTION_EXTRA_PORTAL_PASSES 0-6            (default 0)
+ *   SCHEDULED_INGESTION_EXTRA_PORTAL_PASSES 0-6            (default 3; each pass checks another rotation batch of portals)
  */
 export function readDailyScheduleConfig(
   env: Record<string, string | undefined> = process.env,
@@ -64,7 +64,7 @@ export function readDailyScheduleConfig(
       boundedInt(env.SCHEDULED_INGESTION_CATCH_UP_HOURS, 12, 1, 23) * HOUR_MS,
     extraPortalPasses: boundedInt(
       env.SCHEDULED_INGESTION_EXTRA_PORTAL_PASSES,
-      0,
+      3,
       0,
       6,
     ),

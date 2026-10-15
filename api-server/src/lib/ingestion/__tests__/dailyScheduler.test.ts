@@ -19,6 +19,7 @@ const config = readDailyScheduleConfig({
   SCHEDULED_INGESTION_ENABLED: "true",
   SCHEDULED_INGESTION_HOUR_UTC: "10",
   SCHEDULED_INGESTION_MINUTE_UTC: "0",
+  SCHEDULED_INGESTION_EXTRA_PORTAL_PASSES: "0",
 });
 
 test("configuration defaults: on only in production, bounded values", () => {
@@ -41,6 +42,12 @@ test("configuration defaults: on only in production, bounded values", () => {
   assert.equal(bounded.minuteUtc, 0);
   assert.equal(bounded.extraPortalPasses, 6);
   assert.equal(bounded.catchUpWindowMs, 12 * 60 * 60_000);
+  // Each run only visits one rotation batch of portals, so the daily run adds extra passes by default; 0 turns them off.
+  assert.equal(readDailyScheduleConfig({}).extraPortalPasses, 3);
+  assert.equal(
+    readDailyScheduleConfig({ SCHEDULED_INGESTION_EXTRA_PORTAL_PASSES: "0" }).extraPortalPasses,
+    0,
+  );
 });
 
 test("slot math: before the slot uses yesterday's, after it uses today's", () => {
