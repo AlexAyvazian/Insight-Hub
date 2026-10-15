@@ -34,11 +34,13 @@ function newsSignal(article: Article): NewsSignal {
   if (!Number.isFinite(date) || date > Date.now() + 86400_000 || date < Date.now() - 7 * 86400_000) return null;
   const headline = article.title.toLowerCase();
   const full = (article.title + " " + article.snippet).toLowerCase();
-  const government = /\b(?:federal|government|pentagon|department of defense|department of homeland security|dod|dhs|usaf|u\.?s\.?\s*(?:army|navy|air force|space force|marine corps)|military|defen[cs]e|sam\.gov|gsa|logcap|afcap)\b/i.test(full);
+  const government = /\b(?:federal|government|pentagon|department of defense|department of homeland security|dod|dhs|usaf|u\.?s\.?\s*(?:army|navy|air force|space force|marine corps|government)|military|defen[cs]e|sam\.gov|gsa|logcap|afcap|federal aviation administration|department of energy|department of state|department of veterans affairs|national aeronautics and space administration|nasa)\b/i.test(full);
   if (!government) return null;
   const denied = /\b(?:not awarded|fails? to win|lost (?:the |a )?(?:bid|contract)|protests? (?:an? )?award|award (?:protest|challenged|overturned))\b/i.test(full);
-  if (!denied && /\b(?:awarded|wins?|won|secures?|receives?|lands?|selected for|task order awarded|contract award(?:ed|s)?)\b/i.test(headline)
-    && /\b(?:contract|award|task order|agreement|deal|logcap|afcap)\b/i.test(full)) return "award";
+  // "awarded a $X contract" and "$X contract win" are both common headlines.
+  // Require an actual contract/award context; generic corporate wins are not awards.
+  if (!denied && /\b(?:awarded|wins?|won|secures?|receives?|lands?|selected for|award(?:ed|s)?|contract win|contractor selected)\b/i.test(headline)
+    && /\b(?:contract|award|task order|delivery order|logcap|afcap)\b/i.test(full)) return "award";
   if (/\b(?:solicitation|request for proposals?|request for bids?|invitation to bid|rfp|recompete|re-competition|seeking bids|issues? (?:a |an )?(?:tender|solicitation))\b/i.test(headline)) return "solicitation";
   return null;
 }
@@ -171,13 +173,10 @@ export default function CompanyWatchPage() {
     if (add.trim()) setCompanies(unique([...companies.map(company => company.name), add]).map(name => ({ name })));
     setAdd("");
   };
-  const matching = (name: string) => {
-    const tokens = name.toLowerCase().split(/\s+/).filter(token => !["corporation", "company", "international", "services", "systems", "the", "of"].includes(token));
-    return articles.filter(article => {
-      const text = `${article.title} ${article.snippet}`.toLowerCase();
-      return article.companyNames?.includes(name) || text.includes(name.toLowerCase()) || (tokens.length > 0 && tokens.every(token => text.includes(token)));
-    });
-  };
+  // Association is established by the per-company search response, not by
+  // generic fragments such as "general", "systems", or "international".
+  const matching = (name: string) =>
+    articles.filter(article => article.companyNames?.includes(name));
 
   return (
     <div className="portal-readable space-y-7">
