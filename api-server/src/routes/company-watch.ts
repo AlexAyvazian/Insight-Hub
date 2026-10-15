@@ -100,7 +100,6 @@ export function matchesCompanyNews(text: string, company: string): boolean {
     "mantech international": ["ManTech"],
     "jacobs technology": ["Jacobs"],
     "american bureau of shipping": ["ABS"],
-    "i ap worldwide services": ["IAP Worldwide Services"],
   };
   const normalized = company.toLowerCase().trim();
   const shortName = company.replace(/\s+(?:corporation|corp\.?|inc\.?|llc|ltd\.?|company)$/i, "").trim();
@@ -212,7 +211,7 @@ router.post('/company-watch/search', async (req, res) => {
   }
   try {
     const result = await pending;
-    const ttl = result.warnings.length ? PARTIAL_CACHE_TTL_MS : SEARCH_CACHE_TTL_MS;
+    const ttl = result.warnings.length ? PARTIAL_CACHE_TTL_MS : NEWS_POOL_TTL_MS;
     searchCache.set(cacheKey, { expiresAt: Date.now() + ttl, result });
     for (const [key, entry] of searchCache) {
       if (entry.expiresAt <= Date.now()) searchCache.delete(key);
