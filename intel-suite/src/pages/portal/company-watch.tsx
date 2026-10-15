@@ -249,8 +249,11 @@ export default function CompanyWatchPage() {
                 if (companyNames.length) merged.set(article.url, { ...article, companyNames });
               }
               for (const article of result.articles) {
-                const companyNames = [...new Set([...(merged.get(article.url)?.companyNames ?? []), name])];
-                merged.set(article.url, { ...article, companyNames });
+                const existing = merged.get(article.url);
+                const companyNames = [...new Set([...(existing?.companyNames ?? []), name])];
+                // A shared article must retain a separate verified assessment for every watched company.
+                const assessments = { ...(existing?.assessments ?? {}), ...(article.assessments ?? {}) };
+                merged.set(article.url, { ...existing, ...article, companyNames, assessments });
               }
               return [...merged.values()];
             });
@@ -411,7 +414,7 @@ export default function CompanyWatchPage() {
               .filter(article => articleSignal(article, selected.name) === kind)
               .filter(article => {
                 const assessment = article.assessments?.[selected.name];
-                return kind !== "award" || !assessment || assessment.attribution === "reported_awardee";
+                return kind !== "award" || assessment?.attribution === "reported_awardee";
               })
               .sort((left, right) => rank(left) - rank(right) || (Date.parse(right.publishedAt ?? "") || 0) - (Date.parse(left.publishedAt ?? "") || 0));
             return (
