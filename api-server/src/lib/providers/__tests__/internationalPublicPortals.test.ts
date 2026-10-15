@@ -84,5 +84,5 @@ test("international provider is keyless-configured because TED published search 
   const status = await internationalPublicPortalsProvider.getStatus();
   assert.equal(status.configured, true);
   assert.equal(status.healthy, true);
-  assert.equal(status.recordCount, 8);
+  assert.equal(status.recordCount, 9);
 });

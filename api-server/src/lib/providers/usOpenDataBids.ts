@@ -4,6 +4,7 @@
  *   - NYC City Record Online (dg92-zbpx): every NYC agency procurement solicitation, with due dates and contacts
  *   - City of Los Angeles RAMP open bid opportunities (hf3r-utnq): City of LA, LAUSD and partner agencies
  *   - Montgomery County, MD solicitations (eeq6-nnwe)
+ *   - State of Delaware open bids (2hnj-zwix): state agencies, school districts and colleges
  *
  * No key is required. SOCRATA_APP_TOKEN, when set, is sent as X-App-Token for a higher rate limit. Every record goes
  * through the same Neon-profile relevance gate as TED, and closed, cancelled or expired bids are dropped.
@@ -17,11 +18,12 @@ import { decideRelevance } from "../search/relevanceDecision";
 const NYC_URL = "https://data.cityofnewyork.us/resource/dg92-zbpx.json";
 const LA_RAMP_URL = "https://data.lacity.org/resource/hf3r-utnq.json";
 const MONTGOMERY_URL = "https://data.montgomerycountymd.gov/resource/eeq6-nnwe.json";
+const DELAWARE_URL = "https://data.delaware.gov/resource/2hnj-zwix.json";
 const ROW_LIMIT = 1000;
 const UNKNOWN_POSTED_DATE = new Date(0);
 
 type Row = Record<string, unknown>;
-export type UsOpenDataSource = "nycCityRecord" | "laRamp" | "montgomeryCountyMd";
+export type UsOpenDataSource = "nycCityRecord" | "laRamp" | "montgomeryCountyMd" | "delawareMarketplace";
 
 function text(value: unknown): string | undefined {
   if (typeof value === "string" && value.trim()) return value.replace(/\s+/g, " ").trim();
@@ -219,6 +221,46 @@ export function montgomeryToOpportunity(row: Row): NormalizedOpportunity | null 
   };
 }
 
+export function delawareBidToOpportunity(row: Row): NormalizedOpportunity | null {
+  const number = text(row.contractnumber);
+  const title = text(row.contracttitle);
+  if (!number || !title) return null;
+  const deadline = parseDate(row.deadlinedate);
+  if (!deadline || deadline.getTime() < Date.now()) return null;
+
+  const link = row.bidurl && typeof row.bidurl === "object" ? text((row.bidurl as Row).url) : text(row.bidurl);
+  const sourceUrl = link ?? `https://mmp.delaware.gov/Bids?number=${encodeURIComponent(number)}`;
+  const unspsc = text(row.unspsc);
+  const description = unspsc ? `UNSPSC segment/family: ${unspsc}` : undefined;
+  if (!relevant(title, description, sourceUrl)) return null;
+
+  const agencyCode = text(row.agencycode);
+  const base = baseRecord("delawareMarketplace", "Delaware Bids (Marketplace)", "Delaware");
+  return {
+    ...base,
+    externalId: externalIdFor("de-mmp", number),
+    title,
+    agency: agencyCode ? `State of Delaware (${agencyCode})` : "State of Delaware",
+    type: "Solicitation",
+    status: "active",
+    postedDate: parseDate(row.opendate) ?? UNKNOWN_POSTED_DATE,
+    responseDeadline: deadline,
+    description,
+    location: "Delaware",
+    placeOfPerformance: "Delaware",
+    sourceUrl,
+    solicitationNumber: number,
+    rawData: {
+      ...base.rawData,
+      sourceConfidence: "high",
+      deadlineProvenance: "official_structured",
+      descriptionProvenance: description ? "official_structured" : "unknown",
+      agencyCode,
+      unspsc,
+    },
+  };
+}
+
 async function fetchRows(baseUrl: string, where: string, order: string, signal?: AbortSignal): Promise<Row[]> {
   const params = new URLSearchParams({ $where: where, $order: order, $limit: String(ROW_LIMIT) });
   const headers: Record<string, string> = { accept: "application/json" };
@@ -277,5 +319,15 @@ export const fetchMontgomeryCounty = (options: FetchOptions) =>
     `status='Active' AND closingdate > '${soqlNow()}'`,
     "issuancedate DESC",
     montgomeryToOpportunity,
+    options,
+  );
+
+export const fetchDelawareBids = (options: FetchOptions) =>
+  fetchSource(
+    "delawareMarketplace",
+    DELAWARE_URL,
+    `deadlinedate > '${soqlNow()}'`,
+    "opendate DESC",
+    delawareBidToOpportunity,
     options,
   );

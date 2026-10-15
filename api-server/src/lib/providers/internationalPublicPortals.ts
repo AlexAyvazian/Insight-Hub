@@ -20,7 +20,7 @@ import {
 } from "./profileQueryTerms";
 import { summarizeSamVerification } from "./samGovPageVerification";
 import { fetchContractsFinder, fetchFindATender, fetchWorldBank } from "./openGovernmentTenderApis";
-import { fetchLaRamp, fetchMontgomeryCounty, fetchNycCityRecord } from "./usOpenDataBids";
+import { fetchDelawareBids, fetchLaRamp, fetchMontgomeryCounty, fetchNycCityRecord } from "./usOpenDataBids";
 
 const TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search";
 const TED_NOTICE_BASE = "https://ted.europa.eu/en/notice/-/detail";
@@ -383,12 +383,13 @@ export class InternationalPublicPortalsProvider implements DataSourceProvider {
       fetchNycCityRecord(options),
       fetchLaRamp(options),
       fetchMontgomeryCounty(options),
+      fetchDelawareBids(options),
     ]);
     const records: NormalizedOpportunity[] = [];
     const errors: string[] = [];
     const sources: Record<string, unknown> = {};
 
-    const labels = ["canadaBuys", "ted", "findATender", "contractsFinder", "worldBank", "nycCityRecord", "laRamp", "montgomeryCountyMd"] as const;
+    const labels = ["canadaBuys", "ted", "findATender", "contractsFinder", "worldBank", "nycCityRecord", "laRamp", "montgomeryCountyMd", "delawareMarketplace"] as const;
     settled.forEach((entry, index) => {
       const label = labels[index]!;
       if (entry.status === "rejected") {
@@ -433,7 +434,7 @@ export class InternationalPublicPortalsProvider implements DataSourceProvider {
       name: this.name,
       configured: true,
       healthy: true,
-      recordCount: 8,
+      recordCount: 9,
       errorMessage: undefined,
     };
   }

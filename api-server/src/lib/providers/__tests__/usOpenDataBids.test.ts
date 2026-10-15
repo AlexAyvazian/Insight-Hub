@@ -7,7 +7,7 @@ process.env.INTEL_DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.AUTH_DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.APP_DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
-const { fetchLaRamp, fetchNycCityRecord, laRampToOpportunity, montgomeryToOpportunity, nycNoticeToOpportunity } =
+const { delawareBidToOpportunity, fetchLaRamp, fetchNycCityRecord, laRampToOpportunity, montgomeryToOpportunity, nycNoticeToOpportunity } =
   await import("../usOpenDataBids");
 const { profileLeadQueries } = await import("../profileQueryTerms");
 
@@ -101,6 +101,28 @@ test("Montgomery County rows map with a unique per-bid link; inactive and expire
   assert.equal(montgomeryToOpportunity(mc({ status: "Closed" })), null);
   assert.equal(montgomeryToOpportunity(mc({ closingdate: PAST })), null);
   assert.equal(montgomeryToOpportunity(mc({ description: "Custom cardboard boxes" })), null);
+});
+
+const de = (o: Record<string, unknown> = {}) => ({
+  contractnumber: "STA26-PSCSTR",
+  contracttitle: service(),
+  opendate: "2026-09-15T00:00:00.000",
+  deadlinedate: FUTURE,
+  agencycode: "STA",
+  unspsc: "8010",
+  bidurl: { url: "https://mmp.delaware.gov/Bids/Details/9319" },
+  ...o,
+});
+
+test("Delaware bids map with the nested bid link; expired, undated and irrelevant bids are dropped", () => {
+  const record = delawareBidToOpportunity(de());
+  assert.ok(record);
+  assert.equal(record.sourceUrl, "https://mmp.delaware.gov/Bids/Details/9319");
+  assert.equal(record.agency, "State of Delaware (STA)");
+  assert.equal(record.solicitationNumber, "STA26-PSCSTR");
+  assert.equal(delawareBidToOpportunity(de({ deadlinedate: PAST })), null);
+  assert.equal(delawareBidToOpportunity(de({ deadlinedate: undefined })), null);
+  assert.equal(delawareBidToOpportunity(de({ contracttitle: "Generator replacement", unspsc: "7215" })), null);
 });
 
 test("fetchers query SODA with open-bid filters and the optional app token", async () => {
