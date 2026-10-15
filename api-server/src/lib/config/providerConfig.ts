@@ -1,6 +1,7 @@
 import { rfpDb as db } from "@workspace/db";
 import { settingsTable } from "@workspace/db/schema";
 import { createCredentialSettingsCache } from "./credentialSettingsCache";
+import { logger } from "../logger";
 
 export { createCredentialSettingsCache };
 
@@ -597,6 +598,23 @@ export interface ResolvedCredential {
   key: string;
 }
 
+const SECRET_ENV_NAME = /(?:KEY|TOKEN|SECRET)(?:_\d+)?$/i;
+const warnedMalformedEnvKeys = new Set<string>();
+
+/**
+ * Position and code point of the first character that can never appear in an API key or token (anything outside
+ * printable ASCII, e.g. a Cyrillic look-alike letter pasted in by mistake), or null when the value is clean.
+ */
+export function findInvalidCredentialCharacter(value: string): { index: number; codePoint: string } | null {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code > 0x7e) {
+      return { index, codePoint: `U+${code.toString(16).toUpperCase().padStart(4, "0")}` };
+    }
+  }
+  return null;
+}
+
 export async function resolveCredentialWithSource(
   dbKey: string,
   envKey?: string,
@@ -604,7 +622,18 @@ export async function resolveCredentialWithSource(
   if (envKey) {
     const envVal = process.env[envKey];
     if (envVal && envVal.trim()) {
-      return { value: envVal.trim(), source: "environment", key: envKey };
+      const value = envVal.trim();
+      const invalid = SECRET_ENV_NAME.test(envKey) ? findInvalidCredentialCharacter(value) : null;
+      if (!invalid) return { value, source: "environment", key: envKey };
+      // A key with a stray non-ASCII character is rejected by every API, and can crash the request before it is
+      // sent. Treat it as unset (so pools fall through to the next key) and say which variable to re-paste.
+      if (!warnedMalformedEnvKeys.has(envKey)) {
+        warnedMalformedEnvKeys.add(envKey);
+        logger.warn(
+          { envKey, position: invalid.index, codePoint: invalid.codePoint },
+          `Ignoring ${envKey}: it contains a non-ASCII character at position ${invalid.index} (${invalid.codePoint}). Re-enter the value in Render.`,
+        );
+      }
     }
   }
 
