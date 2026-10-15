@@ -734,6 +734,16 @@ export class OpenGovProvider implements DataSourceProvider {
         if (result.error) {
           allErrors.push(`${tenant.portalId}: ${result.error}`);
         }
+        // One line per tenant so a run's logs show which OpenGov portals answered (and with which HTTP status).
+        console.log(
+          JSON.stringify({
+            event: "opengov_tenant_result",
+            tenant: tenant.tenantSlug,
+            records: result.records.length,
+            pagesFetched: result.pagesFetched,
+            error: result.error ?? null,
+          }),
+        );
 
         // Cross-tenant deduplication (same project appearing on two tenants).
         for (const record of result.records) {

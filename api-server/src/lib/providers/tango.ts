@@ -60,6 +60,24 @@ interface TangoListResponse {
   results: TangoOpportunity[];
 }
 
+/**
+ * Plain text from a Tango field. Tango sends some fields as strings and others as `{ code, description }` objects (or
+ * numbers); the ingestion pipeline calls `.trim()` on these, so a non-string value fails every record that carries it
+ * ("e?.trim is not a function") and nothing from the provider is stored.
+ */
+export function tangoText(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    for (const key of ["description", "name", "title", "display_name", "label", "type", "code", "value"]) {
+      const candidate = record[key];
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
 function parsedDate(value?: string): Date | undefined {
   if (!value) return undefined;
   const parsed = new Date(value);
@@ -123,33 +141,32 @@ export class TangoProvider implements DataSourceProvider {
   ): NormalizedOpportunity {
     const placeParts: string[] = [];
     const place = opportunity.place_of_performance;
-    if (place?.city) placeParts.push(place.city);
-    if (place?.state) placeParts.push(place.state);
-    if (
-      place?.country &&
-      place.country !== "United States" &&
-      place.country !== "USA"
-    ) {
-      placeParts.push(place.country);
+    const city = tangoText(place?.city);
+    const state = tangoText(place?.state);
+    const country = tangoText(place?.country);
+    if (city) placeParts.push(city);
+    if (state) placeParts.push(state);
+    if (country && country !== "United States" && country !== "USA") {
+      placeParts.push(country);
     }
 
     const postedDate = parsedDate(opportunity.first_notice_date);
     return {
-      externalId: opportunity.opportunity_id,
-      title: opportunity.title || "Untitled Opportunity",
-      agency: opportunity.office?.agency_name || "Unknown Agency",
-      subAgency: opportunity.office?.department_name || undefined,
-      type: opportunity.meta?.notice_type?.type || "Solicitation",
+      externalId: tangoText(opportunity.opportunity_id) ?? "",
+      title: tangoText(opportunity.title) || "Untitled Opportunity",
+      agency: tangoText(opportunity.office?.agency_name) || "Unknown Agency",
+      subAgency: tangoText(opportunity.office?.department_name),
+      type: tangoText(opportunity.meta?.notice_type?.type) || "Solicitation",
       status: opportunity.active ? "active" : "archived",
-      naicsCode: opportunity.naics_code || undefined,
+      naicsCode: tangoText(opportunity.naics_code),
       postedDate: postedDate ?? UNKNOWN_POSTED_DATE,
       responseDeadline: parsedDate(opportunity.response_deadline),
-      setAside: opportunity.set_aside || undefined,
+      setAside: tangoText(opportunity.set_aside),
       placeOfPerformance:
         placeParts.length > 0 ? placeParts.join(", ") : undefined,
-      description: opportunity.description || undefined,
-      solicitationNumber: opportunity.solicitation_number || undefined,
-      sourceUrl: opportunity.sam_url || undefined,
+      description: tangoText(opportunity.description),
+      solicitationNumber: tangoText(opportunity.solicitation_number),
+      sourceUrl: tangoText(opportunity.sam_url),
       source: this.name,
       providerName: this.name,
       rawData: {

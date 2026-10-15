@@ -16,7 +16,28 @@ import { occumedDefaultQueries, occumedExtractionGuidance, occumedScopeSummary }
 import { FreeTierCredentialPool } from "./freeTierCredentialPool";
 
 const GROQ_BASE = "https://api.groq.com/openai/v1";
-const DEFAULT_MODEL = "llama-3.1-8b-instant";
+// Groq retired llama-3.1-8b-instant for free/developer keys on 2026-08-16 (HTTP 404 model_not_found since); its
+// deprecation page names openai/gpt-oss-20b as the replacement. Override with GROQ_MODEL.
+const DEFAULT_MODEL = "openai/gpt-oss-20b";
+const REASONING_HEADROOM_TOKENS = 400;
+/** Groq model ids past their shutdown date (https://console.groq.com/docs/deprecations). */
+const GROQ_RETIRED_MODELS = new Set(["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]);
+
+/** gpt-oss models spend part of max_tokens on reasoning; without headroom a short answer comes back empty. */
+export function groqRequestBody(
+  model: string,
+  prompt: string,
+  maxTokens: number,
+): Record<string, unknown> {
+  const reasoning = model.startsWith("openai/gpt-oss");
+  return {
+    model,
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: reasoning ? maxTokens + REASONING_HEADROOM_TOKENS : maxTokens,
+    temperature: 0.2,
+    ...(reasoning ? { reasoning_effort: "low" } : {}),
+  };
+}
 const credentials = new FreeTierCredentialPool(
   "groq-multi-account",
   [
@@ -31,7 +52,8 @@ export class GroqProvider implements DataSourceProvider {
 
   private async getModel(): Promise<string> {
     const model = await resolveCredential("groqModel", "GROQ_MODEL");
-    return model ?? DEFAULT_MODEL;
+    // A saved setting that still names a retired model would keep every call failing; use the live default instead.
+    return model && !GROQ_RETIRED_MODELS.has(model) ? model : DEFAULT_MODEL;
   }
 
   async isConfigured(): Promise<boolean> {
@@ -60,12 +82,7 @@ export class GroqProvider implements DataSourceProvider {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: maxTokens,
-          temperature: 0.2,
-        }),
+        body: JSON.stringify(groqRequestBody(model, prompt, maxTokens)),
         signal: signal
           ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
           : AbortSignal.timeout(30_000),
