@@ -374,7 +374,7 @@ function matchesSource(article: NewsArticle, domains: string[]): boolean {
   return domains.some(domain => hostname === domain || hostname.endsWith(`.${domain}`));
 }
 
-export async function fetchRelevantNews(query: string, max: number, page: number, search: string | null, sourceDomains: string[] = []): Promise<NewsPayload> {
+export async function fetchRelevantNews(query: string, max: number, page: number, search: string | null, sourceDomains: string[] = [], includeSupplemental = true): Promise<NewsPayload> {
   const jobs: Array<{ provider: "gnews" | "apitube" | "tinyfish" | "keenable"; run: () => Promise<{ articles: unknown[]; warnings: string[] }> }> = [];
   // GNews and APITube keep their full news coverage.
   // TinyFish and Keenable target only the monitored publications.
@@ -389,7 +389,7 @@ export async function fetchRelevantNews(query: string, max: number, page: number
   if (apitubeKeys().length) jobs.push({ provider: "apitube", run: () => fetchApitubeNews(search, max, page) });
   const [results, supplemental] = await Promise.all([
     Promise.allSettled(jobs.map(job => job.run())),
-    getSupplementalNewsPool(),
+    includeSupplemental ? getSupplementalNewsPool() : Promise.resolve(null),
   ]);
   const sources: NewsPayload["sources"] = [];
   const warnings: string[] = [];
@@ -408,8 +408,8 @@ export async function fetchRelevantNews(query: string, max: number, page: number
       logger.warn({ provider, statusCode: failureStatus }, "Relevant news provider unavailable");
     }
   }
-  for (const name of SUPPLEMENTAL_PROVIDERS) {
-    const feed = supplemental[name];
+  for (const name of includeSupplemental ? SUPPLEMENTAL_PROVIDERS : []) {
+    const feed = supplemental![name];
     if (feed.status === "disabled") continue;
     if (feed.status === "ok") {
       sources.push(name);
