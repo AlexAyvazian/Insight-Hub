@@ -8,7 +8,7 @@ import { locationCountry } from "../officialAward";
 import { normalizeUsaSpendingRow, fetchUsaSpendingAwards, usaSpendingRequestBody } from "../usaSpendingAwards";
 import { buildCompanyLeads, dedupeLeads } from "../awardLeads";
 import { upsertAwards, type SqlRunner, type StoredAward } from "../awardStore";
-import { companyAwards, runAwardPass } from "../awardWatcher";
+import { bootstrapDefaultCompanyWatch, companyAwards, DEFAULT_COMPANY_WATCH_NAMES, runAwardPass, runDodPass, type AwardPassSummary } from "../awardWatcher";
 import { buildProfile, type ProfileRows } from "../../search/relevanceProfile";
 
 const NOW = Date.parse("2026-10-15T12:00:00Z");
@@ -254,6 +254,45 @@ test("first-seen tracking: an award is new once; re-seeing it keeps the original
 });
 
 // ── No paid news calls ────────────────────────────────────────────────────────────────────────────────────────────
+
+test("server seeds the UI default watchlist once without a browser session", async () => {
+  let registered: string[] = [];
+  const run: SqlRunner = async (statement, parameters = []) => {
+    if (statement.includes("count(*)::int AS registered")) return [{ registered: registered.length }];
+    if (statement.includes("INSERT INTO company_watch_companies")) {
+      registered = parameters[1] as string[];
+      return [];
+    }
+    return [];
+  };
+  const count = await bootstrapDefaultCompanyWatch(run);
+  assert.equal(count, new Set(DEFAULT_COMPANY_WATCH_NAMES.map(x => x.toLowerCase())).size);
+  assert.ok(registered.includes("Leidos"));
+  assert.ok(registered.includes("Amentum"));
+  assert.ok(registered.includes("KBR"));
+  assert.equal(await bootstrapDefaultCompanyWatch(run), 0, "restarts must not overwrite the existing watchlist");
+});
+
+test("DoD 403 is reported as blocked and stops repeated calls to a rejected host", async () => {
+  const rss = [1, 2, 3].map(n => "<item><title>Contracts for Oct. 15, 2026</title><link>https://www.war.gov/News/Contracts/Contract/Article/" + n + "/</link><description>Summary only</description></item>").join("");
+  let articleRequests = 0;
+  const fakeFetch = (async (url: string | URL | Request) => {
+    if (String(url).includes("RSS.ashx")) return new Response("<rss><channel>" + rss + "</channel></rss>");
+    articleRequests++;
+    return new Response("Forbidden", { status: 403 });
+  }) as typeof fetch;
+  const summary: AwardPassSummary = {
+    startedAt: new Date().toISOString(), finishedAt: null,
+    dod: { status: "not run", feedItems: 0, pagesProcessed: 0, pagesSkipped: 0, awardsParsed: 0, newAwards: 0, errors: [] },
+    usaspending: { companies: 0, rows: 0, matched: 0, newAwards: 0, rejectedRecipients: 0, errors: [] },
+  };
+  const run: SqlRunner = async () => [];
+  await runDodPass(run, summary, fakeFetch);
+  assert.equal(summary.dod.status, "blocked: HTTP 403");
+  assert.equal(summary.dod.feedItems, 3);
+  assert.equal(articleRequests, 1, "do not hammer 403-blocked article pages");
+  assert.equal(summary.dod.errors.length, 1);
+});
 
 test("official awards and the background pass make no paid news API calls", async t => {
   const hosts: string[] = [];
