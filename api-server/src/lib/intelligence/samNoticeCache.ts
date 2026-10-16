@@ -70,7 +70,7 @@ export async function saveSamIntelligenceNotices(
   });
   const params: unknown[] = [];
   const cells = values.map((row, rowIndex) =>
-    "(" + row.map((value, colIndex) => { params.push(value); return "$" + (rowIndex * 15 + colIndex + 1); }).join(",") + ")"
+    "(" + row.map((value, colIndex) => { params.push(value); return "$" + (rowIndex * 14 + colIndex + 1); }).join(",") + ")"
   ).join(",");
   await run(`INSERT INTO sam_gov_intelligence_notices (
     notice_id, notice_type, title, agency, description, naics_code, set_aside, work_location,
