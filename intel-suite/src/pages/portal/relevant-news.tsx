@@ -18,6 +18,7 @@ const DEFAULT_SOURCES: MonitoredSource[] = [
 ];
 const sourceStorageKey = "insight-hub.relevant-news.sources";
 
+const PROVIDER_LABELS: Record<string, string> = { gnews: "GNews", apitube: "APITube", tinyfish: "TinyFish", keenable: "Keenable", thenewsapi: "The News API", currents: "Currents", gdelt: "GDELT", newsdata: "NewsData.io" };
 type NewsArticle = {
   id: string;
   title: string;
@@ -32,7 +33,7 @@ type NewsArticle = {
     country: string | null;
   };
   relevanceScore: number;
-  provider?: "gnews" | "apitube" | "tinyfish" | "keenable";
+  provider?: "gnews" | "apitube" | "tinyfish" | "keenable" | "thenewsapi" | "currents" | "gdelt" | "newsdata";
   companies?: string[];
   signals?: string[];
 };
@@ -44,7 +45,7 @@ type NewsResponse = {
   filteredOut: number;
   query: string;
   source: "gnews" | "apitube" | "tinyfish" | "keenable" | "mixed";
-  sources?: Array<"gnews" | "apitube" | "tinyfish" | "keenable">;
+  sources?: Array<"gnews" | "apitube" | "tinyfish" | "keenable" | "thenewsapi" | "currents" | "gdelt" | "newsdata">;
   warnings?: string[];
   deduplicated?: number;
   fetchedAt: string;
@@ -147,7 +148,7 @@ export default function RelevantNewsPage() {
   const upstreamArticles = query.data?.upstreamArticles ?? 0;
   const filteredOut = query.data?.filteredOut ?? 0;
   const providers = (query.data?.sources ?? (query.data?.source === "mixed" ? ["gnews", "apitube"] : query.data?.source ? [query.data.source] : []))
-    .map(provider => provider === "keenable" ? "Keenable" : provider === "apitube" ? "APITube" : provider === "tinyfish" ? "TinyFish" : "GNews").join(" + ") || "news providers";
+    .map(provider => PROVIDER_LABELS[provider] ?? provider).join(" + ") || "news providers";
   const statusText = query.isFetching
     ? "Refreshing relevant news"
     : `${articles.length.toLocaleString("en-US")} articles shown`;
@@ -260,7 +261,7 @@ export default function RelevantNewsPage() {
               <ArticlePhoto key={`${article.url}|${article.image ?? "publisher"}`} article={article} />
               <div className="min-w-0 p-5">
                 <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-[11px] uppercase tracking-[0.15em] text-white/35">
-                  <span className="ui-break-anywhere">{article.source.name}{article.provider && ` · ${article.provider === "keenable" ? "Keenable" : article.provider === "apitube" ? "APITube" : article.provider === "tinyfish" ? "TinyFish" : "GNews"}`}</span>
+                  <span className="ui-break-anywhere">{article.source.name}{article.provider && ` · ${PROVIDER_LABELS[article.provider] ?? article.provider}`}</span>
                   <time dateTime={article.publishedAt ?? undefined}>{displayDate(article.publishedAt)}</time>
                 </div>
                 <h2 className="ui-break-anywhere mt-3 text-xl font-semibold leading-snug text-white">{article.title}</h2>
