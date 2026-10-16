@@ -18,6 +18,80 @@ import { buildCompanyLeads, type AwardLead } from "./awardLeads";
 import { DOD_CONTRACTS_RSS, announcementDate, fetchText, parseAnnouncement, parseContractsRss } from "./dodContracts";
 import { fetchUsaSpendingAwards } from "./usaSpendingAwards";
 
+export const DEFAULT_COMPANY_WATCH_NAMES = [
+  "Leidos",
+  "IAP Worldwide Services",
+  "MAG Aerospace",
+  "Camber Corporation",
+  "Trace Systems",
+  "KBR",
+  "BAE Systems",
+  "Weatherford International",
+  "Versar",
+  "Constellis",
+  "C3EL",
+  "Fluor Corporation",
+  "Clovehitch",
+  "V2X",
+  "Sierra Nevada Corporation",
+  "Valiant Integrated Services",
+  "AC Transit",
+  "Freeport-McMoRan",
+  "California Department of Corrections and Rehabilitation",
+  "Alutiiq",
+  "ManTech International",
+  "GDC",
+  "CACI International",
+  "IDS International",
+  "SOS International",
+  "ITC Defense",
+  "DataPath",
+  "SkyBridge Tactical",
+  "Amentum",
+  "American International Contractors",
+  "Anduril",
+  "APVI",
+  "ASRC Federal",
+  "Astrapi Advisors",
+  "Atlas Advisors",
+  "Bell Textron",
+  "BL Harbert International",
+  "CDAS",
+  "Dynamic Aviation",
+  "Fathom 4",
+  "GardaWorld",
+  "General Dynamics Information Technology",
+  "Group SSI",
+  "IAP",
+  "International SOS",
+  "Jacobs Technology",
+  "Navmar Applied Science Corporation",
+  "Noblis",
+  "Olgoonik Solutions",
+  "Patriot Group International",
+  "Peraton",
+  "Platform Aerospace",
+  "Prüst Holding",
+  "S3 International",
+  "Strategic Solutions Unlimited",
+  "University of Maryland Global Campus",
+  "Vectrus",
+  "Versar Global Solutions",
+  "Westinghouse Electric Company",
+] as const;
+
+/** Register the default UI roster on the server if no browser has registered any companies yet.
+ * This is deliberately one-time: later page edits and custom watched companies take precedence.
+ */
+export async function bootstrapDefaultCompanyWatch(run: SqlRunner): Promise<number> {
+  const rows = await run("SELECT count(*)::int AS registered FROM company_watch_companies");
+  if (rows.length !== 1 || Number(rows[0]?.registered) !== 0) return 0;
+  const unique = [...new Map(DEFAULT_COMPANY_WATCH_NAMES.map(name => [companyKey(name), name])).entries()]
+    .map(([key, name]) => ({ key, name }));
+  await recordRequestedCompanies(run, unique);
+  return unique.length;
+}
+
 const PASS_INTERVAL_MS = 3 * 3_600_000;
 const FIRST_PASS_DELAY_MS = 4 * 60_000;
 const USASPENDING_BATCH = 15;
@@ -26,6 +100,7 @@ const USASPENDING_SPACING_MS = 1_500;
 export interface AwardPassSummary {
   startedAt: string;
   finishedAt: string | null;
+  bootstrappedCompanies?: number;
   dod: { status: string; feedItems: number; pagesProcessed: number; pagesSkipped: number; awardsParsed: number; newAwards: number; errors: string[] };
   usaspending: { companies: number; rows: number; matched: number; newAwards: number; rejectedRecipients: number; errors: string[] };
 }
@@ -59,6 +134,12 @@ export async function runDodPass(run: SqlRunner, summary: AwardPassSummary, fetc
         if (!page.ok) {
           summary.dod.errors.push(`${item.link}: HTTP ${page.status}`);
           await markSourceProcessed(run, item.link, 0, `HTTP ${page.status}`);
+          // A global WAF block or rate limit affects every article, not just this one.
+          // Do not hammer remaining links or report a falsely healthy source.
+          if (page.status === 403 || page.status === 429) {
+            summary.dod.status = `blocked: HTTP ${page.status}`;
+            break;
+          }
           continue;
         }
         awards = parseAnnouncement(page.text, item.link, date);
@@ -104,6 +185,10 @@ export async function runAwardPass(runner?: SqlRunner, fetchImpl: typeof fetch =
     try {
       const run = runner ?? await defaultRunner();
       await ensureAwardStore(run);
+      summary.bootstrappedCompanies = await bootstrapDefaultCompanyWatch(run).catch(error => {
+        summary.usaspending.errors.push(`watchlist bootstrap: ${errorText(error)}`);
+        return 0;
+      });
       await runDodPass(run, summary, fetchImpl).catch(error => { summary.dod.status = `error: ${errorText(error)}`; });
       await runUsaSpendingPass(run, summary, fetchImpl).catch(error => { summary.usaspending.errors.push(errorText(error)); });
     } catch (error) {
