@@ -46,6 +46,7 @@ const SOURCE_LABELS: Record<OfficialAward["source"], string> = {
   dod_contract_announcement: "Department of War daily contract announcement",
   usaspending: "USAspending.gov award record",
   insight_hub_opportunity: "Award notice in Insight Hub opportunities",
+  sam_gov_award_notice: "SAM.gov official award notice (cached in Insight Hub)",
 };
 
 /** Recipient entry of a DoD paragraph without its location/contract-number tail, for display. */
@@ -109,7 +110,7 @@ export function buildCompanyLeads(company: string, awards: StoredAward[], now = 
   return dedupeLeads(leads);
 }
 
-const SOURCE_RANK: Record<OfficialAward["source"], number> = { dod_contract_announcement: 0, usaspending: 1, insight_hub_opportunity: 2 };
+const SOURCE_RANK: Record<OfficialAward["source"], number> = { dod_contract_announcement: 0, usaspending: 1, sam_gov_award_notice: 2, insight_hub_opportunity: 3 };
 const ATTRIBUTION_RANK: Record<AwardAttribution, number> = { confirmed_awardee: 0, documented_incumbent: 1, possible_match: 2 };
 
 /** The same contract action seen by two sources is one lead (the DoD announcement wins: it states location). */
