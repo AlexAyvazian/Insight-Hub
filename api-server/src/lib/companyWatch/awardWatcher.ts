@@ -93,7 +93,8 @@ export async function bootstrapDefaultCompanyWatch(run: SqlRunner): Promise<numb
 }
 
 const PASS_INTERVAL_MS = 3 * 3_600_000;
-const FIRST_PASS_DELAY_MS = 4 * 60_000;
+// Allow migrations to settle, then start an unattended award pass promptly after deploy.
+const FIRST_PASS_DELAY_MS = 45_000;
 const USASPENDING_BATCH = 15;
 const USASPENDING_SPACING_MS = 1_500;
 
