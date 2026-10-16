@@ -5,7 +5,7 @@ process.env.RFP_DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.INTEL_DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
 const [
-  { isGovConSemanticCandidate },
+  { isGovConSemanticCandidate, safeForecastProviderError },
   { isForwardForecast },
   { forecastSearchHitCurrent },
   { policyFeedDate },
@@ -239,4 +239,13 @@ test("very stale incumbent expirations do not remain recompete candidates", () =
     ),
     false,
   );
+});
+
+
+test("partial GovCon and Tango source errors are sanitized without leaking provider responses", () => {
+  assert.equal(safeForecastProviderError("GovCon", "GovCon API returned 403: secret=hidden"), "GovCon service returned HTTP 403");
+  assert.equal(safeForecastProviderError("Tango", "Tango forecast API 429: key=hidden"), "Tango service returned HTTP 429");
+  assert.equal(safeForecastProviderError("GovCon", "GOVCON_API_KEY is not configured"), "GovCon API key is not configured");
+  assert.equal(safeForecastProviderError("Tango", "Tango forecast budget is in cooldown"), "Tango provider is in budget cooldown");
+  assert.equal(safeForecastProviderError("GovCon", "Unexpected private response"), "GovCon provider request failed");
 });

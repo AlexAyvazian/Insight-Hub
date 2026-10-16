@@ -74,6 +74,13 @@ type ForecastResponse = {
     hasNext: boolean;
   };
   sourcePageRecords: number;
+  sourceBreakdown?: {
+    govcon: number;
+    tango: number;
+    officialAgencyForecasts?: number;
+    recoveredErrors?: string[];
+  };
+  paginationBasis?: "upstream" | "filtered";
   suppressedCount: number;
   lowRelevanceCount: number;
   semanticProvider: "gemini" | "deterministic";
@@ -165,6 +172,17 @@ function plainText(value: string | null): string | null {
     .replace(/\s+/g, " ")
     .trim();
   return stripped || null;
+}
+
+/** Provider errors can carry response bodies. Never expose those to the browser. */
+export function safeSourceWarning(warning: string): string {
+  const provider = /^([a-z][a-z0-9 -]{0,30}):/i.exec(warning)?.[1]
+    ?? (/govcon/i.test(warning) ? "GovCon" : /tango/i.test(warning) ? "Tango" : "Official forecast discovery");
+  const code = /(?:HTTP |API returned |API )(\d{3})\b/i.exec(warning)?.[1];
+  if (code) return provider + " returned HTTP " + code;
+  if (/not configured/i.test(warning)) return provider + " is not configured";
+  if (/cooldown|cooling down|budget/i.test(warning)) return provider + " is in cooldown";
+  return provider + " is temporarily unavailable";
 }
 
 function hiddenStorageKey(mode: GovConWorkspaceMode): string {
@@ -536,6 +554,9 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
     };
   }, [visibleRecords]);
   const total = query.data?.pagination.total ?? 0;
+  const sourceBreakdown = query.data?.sourceBreakdown;
+  const sourceWarnings = sourceBreakdown?.recoveredErrors ?? [];
+  const upstreamPaging = query.data?.paginationBasis === "upstream";
   const currentStart = total === 0 ? 0 : filters.offset + 1;
   const currentEnd = Math.min(filters.offset + PAGE_SIZE, total);
 
@@ -591,7 +612,9 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3 text-sm text-white/65">
           {query.isFetching ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <CalendarDays className="h-4 w-4 text-primary/70" />}
-          <span>{query.isFetching ? "Refreshing GovCon data…" : `${visibleRecords.length.toLocaleString("en-US")} shown from ${total.toLocaleString("en-US")} source matches`}</span>
+          <span>{query.isFetching ? "Refreshing GovCon data…" : upstreamPaging
+            ? visibleRecords.length.toLocaleString("en-US") + " shown · " + total.toLocaleString("en-US") + " upstream candidates (before relevance screening)"
+            : visibleRecords.length.toLocaleString("en-US") + " shown from " + total.toLocaleString("en-US") + " matching results"}</span>
           {query.data?.semanticProvider === "gemini" && <span className="inline-flex items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-xs font-semibold uppercase tracking-wider text-primary/90"><Sparkles className="h-3 w-3" /> Gemini ranked</span>}
           {query.data?.cached && <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs font-semibold uppercase tracking-wider text-white/70">cached</span>}
         </div>
@@ -660,6 +683,28 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
         {hiddenOnPage > 0 && <span>· {hiddenOnPage} being hidden while feedback saves</span>}
       </div>
 
+      {sourceBreakdown && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-black/25 px-4 py-3 text-sm text-white/75">
+          <span className="font-semibold text-white">Source coverage</span>
+          <span>GovCon: {(sourceBreakdown.govcon ?? 0).toLocaleString("en-US")}</span>
+          <span>Tango: {(sourceBreakdown.tango ?? 0).toLocaleString("en-US")}</span>
+          {!isRecompete && sourceBreakdown.officialAgencyForecasts !== undefined && (
+            <span>Official agency forecasts: {sourceBreakdown.officialAgencyForecasts.toLocaleString("en-US")}</span>
+          )}
+          <span className="text-white/45">Counts are before Occu-Med fit filtering.</span>
+        </div>
+      )}
+      {sourceWarnings.length > 0 && (
+        <div role="status" className="rounded-xl border border-amber-300/25 bg-amber-300/10 p-4 text-sm text-amber-100">
+          <p className="font-semibold">Partial source coverage — results may be incomplete.</p>
+          <p className="mt-1 text-amber-100/80">{sourceWarnings.length} provider warning{sourceWarnings.length === 1 ? "" : "s"}. Other available sources are still displayed.</p>
+          <ul className="mt-2 list-inside list-disc space-y-1 text-amber-100/75">
+            {sourceWarnings.map((warning, index) => (
+              <li key={index}>{safeSourceWarning(warning)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {feedbackError && (
         <div className="rounded-xl border border-red-300/20 bg-red-300/10 p-3 text-sm text-red-100/85">{feedbackError}</div>
       )}
@@ -675,7 +720,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
       )}
 
       {!query.isLoading && !query.isError && records.length === 0 && (
-        <div className="glass-card rounded-2xl border border-white/10 p-10 text-center text-base text-white/65">No matching {isRecompete ? "recompetes" : "forecasts"}. Choose Occu-Med NAICS codes, turn off Occu-Med fit only, or broaden the search terms.</div>
+        <div className="glass-card rounded-2xl border border-white/10 p-10 text-center text-base text-white/65">No matching {isRecompete ? "verified recompete candidates" : "forecasts"} on this source page. {upstreamPaging ? "More upstream pages may contain matches. Use Next to continue. " : ""}Turn off Occu-Med fit only or broaden the search terms.</div>
       )}
 
       {!query.isLoading && !query.isError && records.length > 0 && visibleRecords.length === 0 && (
@@ -694,7 +739,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
 
       {total > PAGE_SIZE && (
         <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-black/15 p-4 text-base text-white/70">
-          <span>Source page {currentStart.toLocaleString("en-US")}–{currentEnd.toLocaleString("en-US")} of {total.toLocaleString("en-US")}</span>
+          <span>{upstreamPaging ? "Upstream page" : "Result page"} {currentStart.toLocaleString("en-US")}–{currentEnd.toLocaleString("en-US")} of {total.toLocaleString("en-US")}{upstreamPaging ? " upstream candidates" : ""}</span>
           <div className="flex gap-2">
             <button disabled={filters.offset === 0 || query.isFetching} onClick={() => setFilters((current) => ({ ...current, offset: Math.max(0, current.offset - PAGE_SIZE) }))} className="rounded-lg border border-white/10 px-3 py-2 transition-colors hover:text-white disabled:opacity-35">Previous</button>
             <button disabled={!query.data?.pagination.hasNext || query.isFetching} onClick={() => setFilters((current) => ({ ...current, offset: current.offset + PAGE_SIZE }))} className="rounded-lg border border-white/10 px-3 py-2 transition-colors hover:text-white disabled:opacity-35">Next</button>
