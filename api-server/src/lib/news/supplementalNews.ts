@@ -79,7 +79,7 @@ async function jsonRequest(url: URL, headers: Record<string, string> = {}): Prom
   return object(data);
 }
 
-export async function fetchSupplementalProvider(name: SupplementalProviderName, apiKey?: string): Promise<SupplementalNewsArticle[]> {
+export async function fetchSupplementalProvider(name: SupplementalProviderName, apiKey?: string, secondaryKey?: string): Promise<SupplementalNewsArticle[]> {
   let url: URL;
   let headers: Record<string, string> = {};
   switch (name) {
@@ -120,7 +120,15 @@ export async function fetchSupplementalProvider(name: SupplementalProviderName, 
       headers = { "X-ACCESS-KEY": apiKey };
       break;
   }
-  const data = await jsonRequest(url, headers);
+  let data: Record<string, unknown>;
+  try {
+    data = await jsonRequest(url, headers);
+  } catch (error) {
+    // A second NewsData account key is an auth-only fallback, never a rate-limit workaround.
+    const reason = error instanceof Error ? error.message : "";
+    if (name !== "newsdata" || !secondaryKey || secondaryKey === apiKey || !/^HTTP (401|403)$/.test(reason)) throw error;
+    data = await jsonRequest(url, { "X-ACCESS-KEY": secondaryKey });
+  }
   let items: unknown;
   switch (name) {
     case "thenewsapi": items = data.data; break;
@@ -140,10 +148,11 @@ async function getFeed(name: SupplementalProviderName): Promise<SupplementalFeed
   const env: Record<Exclude<SupplementalProviderName, "gdelt">, [string, string]> = {
     thenewsapi: ["thenewsApiToken", "THENEWSAPI_API_TOKEN"],
     currents: ["currentsApiKey", "CURRENTS_API_KEY"],
-    newsdata: ["newsDataApiKey", "NEWSDATA_API_KEY"],
+    newsdata: ["newsDataApiKey", "NEWSDATA_IO_API_KEY"],
   };
   const credential = name === "gdelt" ? null : await resolveCredential(...env[name]);
-  const configured = name === "gdelt" || Boolean(credential);
+  const secondaryKey = name === "newsdata" ? await resolveCredential("newsDataApiKey2", "NEWSDATA_IO_API_KEY_2") : null;
+  const configured = name === "gdelt" || Boolean(credential) || Boolean(secondaryKey);
   const existing = cache.get(name);
   if (existing && existing.until > Date.now() && existing.configured === configured) return existing.feed;
   if (!configured) {
@@ -153,7 +162,7 @@ async function getFeed(name: SupplementalProviderName): Promise<SupplementalFeed
   }
   let request = pending.get(name);
   if (!request) {
-    request = fetchSupplementalProvider(name, credential ?? undefined)
+    request = fetchSupplementalProvider(name, (credential ?? secondaryKey) ?? undefined, credential ? secondaryKey ?? undefined : undefined)
       .then(articles => ready(articles))
       .catch((reason: unknown) => {
         const message = reason instanceof Error ? reason.message : "";
