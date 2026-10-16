@@ -8,6 +8,7 @@
  * Both labels are deliberately explicit to prevent false procurement claims.
  */
 import type { SqlRunner } from "../companyWatch/awardStore";
+import { ensureSamNoticeCache } from "./samNoticeCache";
 
 type Row = Record<string, unknown>;
 const DAY = 86_400_000;
@@ -30,12 +31,11 @@ const http = (v: unknown): string | null => {
 };
 const emptyContact = { name: null, email: null, phone: null } as const;
 
-export const SAM_EARLY_NOTICE_SQL = `SELECT id, notice_id, title, agency, sub_agency, description, type, naics_code,
-    set_aside, place_of_performance, posted_date, response_deadline, sam_url
-  FROM opportunities
-  WHERE (provider_key = 'samGov' OR provider_name ILIKE 'samGov%' OR source = 'sam_gov')
-    AND status = 'active'
-    AND (type ILIKE '%presolicitation%' OR type ILIKE '%sources sought%' OR type ILIKE '%source sought%')
+export const SAM_EARLY_NOTICE_SQL = `SELECT notice_id AS id, notice_id, title, agency, NULL::text AS sub_agency,
+    description, notice_type AS type, naics_code, set_aside, work_location AS place_of_performance,
+    posted_date, response_deadline, source_url AS sam_url
+  FROM sam_gov_intelligence_notices
+  WHERE (notice_type ILIKE '%presolicitation%' OR notice_type ILIKE '%sources sought%' OR notice_type ILIKE '%source sought%')
     AND (response_deadline IS NULL OR response_deadline >= CURRENT_DATE)
     AND posted_date >= now() - interval '270 days'
   ORDER BY posted_date DESC LIMIT 400`;
@@ -120,6 +120,7 @@ export async function loadLocalOfficialSignals(
     run = async (sql, args = []) => (await rfpPool.query(sql, args)).rows as Row[];
   }
   try {
+    if (mode === "forecast") await ensureSamNoticeCache(run);
     const rows = await run(mode === "forecast" ? SAM_EARLY_NOTICE_SQL : EXPIRING_OFFICIAL_AWARDS_SQL);
     const records = rows.map(row => mode === "forecast" ? normalizeSamEarlyNotice(row, now) : normalizeExpiringAward(row, now))
       .filter((record): record is Record<string, unknown> => Boolean(record));
