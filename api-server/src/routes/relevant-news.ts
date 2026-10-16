@@ -4,6 +4,7 @@ import { keenableProvider } from "../lib/providers/keenable";
 import { logger } from "../lib/logger";
 import { apitubeKeys, contractorNewsSignals, fetchApitubeNews, httpUrl } from "../lib/news/apitube";
 import { publisherImage } from "../lib/news/articleImages";
+import { getSupplementalNewsPool, SUPPLEMENTAL_PROVIDERS, type SupplementalProviderName } from "../lib/news/supplementalNews";
 
 const router: IRouter = Router();
 
@@ -45,7 +46,7 @@ type NewsArticle = {
     country: string | null;
   };
   relevanceScore: number;
-  provider: "gnews" | "apitube" | "tinyfish" | "keenable";
+  provider: "gnews" | "apitube" | "tinyfish" | "keenable" | SupplementalProviderName;
   companies: string[];
   signals: string[];
 };
@@ -56,8 +57,8 @@ type NewsPayload = {
   upstreamArticles: number;
   filteredOut: number;
   query: string;
-  source: "gnews" | "apitube" | "tinyfish" | "keenable" | "mixed";
-  sources: Array<"gnews" | "apitube" | "tinyfish" | "keenable">;
+  source: "gnews" | "apitube" | "tinyfish" | "keenable" | SupplementalProviderName | "mixed";
+  sources: Array<"gnews" | "apitube" | "tinyfish" | "keenable" | SupplementalProviderName>;
   warnings: string[];
   deduplicated: number;
   fetchedAt: string;
@@ -232,7 +233,7 @@ export function normalizeArticle(rawValue: unknown): NewsArticle | null {
       country: asString(source.country),
     },
     relevanceScore: Math.max(relevantNewsScore(raw), contractorSignals.score),
-    provider: raw.provider === "keenable" ? "keenable" : raw.provider === "tinyfish" ? "tinyfish" : raw.provider === "apitube" ? "apitube" : "gnews",
+    provider: raw.provider === "keenable" ? "keenable" : raw.provider === "tinyfish" ? "tinyfish" : raw.provider === "apitube" ? "apitube" : SUPPLEMENTAL_PROVIDERS.includes(raw.provider as SupplementalProviderName) ? raw.provider as SupplementalProviderName : "gnews",
     companies: contractorSignals.companies,
     signals: contractorSignals.signals,
   };
@@ -386,9 +387,10 @@ export async function fetchRelevantNews(query: string, max: number, page: number
     run: async () => ({ articles: await fetchGNewsFeed(query, max, page, !search && page === 1), warnings: [] }),
   });
   if (apitubeKeys().length) jobs.push({ provider: "apitube", run: () => fetchApitubeNews(search, max, page) });
-  if (!jobs.length) throw Object.assign(new Error("Configure TINYFISH_API_KEY, an APITube news key, or GNEWS_API_KEY to load relevant news"), { statusCode: 503 });
-
-  const results = await Promise.allSettled(jobs.map(job => job.run()));
+  const [results, supplemental] = await Promise.all([
+    Promise.allSettled(jobs.map(job => job.run())),
+    getSupplementalNewsPool(),
+  ]);
   const sources: NewsPayload["sources"] = [];
   const warnings: string[] = [];
   const rawArticles: unknown[] = [];
@@ -406,7 +408,17 @@ export async function fetchRelevantNews(query: string, max: number, page: number
       logger.warn({ provider, statusCode: failureStatus }, "Relevant news provider unavailable");
     }
   }
-  if (!sources.length) throw Object.assign(new Error(warnings.join(" ")), { statusCode: failureStatus });
+  for (const name of SUPPLEMENTAL_PROVIDERS) {
+    const feed = supplemental[name];
+    if (feed.status === "disabled") continue;
+    if (feed.status === "ok") {
+      sources.push(name);
+      rawArticles.push(...feed.articles);
+    } else {
+      warnings.push(name + " is temporarily unavailable (" + (feed.error ?? "invalid response") + ").");
+    }
+  }
+  if (!sources.length) throw Object.assign(new Error(warnings.length ? warnings.join(" ") : "No news providers configured or available"), { statusCode: failureStatus });
   const relevant = rawArticles.map(normalizeArticle)
     .filter((article): article is NewsArticle => article !== null && article.relevanceScore >= 6 && ((article.provider !== "tinyfish" && article.provider !== "keenable") || matchesSource(article, sourceDomains)));
   const unique = new Map<string, NewsArticle>();
@@ -436,7 +448,7 @@ router.get("/relevant-news", async (req, res) => {
   const max = boundedInteger(req.query.max, 40, 1, 100);
   const page = boundedInteger(req.query.page, 1, 1, 100);
   const newsKeyConfigured = Boolean(await resolveCredential("tinyfishApiKey", "TINYFISH_API_KEY"));
-  const cacheKey = `${newsKeyConfigured}|${sourceDomains.join(",")}|${query}|${max}|${page}|${Boolean(process.env.GNEWS_API_KEY?.trim())}|${apitubeKeys().length}|${process.env.GNEWS_MAX_ARTICLES}|${process.env.APITUBE_NEWS_MAX_ARTICLES}`;
+  const cacheKey = `${newsKeyConfigured}|${sourceDomains.join(",")}|${query}|${max}|${page}|${Boolean(process.env.GNEWS_API_KEY?.trim())}|${apitubeKeys().length}|${process.env.GNEWS_MAX_ARTICLES}|${process.env.APITUBE_NEWS_MAX_ARTICLES}|${Boolean(process.env.THENEWSAPI_API_TOKEN)}|${Boolean(process.env.CURRENTS_API_KEY)}|${Boolean(process.env.NEWSDATA_IO_API_KEY)}|${Boolean(process.env.NEWSDATA_IO_API_KEY_2)}`;
 
   pruneCache();
   const cached = responseCache.get(cacheKey);
