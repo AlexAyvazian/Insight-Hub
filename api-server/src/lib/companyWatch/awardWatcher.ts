@@ -86,7 +86,7 @@ export const DEFAULT_COMPANY_WATCH_NAMES = [
 export async function bootstrapDefaultCompanyWatch(run: SqlRunner): Promise<number> {
   const rows = await run("SELECT count(*)::int AS registered FROM company_watch_companies");
   if (rows.length !== 1 || Number(rows[0]?.registered) !== 0) return 0;
-  const unique = [...new Map(DEFAULT_COMPANY_WATCH_NAMES.map(name => [companyKey(name), name])).entries()]
+  const unique = [...new Map(DEFAULT_COMPANY_WATCH_NAMES.map((name): [string, string] => [companyKey(name), name])).entries()]
     .map(([key, name]) => ({ key, name }));
   await recordRequestedCompanies(run, unique);
   return unique.length;
