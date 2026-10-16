@@ -259,7 +259,7 @@ export function lastAwardPass(): AwardPassSummary | null {
 export async function opportunityAwards(run: SqlRunner, days = 30): Promise<StoredAward[]> {
   const rows = await run(
     `SELECT id, title, agency, sub_agency, awardee, award_amount, posted_date, sam_url, place_of_performance,
-            provider_name, solicitation_number, notice_id, first_seen_at
+            provider_name, provider_key, type, solicitation_number, notice_id, first_seen_at
        FROM opportunities
       WHERE awardee IS NOT NULL AND btrim(awardee) <> '' AND posted_date >= now() - make_interval(days => $1)
       ORDER BY posted_date DESC LIMIT 2000`,
@@ -270,7 +270,9 @@ export async function opportunityAwards(run: SqlRunner, days = 30): Promise<Stor
     const posted = row.posted_date instanceof Date ? row.posted_date.toISOString() : String(row.posted_date ?? "");
     return {
       awardKey: `opportunity:${String(row.id)}`,
-      source: "insight_hub_opportunity" as const,
+      source: (/award/i.test(String(row.type ?? "")) && /sam/i.test(String(row.provider_key ?? row.provider_name ?? "")))
+        ? "sam_gov_award_notice" as const
+        : "insight_hub_opportunity" as const,
       recipientText: String(row.awardee),
       recipientUei: null,
       awardingAgency: [row.agency, row.sub_agency].filter(Boolean).map(String).join(" — ") || null,
