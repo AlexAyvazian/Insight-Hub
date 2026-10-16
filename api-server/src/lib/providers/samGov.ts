@@ -2,7 +2,8 @@ import type { DataSourceProvider, FetchOptions, NormalizedOpportunity, ProviderF
 import { verifySamPublicRecords } from "./samGovPageVerification";
 import { resolveCredential, type ResolvedCredential } from "../config/providerConfig";
 import { FreeTierCredentialPool } from "./freeTierCredentialPool";
-import { rfpDb as db } from "@workspace/db";
+import { rfpDb as db, rfpPool } from "@workspace/db";
+import { saveSamIntelligenceNotices } from "../intelligence/samNoticeCache";
 import { opportunitiesTable } from "@workspace/db/schema";
 import { eq, sql } from "drizzle-orm";
 import {
@@ -21,7 +22,9 @@ export { buildSamGovAutonomousTitleQueries, buildSamGovTitleQueries, isBidReadyS
 export { SAM_GOV_DISCOVERY_TAXONOMY, buildSamGovClassificationQueries } from "./samGovTaxonomy";
 
 const SAM_GOV_DEFAULT_BASE = "https://api.sam.gov/opportunities/v2/search";
-const SAM_GOV_BID_NOTICE_TYPES = ["o", "k"] as const;
+// Same request count: also request presolicitations (p), sources sought (r), and award notices (a).
+// Non-bid types go ONLY to the intelligence sidecar; the RFP results remain bid-ready o/k.
+const SAM_GOV_BID_NOTICE_TYPES = ["o", "k", "p", "r", "a"] as const;
 const SAM_GOV_MAX_RESULTS_PER_TITLE = 250;
 const SAM_GOV_MAX_RESULTS_PER_CLASSIFICATION = 75;
 const SAM_GOV_AUTONOMOUS_QUERY_COUNT = 2;
@@ -164,7 +167,16 @@ export class SamGovProvider implements DataSourceProvider {
     ) {
       throw samGovQuotaError(json.nextAccessTime ?? null);
     }
-    return (json.opportunitiesData ?? [])
+    const notices = json.opportunitiesData ?? [];
+    if (notices.some(item => /presolicitation|sources? sought|award/i.test(item.type ?? item.baseType ?? ""))) {
+      await saveSamIntelligenceNotices(
+        async (statement, args = []) => (await rfpPool.query(statement, args)).rows,
+        notices,
+      ).catch(() => {
+        console.warn(JSON.stringify({ event: "sam_intelligence_cache_unavailable" }));
+      });
+    }
+    return notices
       .filter((opportunity) => isBidReadySamOpportunity(opportunity, today))
       .map((opportunity) => this.normalize(opportunity));
   }
