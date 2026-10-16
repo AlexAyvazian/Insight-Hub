@@ -225,7 +225,7 @@ describe("SAM.gov bid-ready query policy", () => {
       const classificationQueries = buildSamGovClassificationQueries();
       const result = await new SamGovProvider().fetch({ dateRange: 30, limit: 1000 });
 
-      // One run rotates a bounded window of the taxonomy (default 6 codes) so a
+      // Same number of quota-limited API calls, now retaining early and award notice types in a separate cache.\n      // One run rotates a bounded window of the taxonomy (default 6 codes) so a
       // single Fetch cannot burn a small daily SAM.gov quota; coverage comes
       // from the cursor advancing across runs, not from firing every code.
       const perRun = Math.min(
@@ -244,13 +244,13 @@ describe("SAM.gov bid-ready query policy", () => {
       for (const request of titleRequests) {
         const params = new URL(request).searchParams;
         assert.ok(params.get("title"));
-        assert.deepEqual(params.getAll("ptype"), ["o", "k"]);
+        assert.deepEqual(params.getAll("ptype"), ["o", "k", "p", "r", "a"]);
         assert.equal(params.get("limit"), "250");
       }
       for (const request of classificationRequests) {
         const params = new URL(request).searchParams;
         assert.notEqual(Boolean(params.get("ncode")), Boolean(params.get("ccode")));
-        assert.deepEqual(params.getAll("ptype"), ["o", "k"]);
+        assert.deepEqual(params.getAll("ptype"), ["o", "k", "p", "r", "a"]);
         assert.equal(params.get("limit"), "75");
       }
 
