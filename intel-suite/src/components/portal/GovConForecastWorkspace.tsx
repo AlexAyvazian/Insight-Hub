@@ -78,6 +78,8 @@ type ForecastResponse = {
     govcon: number;
     tango: number;
     officialAgencyForecasts?: number;
+    samEarlyNotices?: number;
+    officialExpiringAwards?: number;
     recoveredErrors?: string[];
   };
   paginationBasis?: "upstream" | "filtered";
@@ -688,6 +690,12 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
           <span className="font-semibold text-white">Source coverage</span>
           <span>GovCon: {(sourceBreakdown.govcon ?? 0).toLocaleString("en-US")}</span>
           <span>Tango: {(sourceBreakdown.tango ?? 0).toLocaleString("en-US")}</span>
+          {!isRecompete && sourceBreakdown.samEarlyNotices !== undefined && (
+            <span>SAM.gov early notices: {sourceBreakdown.samEarlyNotices.toLocaleString("en-US")}</span>
+          )}
+          {isRecompete && sourceBreakdown.officialExpiringAwards !== undefined && (
+            <span>Official expiring awards: {sourceBreakdown.officialExpiringAwards.toLocaleString("en-US")}</span>
+          )}
           {!isRecompete && sourceBreakdown.officialAgencyForecasts !== undefined && (
             <span>Official agency forecasts: {sourceBreakdown.officialAgencyForecasts.toLocaleString("en-US")}</span>
           )}
