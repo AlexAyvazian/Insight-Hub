@@ -49,6 +49,12 @@ type ForecastPayload = {
     hasNext: boolean;
   };
   sourcePageRecords: number;
+  sourceBreakdown: {
+    govcon: number;
+    tango: number;
+    recoveredErrors: string[];
+  };
+  paginationBasis: "upstream" | "filtered";
   semanticRejectedCount: number;
   suppressedCount: number;
   lowRelevanceCount: number;
@@ -62,6 +68,16 @@ type CacheEntry = {
   expiresAt: number;
   payload: ForecastPayload;
 };
+
+/** Show upstream provider health without relaying provider error bodies or credentials. */
+export function safeForecastProviderError(name: "GovCon" | "Tango", error: string): string {
+  const status = /(?:HTTP |API returned |API )(\d{3})\b/i.exec(error)?.[1];
+  if (status) return name + " service returned HTTP " + status;
+  if (/not configured/i.test(error)) return name + " API key is not configured";
+  if (/cooldown|cooling down|budget/i.test(error)) return name + " provider is in budget cooldown";
+  if (/abort|timeout/i.test(error)) return name + " provider timed out";
+  return name + " provider request failed";
+}
 
 const responseCache = new Map<string, CacheEntry>();
 const inFlight = new Map<string, Promise<ForecastPayload>>();
@@ -417,7 +433,16 @@ async function fetchForecasts(
           total: asNumber(pagination.total) ?? (data.length + tangoRecords.length),
           hasNext: asBoolean(pagination.has_next),
         },
-    sourcePageRecords: normalized.length + tangoResult.rawCount,
+    sourcePageRecords: normalized.length + tangoRecords.length,
+    sourceBreakdown: {
+      govcon: semantic.length,
+      tango: tangoCandidates.length,
+      recoveredErrors: [
+        govconResult.error ? safeForecastProviderError("GovCon", govconResult.error) : null,
+        tangoResult.error ? safeForecastProviderError("Tango", tangoResult.error) : null,
+      ].filter((item): item is string => Boolean(item)),
+    },
+    paginationBasis: tangoOnly ? "filtered" : "upstream",
     semanticRejectedCount: normalized.length - semantic.length,
     suppressedCount: allCandidates.length - unsuppressed.length,
     lowRelevanceCount,
