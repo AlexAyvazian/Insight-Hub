@@ -185,10 +185,10 @@ async function searchCompanies(companies: string[], sources: Source[]): Promise<
   const newsResult = settled[2];
   const pool: SharedPool = newsResult.status === "fulfilled"
     ? newsResult.value : {
-      ...Object.fromEntries(SUPPLEMENTAL_PROVIDERS.map(name => [name, { status: "error", entries: [], warnings: [name + " unavailable."], error: "request failed" }])),
+      ...(Object.fromEntries(SUPPLEMENTAL_PROVIDERS.map(name => [name, { status: "error", entries: [], warnings: [name + " unavailable."], error: "request failed" }])) as Record<SupplementalProviderName, SharedProvider>),
       gnews: { status: "error", entries: [], warnings: ["GNews news pool unavailable."], error: "request failed" },
       apitube: { status: "error", entries: [], warnings: ["APITube news pool unavailable."], error: "request failed" },
-    } as SharedPool;
+    };
   for (const name of ["gnews", "apitube", ...SUPPLEMENTAL_PROVIDERS] as const) {
     const upstream = pool[name];
     const matches = upstream.entries.filter(entry => companies.some(company => matchesCompanyNews(entry.text, company))).map(entry => entry.article);
