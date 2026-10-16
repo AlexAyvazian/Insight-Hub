@@ -17,6 +17,7 @@ import {
 import { buildCompanyLeads, type AwardLead } from "./awardLeads";
 import { DOD_CONTRACTS_RSS, announcementDate, fetchText, parseAnnouncement, parseContractsRss } from "./dodContracts";
 import { fetchUsaSpendingAwards } from "./usaSpendingAwards";
+import { ensureSamNoticeCache } from "../intelligence/samNoticeCache";
 
 export const DEFAULT_COMPANY_WATCH_NAMES = [
   "Leidos",
@@ -259,7 +260,7 @@ export function lastAwardPass(): AwardPassSummary | null {
 export async function opportunityAwards(run: SqlRunner, days = 30): Promise<StoredAward[]> {
   const rows = await run(
     `SELECT id, title, agency, sub_agency, awardee, award_amount, posted_date, sam_url, place_of_performance,
-            provider_name, solicitation_number, notice_id, first_seen_at
+            provider_name, provider_key, type, solicitation_number, notice_id, first_seen_at
        FROM opportunities
       WHERE awardee IS NOT NULL AND btrim(awardee) <> '' AND posted_date >= now() - make_interval(days => $1)
       ORDER BY posted_date DESC LIMIT 2000`,
@@ -270,7 +271,9 @@ export async function opportunityAwards(run: SqlRunner, days = 30): Promise<Stor
     const posted = row.posted_date instanceof Date ? row.posted_date.toISOString() : String(row.posted_date ?? "");
     return {
       awardKey: `opportunity:${String(row.id)}`,
-      source: "insight_hub_opportunity" as const,
+      source: (/award/i.test(String(row.type ?? "")) && /sam/i.test(String(row.provider_key ?? row.provider_name ?? "")))
+        ? "sam_gov_award_notice" as const
+        : "insight_hub_opportunity" as const,
       recipientText: String(row.awardee),
       recipientUei: null,
       awardingAgency: [row.agency, row.sub_agency].filter(Boolean).map(String).join(" — ") || null,
@@ -284,6 +287,38 @@ export async function opportunityAwards(run: SqlRunner, days = 30): Promise<Stor
       sourceUrl: row.sam_url ? String(row.sam_url) : null,
       completionDate: null,
       firstSeenAt: row.first_seen_at instanceof Date ? row.first_seen_at.toISOString() : String(row.first_seen_at ?? posted),
+    };
+  });
+}
+
+/** SAM.gov award notices captured from the existing, quota-controlled opportunity requests.
+ * The official notice POSTED date is not automatically the contract SIGNED date.
+ */
+export async function cachedSamAwardNotices(run: SqlRunner, days = 60): Promise<StoredAward[]> {
+  await ensureSamNoticeCache(run);
+  const rows = await run(
+    `SELECT notice_id, title, agency, awardee, award_amount, work_location,
+            posted_date, source_url, first_seen_at
+       FROM sam_gov_intelligence_notices
+      WHERE notice_type ILIKE '%award%' AND awardee IS NOT NULL AND btrim(awardee) <> ''
+        AND posted_date >= now() - make_interval(days => $1)
+      ORDER BY posted_date DESC LIMIT 2000`, [days],
+  );
+  return rows.map(row => {
+    const amount = row.award_amount == null ? null : Number(row.award_amount);
+    return {
+      awardKey: "sam-gov-notice:" + String(row.notice_id),
+      source: "sam_gov_award_notice" as const,
+      recipientText: String(row.awardee),
+      recipientUei: null,
+      awardingAgency: row.agency ? String(row.agency) : null,
+      amount: amount !== null && Number.isFinite(amount) ? amount : null,
+      contractNumber: null, modification: null, actionDate: null,
+      workLocation: row.work_location ? String(row.work_location) : null,
+      popCountry: null, description: String(row.title ?? ""),
+      sourceUrl: row.source_url ? String(row.source_url) : null,
+      completionDate: null,
+      firstSeenAt: row.first_seen_at instanceof Date ? row.first_seen_at.toISOString() : String(row.first_seen_at),
     };
   });
 }
@@ -307,7 +342,11 @@ export async function companyAwards(names: string[], runner?: SqlRunner): Promis
     warnings.push(`Insight Hub opportunity awards unavailable: ${errorText(error)}`);
     return [] as StoredAward[];
   });
-  const all = [...stored, ...fromOpportunities];
+  const fromSamNotices = await cachedSamAwardNotices(run).catch(() => {
+    warnings.push("SAM.gov cached award notices are not currently available");
+    return [] as StoredAward[];
+  });
+  const all = [...stored, ...fromOpportunities, ...fromSamNotices];
   const companies: Record<string, AwardLead[]> = {};
   for (const { name } of unique) companies[name] = buildCompanyLeads(name, all);
   const leads = Object.values(companies).flat();

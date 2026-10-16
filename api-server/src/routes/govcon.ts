@@ -12,6 +12,7 @@ import {
   type GovConRelevance,
 } from "../lib/intelligence/govconIntelligence";
 import { verifyRecompete } from "../lib/intelligence/recompeteVerification";
+import { loadLocalOfficialSignals } from "../lib/intelligence/localOfficialSignals";
 import {
   fetchTangoForecasts,
   type TangoForecastRecord,
@@ -52,6 +53,7 @@ type ForecastPayload = {
   sourceBreakdown: {
     govcon: number;
     tango: number;
+    officialExpiringAwards: number;
     recoveredErrors: string[];
   };
   paginationBasis: "upstream" | "filtered";
@@ -341,7 +343,7 @@ async function fetchForecasts(
   };
 
   // Fetch GovCon and Tango in parallel; GovCon failure does not block Tango
-  const [govconResult, tangoResult] = await Promise.all([
+  const [govconResult, tangoResult, official] = await Promise.all([
     (async (): Promise<{ data: unknown[]; pagination: Record<string, unknown>; error: string | null }> => {
       if (!(await providerBudgetAvailable(budgetName))) {
         return { data: [], pagination: {}, error: `GovCon ${mode} requests are temporarily cooling down after an upstream quota or reliability failure.` };
@@ -384,11 +386,12 @@ async function fetchForecasts(
     mode === "recompete"
       ? fetchTangoExpiringContracts(focus, tangoFilters)
       : fetchTangoForecasts(focus, tangoFilters),
+    loadLocalOfficialSignals(mode),
   ]);
   const tangoRecords: Array<TangoForecastRecord | TangoExpiringContractRecord> = tangoResult.records;
 
   // If both sources failed, throw so the caller gets a proper error
-  if (govconResult.error && tangoResult.error && govconResult.data.length === 0 && tangoResult.records.length === 0) {
+  if (govconResult.error && tangoResult.error && govconResult.data.length === 0 && tangoResult.records.length === 0 && official.records.length === 0) {
     throw Object.assign(
       new Error(govconResult.error),
       { statusCode: govconResult.error.includes("cooling down") ? 429 : govconResult.error.includes("not configured") ? 503 : 502 },
@@ -410,7 +413,11 @@ async function fetchForecasts(
     tangoOnly || pageOffset === 0
       ? tangoRecords.filter((record) => isGovConSemanticCandidate(record, mode))
       : [];
-  const allCandidates = [...semantic, ...tangoCandidates];
+  const officialCandidates: NormalizedForecast[] = tangoOnly || pageOffset === 0
+    ? official.records.map(record => record as unknown as NormalizedForecast)
+        .filter(record => isGovConSemanticCandidate(record, mode))
+    : [];
+  const allCandidates = [...semantic, ...tangoCandidates, ...officialCandidates];
 
   const suppressions = await loadGovConSuppressions(mode).catch((error) => {
     logger.warn({ err: error, mode }, "GovCon feedback could not be loaded; continuing without persistent suppression");
@@ -433,13 +440,15 @@ async function fetchForecasts(
           total: asNumber(pagination.total) ?? (data.length + tangoRecords.length),
           hasNext: asBoolean(pagination.has_next),
         },
-    sourcePageRecords: normalized.length + tangoRecords.length,
+    sourcePageRecords: normalized.length + tangoRecords.length + official.records.length,
     sourceBreakdown: {
       govcon: semantic.length,
       tango: tangoCandidates.length,
+      officialExpiringAwards: officialCandidates.length,
       recoveredErrors: [
         govconResult.error ? safeForecastProviderError("GovCon", govconResult.error) : null,
         tangoResult.error ? safeForecastProviderError("Tango", tangoResult.error) : null,
+        ...official.errors,
       ].filter((item): item is string => Boolean(item)),
     },
     paginationBasis: tangoOnly ? "filtered" : "upstream",

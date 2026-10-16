@@ -1,5 +1,5 @@
 /** One official government contract award record, from any official source, as stored for Company Watch. */
-export type OfficialAwardSource = "dod_contract_announcement" | "usaspending" | "insight_hub_opportunity";
+export type OfficialAwardSource = "dod_contract_announcement" | "usaspending" | "insight_hub_opportunity" | "sam_gov_award_notice";
 
 export interface OfficialAward {
   /** Stable identity: the same award from the same source always has the same key. */

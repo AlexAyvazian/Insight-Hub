@@ -6,6 +6,7 @@ import {
 } from "../lib/intelligence/govconFeedback";
 import { rankGovConRecords } from "../lib/intelligence/govconIntelligence";
 import { fetchAgencyForecastLeads } from "../lib/intelligence/agencyForecastDiscovery";
+import { loadLocalOfficialSignals } from "../lib/intelligence/localOfficialSignals";
 import { fetchTangoForecasts } from "../lib/intelligence/tangoForecastProvider";
 import {
   providerBudgetAvailable,
@@ -31,11 +32,12 @@ type ForecastDataset = {
   lowRelevanceCount: number;
   filtersApplied: Record<string, string | undefined>;
   semanticProvider: "gemini" | "deterministic";
-  source: "govcon+official-fco+tango";
+  source: "govcon+official-fco+tango+sam-cache";
   sourceBreakdown: {
     govcon: number;
     tango: number;
     officialAgencyForecasts: number;
+    samEarlyNotices: number;
     agencyDiscoveryProviders: string[];
     recoveredErrors: string[];
   };
@@ -439,7 +441,7 @@ async function buildForecastDataset(
   focus: string | undefined,
   filters: Record<string, string | undefined>,
 ): Promise<ForecastDataset> {
-  const [govcon, tango, agency] = await Promise.all([
+  const [govcon, tango, agency, sam] = await Promise.all([
     fetchGovConForecastPool(focus, filters),
     fetchTangoForecasts(focus, {
       agency: filters.agency,
@@ -447,11 +449,13 @@ async function buildForecastDataset(
       state: filters.state,
     }),
     fetchAgencyForecastLeads(focus),
+    loadLocalOfficialSignals("forecast"),
   ]);
   const agencyFiltered = agency.records.filter((record) =>
     matchesFilters(record, filters),
   );
-  const beforeDedupe = [...govcon.records, ...tango.records, ...agencyFiltered];
+  const samFiltered = sam.records.filter(record => matchesFilters(record, filters));
+  const beforeDedupe = [...govcon.records, ...tango.records, ...agencyFiltered, ...samFiltered];
   const combined = dedupeForecasts(beforeDedupe);
 
   if (combined.length === 0 && govcon.error && tango.error) {
@@ -494,13 +498,14 @@ async function buildForecastDataset(
     )
       ? "gemini"
       : "deterministic",
-    source: "govcon+official-fco+tango",
+    source: "govcon+official-fco+tango+sam-cache",
     sourceBreakdown: {
       govcon: govcon.records.length,
       tango: tango.records.length,
       officialAgencyForecasts: agencyFiltered.length,
+      samEarlyNotices: samFiltered.length,
       agencyDiscoveryProviders: agency.providers,
-      recoveredErrors: [govcon.error, tango.error, ...agency.errors]
+      recoveredErrors: [govcon.error, tango.error, ...agency.errors, ...sam.errors]
         .filter((value): value is string => Boolean(value)),
     },
     fetchedAt: new Date().toISOString(),
