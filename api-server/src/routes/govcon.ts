@@ -413,8 +413,9 @@ async function fetchForecasts(
     tangoOnly || pageOffset === 0
       ? tangoRecords.filter((record) => isGovConSemanticCandidate(record, mode))
       : [];
-  const officialCandidates = tangoOnly || pageOffset === 0
-    ? official.records.filter(record => isGovConSemanticCandidate(record as NormalizedForecast, mode))
+  const officialCandidates: NormalizedForecast[] = tangoOnly || pageOffset === 0
+    ? official.records.map(record => record as unknown as NormalizedForecast)
+        .filter(record => isGovConSemanticCandidate(record, mode))
     : [];
   const allCandidates = [...semantic, ...tangoCandidates, ...officialCandidates];
 
