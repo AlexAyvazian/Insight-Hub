@@ -3,6 +3,7 @@ import { resolveCredential } from "../lib/config/providerConfig";
 import { keenableProvider } from "../lib/providers/keenable";
 import { apitubeKeys, fetchApitubeNews } from "../lib/news/apitube";
 import { fetchGNewsFeed } from "./relevant-news";
+import { getSupplementalNewsPool, SUPPLEMENTAL_PROVIDERS, type SupplementalProviderName } from "../lib/news/supplementalNews";
 import { matchesCompanyNews } from "../lib/companyWatch/companyIdentity";
 import { assessCompanyArticle, type NewsAssessment } from "../lib/companyWatch/newsAssessment";
 import { awardStatus, companyAwards, kickAwardPassIfStale, runAwardPass } from "../lib/companyWatch/awardWatcher";
@@ -25,7 +26,7 @@ router.get("/company-watch/logo/:domain", async (req, res) => {
     return res.send(Buffer.from(bytes));
   } catch { return res.status(404).end(); }
 });
-type Source={name:string;url:string;domain:string}; type Article={id:string;title:string;url:string;snippet:string;publisher:string|null;publishedAt:string|null;provider:"tinyfish"|"keenable"|"gnews"|"apitube";sourceUrl?:string;image?:string|null;companyMatch?:"verified"|"search_result";assessments?:Record<string,NewsAssessment>};
+type Source={name:string;url:string;domain:string}; type Article={id:string;title:string;url:string;snippet:string;publisher:string|null;publishedAt:string|null;provider:"tinyfish"|"keenable"|"gnews"|"apitube"|SupplementalProviderName;sourceUrl?:string;image?:string|null;companyMatch?:"verified"|"search_result";assessments?:Record<string,NewsAssessment>};
 function validUrl(value: unknown): string|null { try { const u=new URL(String(value)); return /^https?:$/.test(u.protocol)?u.href:null; } catch{return null;} }
 function normalize(value:unknown,provider:Article["provider"],source?:Source):Article|null { const r=(value&&typeof value==='object'?value:{}) as Record<string,unknown>; const url=validUrl(r.url); const title=typeof r.title==='string'?r.title.trim():''; if(!url||!title)return null; let publisher=typeof r.publisher==='string'?r.publisher:(typeof r.site_name==='string'?r.site_name:null); if(!publisher)try{publisher=new URL(url).hostname.replace(/^www\./,'')}catch{} return {id:`${provider}:${url}`,title,url,snippet:typeof r.snippet==='string'?r.snippet:(typeof r.description==='string'?r.description:''),publisher,publishedAt:typeof r.date==='string'?r.date:(typeof r.publishedAt==='string'?r.publishedAt:null),provider,sourceUrl:source?.url,image:validUrl(r.thumbnail_url??r.image)}; }
 function cleanSources(value:unknown):Source[]{ if(!Array.isArray(value))return []; return value.flatMap(v=>{const r=(v&&typeof v==='object'?v:{}) as Record<string,unknown>; const url=validUrl(r.url); const name=typeof r.name==='string'?r.name.trim():''; if(!url||!name)return []; try{return [{name,url,domain:new URL(url).hostname.replace(/^www\./,'')}]}catch{return []} }).slice(0,20); }
@@ -53,7 +54,7 @@ type CompanySearchResult = {
 
 type SharedArticle = { article: Article; text: string };
 type SharedProvider = { status: "ok" | "error" | "disabled"; entries: SharedArticle[]; warnings: string[]; error: string | null };
-type SharedPool = { gnews: SharedProvider; apitube: SharedProvider };
+type SharedPool = { gnews: SharedProvider; apitube: SharedProvider } & Record<SupplementalProviderName, SharedProvider>;
 
 // Company Watch searches one company per request. Fetch broad news ONCE per
 // refresh window across all watched companies, not once per company. This keeps
@@ -71,7 +72,7 @@ function nonEmpty(value: unknown): string {
 }
 
 /** Convert both news services to the existing Company Watch article contract. */
-export function normalizeCompanyNews(value: unknown, provider: "gnews" | "apitube"): SharedArticle | null {
+export function normalizeCompanyNews(value: unknown, provider: "gnews" | "apitube" | SupplementalProviderName): SharedArticle | null {
   const raw = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const source = (raw.source && typeof raw.source === "object" ? raw.source : {}) as Record<string, unknown>;
   const url = validUrl(raw.url);
@@ -126,10 +127,15 @@ async function apitubePool(): Promise<SharedProvider> {
 async function sharedNewsPool(): Promise<SharedPool> {
   if (newsPoolCache && newsPoolCache.expiresAt > Date.now()) return newsPoolCache.value;
   if (!newsPoolInFlight) {
-    newsPoolInFlight = Promise.all([gnewsPool(), apitubePool()]).then(([gnews, apitube]) => {
-      const value = { gnews, apitube };
-      const partiallyUnavailable = [gnews, apitube].some(p => p.status === "error" || p.warnings.length > 0);
-      const rateLimited = [gnews, apitube].some(p => p.error?.includes("429"));
+    newsPoolInFlight = Promise.all([gnewsPool(), apitubePool(), getSupplementalNewsPool()]).then(([gnews, apitube, supplemental]) => {
+      const extra = Object.fromEntries(SUPPLEMENTAL_PROVIDERS.map(name => {
+        const feed = supplemental[name];
+        const entries = feed.articles.map(article => normalizeCompanyNews(article, name)).filter((value): value is SharedArticle => value !== null);
+        return [name, { status: feed.status, entries, warnings: feed.error ? [name + ": " + feed.error + "."] : [], error: feed.error }];
+      })) as Record<SupplementalProviderName, SharedProvider>;
+      const value: SharedPool = { gnews, apitube, ...extra };
+      const partiallyUnavailable = Object.values(value).some(p => p.status === "error" || p.warnings.length > 0);
+      const rateLimited = Object.values(value).some(p => p.error?.includes("429"));
       const ttl = partiallyUnavailable && !rateLimited ? PARTIAL_CACHE_TTL_MS : NEWS_POOL_TTL_MS;
       newsPoolCache = { expiresAt: Date.now() + ttl, value };
       return value;
@@ -178,9 +184,12 @@ async function searchCompanies(companies: string[], sources: Source[]): Promise<
   });
   const newsResult = settled[2];
   const pool: SharedPool = newsResult.status === "fulfilled"
-    ? newsResult.value : { gnews: { status: "error", entries: [], warnings: ["GNews news pool unavailable."], error: "request failed" },
-      apitube: { status: "error", entries: [], warnings: ["APITube news pool unavailable."], error: "request failed" } };
-  for (const name of ["gnews", "apitube"] as const) {
+    ? newsResult.value : {
+      ...(Object.fromEntries(SUPPLEMENTAL_PROVIDERS.map(name => [name, { status: "error", entries: [], warnings: [name + " unavailable."], error: "request failed" }])) as unknown as Record<SupplementalProviderName, SharedProvider>),
+      gnews: { status: "error", entries: [], warnings: ["GNews news pool unavailable."], error: "request failed" },
+      apitube: { status: "error", entries: [], warnings: ["APITube news pool unavailable."], error: "request failed" },
+    };
+  for (const name of ["gnews", "apitube", ...SUPPLEMENTAL_PROVIDERS] as const) {
     const upstream = pool[name];
     const matches = upstream.entries.filter(entry => companies.some(company => matchesCompanyNews(entry.text, company))).map(entry => entry.article);
     articles.push(...matches);
