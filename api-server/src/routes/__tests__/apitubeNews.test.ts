@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { apitubeKeys, contractorNewsSignals, fetchApitubeNews, mapApitubeArticle } from "../../lib/news/apitube";
-import { fetchRelevantNews, normalizeArticle } from "../relevant-news";
+import { fetchRelevantNews as fetchRelevantNewsAll, normalizeArticle } from "../relevant-news";
+// Validate the original GNews + APITube provider contract independently of the optional news sources.
+const fetchRelevantNews = (query: string, max: number, page: number, search: string | null) =>
+  fetchRelevantNewsAll(query, max, page, search, [], false);
 
 const article = {
   id: 123, title: "Amentum expands workforce after LOGCAP contract award",
