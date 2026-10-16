@@ -78,7 +78,7 @@ export interface UsaSpendingCompanyResult {
 }
 
 /** Paginate all available rows, bounded for provider safety. Never pretend a partial search was complete. */
-export async function fetchUsaSpendingAwards(company: string, now = new Date(), fetchImpl: typeof fetch = fetch): Promise<UsaSpendingCompanyResult> {
+export async function fetchUsaSpendingAwards(company: string, now = new Date(), fetchImpl: typeof fetch = fetch, companySignal?: AbortSignal): Promise<UsaSpendingCompanyResult> {
   const attempts: Array<[string[], string | null]> = [[FULL_FIELDS, "date_signed"], [SAFE_FIELDS, "date_signed"]];
   let lastStatus = "not attempted";
   for (const [fields, dateType] of attempts) {
@@ -91,7 +91,7 @@ export async function fetchUsaSpendingAwards(company: string, now = new Date(), 
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify(usaSpendingRequestBody(company, now, fields, dateType, page)),
-        signal: AbortSignal.timeout(30_000),
+        signal: companySignal ? AbortSignal.any([companySignal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
       });
       lastStatus = `HTTP ${response.status}`;
       // Invalid field sets can be retried once with the documented baseline.

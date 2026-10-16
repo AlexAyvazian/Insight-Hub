@@ -97,13 +97,15 @@ const PASS_INTERVAL_MS = 3 * 3_600_000;
 const FIRST_PASS_DELAY_MS = 45_000;
 const USASPENDING_BATCH = 15;
 const USASPENDING_SPACING_MS = 1_500;
+const USASPENDING_CONCURRENT_COMPANIES = 3;
+const USASPENDING_COMPANY_TIMEOUT_MS = 45_000;
 
 export interface AwardPassSummary {
   startedAt: string;
   finishedAt: string | null;
   bootstrappedCompanies?: number;
   dod: { status: string; feedItems: number; pagesProcessed: number; pagesSkipped: number; awardsParsed: number; newAwards: number; errors: string[] };
-  usaspending: { companies: number; rows: number; matched: number; newAwards: number; rejectedRecipients: number; errors: string[] };
+  usaspending: { companies: number; attemptedCompanies?: number; rows: number; matched: number; newAwards: number; rejectedRecipients: number; errors: string[] };
 }
 
 let lastPass: AwardPassSummary | null = null;
@@ -156,23 +158,56 @@ export async function runDodPass(run: SqlRunner, summary: AwardPassSummary, fetc
   }
 }
 
-export async function runUsaSpendingPass(run: SqlRunner, summary: AwardPassSummary, fetchImpl: typeof fetch = fetch, spacingMs = USASPENDING_SPACING_MS): Promise<void> {
+export async function runUsaSpendingPass(
+  run: SqlRunner,
+  summary: AwardPassSummary,
+  fetchImpl: typeof fetch = fetch,
+  spacingMs = USASPENDING_SPACING_MS,
+  companyTimeoutMs = USASPENDING_COMPANY_TIMEOUT_MS,
+): Promise<void> {
   const due = await companiesDueForCheck(run, USASPENDING_BATCH);
-  for (const [index, company] of due.entries()) {
-    if (index > 0) await sleep(spacingMs);
-    try {
-      const result = await fetchUsaSpendingAwards(company.name, new Date(), fetchImpl);
-      summary.usaspending.companies++;
-      summary.usaspending.rows += result.rows;
-      summary.usaspending.matched += result.awards.length;
-      summary.usaspending.rejectedRecipients += result.rejectedRecipients.length;
-      summary.usaspending.newAwards += await upsertAwards(run, result.awards);
-      await markCompanyChecked(run, company.key, `${result.status}; ${result.rows} rows, ${result.awards.length} verified`);
-    } catch (error) {
-      summary.usaspending.errors.push(`${company.name}: ${errorText(error)}`);
-      await markCompanyChecked(run, company.key, `error: ${errorText(error)}`).catch(() => undefined);
+  let cursor = 0;
+  let nextStartAt = 0;
+  // Three bounded workers permit multiple slow upstream lookups without
+  // hammering USAspending with unbounded concurrent API requests.
+  const worker = async (): Promise<void> => {
+    while (cursor < due.length) {
+      const company = due[cursor++]!;
+      const slot = Math.max(Date.now(), nextStartAt);
+      nextStartAt = slot + spacingMs;
+      if (slot > Date.now()) await sleep(slot - Date.now());
+      summary.usaspending.attemptedCompanies = (summary.usaspending.attemptedCompanies ?? 0) + 1;
+      const startedAt = Date.now();
+      try {
+        const result = await fetchUsaSpendingAwards(
+          company.name, new Date(), fetchImpl, AbortSignal.timeout(companyTimeoutMs),
+        );
+        const added = await upsertAwards(run, result.awards);
+        summary.usaspending.companies++;
+        summary.usaspending.rows += result.rows;
+        summary.usaspending.matched += result.awards.length;
+        summary.usaspending.rejectedRecipients += result.rejectedRecipients.length;
+        summary.usaspending.newAwards += added;
+        await markCompanyChecked(run, company.key, result.status + "; " + result.rows + " rows, " + result.awards.length + " verified");
+        console.log(JSON.stringify({
+          event: "company_watch_award_company", name: company.name, status: result.status,
+          rows: result.rows, verified: result.awards.length, newAwards: added, elapsedMs: Date.now() - startedAt,
+        }));
+      } catch (error) {
+        const message = errorText(error);
+        summary.usaspending.errors.push(company.name + ": " + message);
+        await markCompanyChecked(run, company.key, "error: " + message).catch(() => undefined);
+        console.log(JSON.stringify({
+          event: "company_watch_award_company", name: company.name, status: "error",
+          error: message, elapsedMs: Date.now() - startedAt,
+        }));
+      }
     }
-  }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(USASPENDING_CONCURRENT_COMPANIES, due.length) },
+    () => worker(),
+  ));
 }
 
 export async function runAwardPass(runner?: SqlRunner, fetchImpl: typeof fetch = fetch): Promise<AwardPassSummary> {
