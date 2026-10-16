@@ -686,8 +686,8 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
       {sourceBreakdown && (
         <div className="flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-black/25 px-4 py-3 text-sm text-white/75">
           <span className="font-semibold text-white">Source coverage</span>
-          <span>GovCon: {sourceBreakdown.govcon.toLocaleString("en-US")}</span>
-          <span>Tango: {sourceBreakdown.tango.toLocaleString("en-US")}</span>
+          <span>GovCon: {(sourceBreakdown.govcon ?? 0).toLocaleString("en-US")}</span>
+          <span>Tango: {(sourceBreakdown.tango ?? 0).toLocaleString("en-US")}</span>
           {!isRecompete && sourceBreakdown.officialAgencyForecasts !== undefined && (
             <span>Official agency forecasts: {sourceBreakdown.officialAgencyForecasts.toLocaleString("en-US")}</span>
           )}
