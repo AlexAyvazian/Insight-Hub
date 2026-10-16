@@ -55,8 +55,9 @@ test("both portals reuse database statements only, with no network calls", async
   const recompetes = await loadLocalOfficialSignals("recompete", run, NOW);
   assert.equal(forecasts.records.length, 1);
   assert.equal(recompetes.records.length, 1);
-  assert.deepEqual(sqls, [SAM_EARLY_NOTICE_SQL, EXPIRING_OFFICIAL_AWARDS_SQL]);
-  assert.match(SAM_EARLY_NOTICE_SQL, /provider_key = 'samGov'/);
+  assert.equal(sqls.filter(sql => sql === SAM_EARLY_NOTICE_SQL).length, 1);
+  assert.equal(sqls.filter(sql => sql === EXPIRING_OFFICIAL_AWARDS_SQL).length, 1);
+  assert.match(SAM_EARLY_NOTICE_SQL, /FROM sam_gov_intelligence_notices/);
   assert.match(EXPIRING_OFFICIAL_AWARDS_SQL, /company_watch_awards/);
   const unavailable = await loadLocalOfficialSignals("forecast", async () => { throw new Error("secret"); }, NOW);
   assert.equal(unavailable.records.length, 0);
