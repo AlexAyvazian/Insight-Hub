@@ -225,7 +225,8 @@ describe("SAM.gov bid-ready query policy", () => {
       const classificationQueries = buildSamGovClassificationQueries();
       const result = await new SamGovProvider().fetch({ dateRange: 30, limit: 1000 });
 
-      // Same number of quota-limited API calls, now retaining early and award notice types in a separate cache.\n      // One run rotates a bounded window of the taxonomy (default 6 codes) so a
+      // Same number of quota-limited API calls, now retaining early and award notice types in a separate cache.
+      // One run rotates a bounded window of the taxonomy (default 6 codes) so a
       // single Fetch cannot burn a small daily SAM.gov quota; coverage comes
       // from the cursor advancing across runs, not from firing every code.
       const perRun = Math.min(
