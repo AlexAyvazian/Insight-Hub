@@ -8,7 +8,7 @@ import { locationCountry } from "../officialAward";
 import { normalizeUsaSpendingRow, fetchUsaSpendingAwards, usaSpendingRequestBody } from "../usaSpendingAwards";
 import { buildCompanyLeads, dedupeLeads } from "../awardLeads";
 import { upsertAwards, type SqlRunner, type StoredAward } from "../awardStore";
-import { bootstrapDefaultCompanyWatch, companyAwards, DEFAULT_COMPANY_WATCH_NAMES, runAwardPass, runDodPass, type AwardPassSummary } from "../awardWatcher";
+import { bootstrapDefaultCompanyWatch, companyAwards, DEFAULT_COMPANY_WATCH_NAMES, runAwardPass, runDodPass, runUsaSpendingPass, type AwardPassSummary } from "../awardWatcher";
 import { buildProfile, type ProfileRows } from "../../search/relevanceProfile";
 
 const NOW = Date.parse("2026-10-15T12:00:00Z");
@@ -292,6 +292,40 @@ test("DoD 403 is reported as blocked and stops repeated calls to a rejected host
   assert.equal(summary.dod.feedItems, 3);
   assert.equal(articleRequests, 1, "do not hammer 403-blocked article pages");
   assert.equal(summary.dod.errors.length, 1);
+});
+
+test("background USAspending batch runs in bounded parallel with measured progress", async () => {
+  const names = Array.from({ length: 6 }, (_, i) => ({ company_key: "kbr-" + i, name: "KBR" }));
+  let active = 0;
+  let maxActive = 0;
+  const fetchMock = (async () => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    active--;
+    return Response.json({ results: [{
+      generated_internal_id: "CONT_AWD_TEST", "Award ID": "W91CRB26C0001",
+      "Recipient Name": "KBR WYLE SERVICES, LLC", "Base Obligation Date": "2026-10-10",
+      "Award Amount": 1000000,
+    }] });
+  }) as typeof fetch;
+  const runner: SqlRunner = async statement => {
+    if (statement.includes("SELECT company_key, name FROM company_watch_companies")) return names;
+    if (statement.includes("RETURNING (xmax = 0) AS inserted")) return [{ inserted: true }];
+    return [];
+  };
+  const summary: AwardPassSummary = {
+    startedAt: new Date().toISOString(), finishedAt: null,
+    dod: { status: "not run", feedItems: 0, pagesProcessed: 0, pagesSkipped: 0, awardsParsed: 0, newAwards: 0, errors: [] },
+    usaspending: { companies: 0, rows: 0, matched: 0, newAwards: 0, rejectedRecipients: 0, errors: [] },
+  };
+  await runUsaSpendingPass(runner, summary, fetchMock, 0, 300);
+  assert.equal(summary.usaspending.attemptedCompanies, 6);
+  assert.equal(summary.usaspending.companies, 6);
+  assert.equal(summary.usaspending.newAwards, 6);
+  assert.equal(summary.usaspending.errors.length, 0);
+  assert.ok(maxActive > 1, "multiple independent companies run concurrently");
+  assert.ok(maxActive <= 3, "no more than three in flight");
 });
 
 test("official awards and the background pass make no paid news API calls", async t => {
