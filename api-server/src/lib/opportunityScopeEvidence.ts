@@ -6,7 +6,14 @@
 import { getRelevanceProfile, type RelevanceProfile } from "./search/relevanceProfile";
 
 function words(value: string): string {
-  return value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  // Normalize common abbreviations/inflections, not service vocabulary.
+  // The list of *relevant services* remains owned by OCCU_MED_AWARE.
+  return value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()
+    .split(/\s+/)
+    .map((word) => word === "lab" ? "laboratory"
+      : ["exam", "exams", "examinations"].includes(word) ? "examination"
+      : word)
+    .join(" ");
 }
 
 /** Whole-token phrase matching: "lead" cannot match "leadership". */
@@ -39,7 +46,12 @@ export function hasPrimaryOccuMedServiceEvidence(
     ...profile.generalExplicit,
     ...categories.flatMap((category) => category.explicit),
   ]);
-  const components = multiWordTerms(categories.flatMap((category) => category.component));
+  // Network management and generic title signals (e.g. "quality assurance",
+  // "medical services") cannot independently prove a clinical purchase.
+  const components = multiWordTerms(categories
+    .filter((category) => category.id !== profile.networkCategoryId)
+    .flatMap((category) => category.component))
+    .filter((term) => !profile.genericTitle.some((generic) => containsCompletePhrase(term, generic)));
   if ([...explicit, ...components].some((term) => containsCompletePhrase(title, term))) {
     return true;
   }
