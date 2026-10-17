@@ -41,6 +41,12 @@ test("specific service titles remain eligible; generic scopes wait for review", 
   assert.notEqual(ambiguous.classification, "verified-open");
 });
 
+test("recognizes genuine medical-exam and laboratory-testing title abbreviations", () => {
+  assert.equal(hasPrimaryOccuMedServiceEvidence("OH Medical Exams Blanket Purchase Agreement (BPA)", "Medical examinations for employees"), true);
+  assert.equal(hasPrimaryOccuMedServiceEvidence("Kadena Lab Testing Services BPA", "Clinical laboratory testing for employees"), true);
+  assert.equal(hasPrimaryOccuMedServiceEvidence("Boxelder JCC Medical Services", "General administrative requirements"), false);
+});
+
 test("AI context preserves evidence in later description sections", () => {
   const fullText = "Administrative boilerplate ".repeat(500) + "\nPre-placement medical examinations required by employer\n" + "Terms and conditions ".repeat(700);
   const excerpt = opportunityDescriptionContext(fullText, 7_000);
