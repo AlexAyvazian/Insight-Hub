@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { NormalizedOpportunity } from "../providers/types";
 import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch";
 import { getOccuMedPromptContext, renderPromptContext } from "./occumedPromptContext";
+import { opportunityDescriptionContext } from "./opportunityDescriptionContext";
 import { geminiProvider } from "../providers/gemini";
 import { decideRelevance } from "./relevanceDecision";
 import { getRelevanceProfile } from "./relevanceProfile";
@@ -72,7 +73,7 @@ const MIN_PANEL_SIZE = 2;
 const CHUNK_SIZE = 4;
 const DEFAULT_CANDIDATE_LIMIT = 10;
 const PROVIDER_TIMEOUT_MS = 28_000;
-const MAX_DESCRIPTION_CHARS = 1_400;
+const MAX_DESCRIPTION_CHARS = 12_000;
 const MAX_OUTPUT_TOKENS = 900;
 const CACHE_TTL_MS = 12 * 60 * 60 * 1_000;
 const SHORT_COOLDOWN_MS = 10 * 60 * 1_000;
@@ -209,7 +210,7 @@ function recordText(record: NormalizedOpportunity): string {
     record.responseDeadline
       ? `Response deadline: ${record.responseDeadline.toISOString()}`
       : "Response deadline: unknown",
-    `Description: ${(record.description ?? "").slice(0, MAX_DESCRIPTION_CHARS)}`,
+    `Description: ${opportunityDescriptionContext(record.description, MAX_DESCRIPTION_CHARS)}`,
   ]
     .filter(Boolean)
     .join("\n");

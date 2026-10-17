@@ -3,6 +3,7 @@ import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch
 import { getOccuMedPromptContext, renderPromptContext } from "./occumedPromptContext";
 import { decideRelevance } from "./relevanceDecision";
 import { getRelevanceProfile } from "./relevanceProfile";
+import { opportunityDescriptionContext } from "./opportunityDescriptionContext";
 import { SCOPE_BLOCK_HEADER, judgeScopeBlock, profileServiceLabels, scoreGuidance } from "./profileText";
 import { geminiProvider } from "../providers/gemini";
 import { groqProvider } from "../providers/groq";
@@ -62,7 +63,7 @@ const REVIEW_PROVIDERS: ReviewProvider[] = [
 ];
 
 const DEFAULT_REVIEW_LIMIT = 3;
-const REVIEW_DESCRIPTION_CHARS = 1_200;
+const REVIEW_DESCRIPTION_CHARS = 12_000;
 const REVIEW_OUTPUT_TOKENS = 700;
 const PANEL_SIZE = 3;
 const PANEL_CONSENSUS = 2;
@@ -239,7 +240,7 @@ export function buildReviewPrompt(
           record.responseDeadline
             ? `Deadline: ${record.responseDeadline.toISOString()}`
             : "Deadline: unknown",
-          `Description: ${(record.description ?? "").slice(0, REVIEW_DESCRIPTION_CHARS)}`,
+          `Description: ${opportunityDescriptionContext(record.description, REVIEW_DESCRIPTION_CHARS)}`,
         ]
           .filter(Boolean)
           .join("\n"),
