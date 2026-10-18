@@ -118,6 +118,12 @@ export interface RuleContext {
   /** title + snippet + description */
   haystack: string;
   hasProcurementSignal: boolean;
+  /**
+   * Opportunities only: a post-award trigger found only outside the title ("the current contract was awarded to
+   * ...") does not hard-reject a notice whose title names a bid-ready procurement stage; it becomes a negative
+   * signal instead. Other consumers leave this unset and keep the rule's literal any-trigger behavior.
+   */
+  postAwardTitleScoped?: boolean;
 }
 export interface RuleHardReject {
   ruleKey: string;
@@ -169,6 +175,16 @@ export function evaluateRules(profile: RelevanceProfile, ctx: RuleContext): Rule
       case "reject_as_out_of_scope": {
         if (out.hardReject || !declaresMatch(rule)) break;
         const hit = matchTriggers(ctx.haystack, rule.triggers)[0];
+        if (
+          hit &&
+          rule.action === "reject_post_award_notice" &&
+          ctx.postAwardTitleScoped &&
+          matchTriggers(ctx.title, rule.triggers).length === 0 &&
+          matchTriggers(ctx.title, profile.procurementSignals).length > 0
+        ) {
+          out.negativeSignals.push(`${rule.key}: ${hit} (description history in a bid-ready notice)`);
+          break;
+        }
         if (hit)
           out.hardReject = {
             ruleKey: rule.key,

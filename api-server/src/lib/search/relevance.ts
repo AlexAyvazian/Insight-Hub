@@ -223,6 +223,7 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
     title: titleNorm,
     haystack,
     hasProcurementSignal: hasProc,
+    postAwardTitleScoped: mode === "token",
   });
   if (rules.hardReject)
     return rejected(
