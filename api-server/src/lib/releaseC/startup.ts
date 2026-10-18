@@ -77,7 +77,10 @@ export async function startReleaseC(log: Log): Promise<void> {
     const intervalMs = Math.max(5 * 60_000, Number(process.env.REVIEW_QUEUE_INTERVAL_MS ?? 30 * 60_000));
     const tick = async () => {
       try {
-        const { reviewQueueStats } = await import("./reviewQueue");
+        const { releaseStaleClaims, reviewQueueStats } = await import("./reviewQueue");
+        // Without this, items stranded in_review by a redeploy stay there: nothing else counts them as due.
+        const released = await releaseStaleClaims();
+        if (released > 0) log.info({ event: "review_queue_stale_claims_released", released }, "Stale review claims released");
         const stats = await reviewQueueStats();
         if (stats.dueNow === 0) return;
         const { startManualIngestion, ActiveIngestionRunError } = await import("../ingestion/manualIngestion");

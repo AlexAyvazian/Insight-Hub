@@ -169,6 +169,29 @@ describe("review queue persistence", () => {
     assert.equal((row?.decision as { method?: string } | null)?.method, "deterministic");
   });
 
+  it("returns items stranded in_review by a dead run to the queue so the scheduler sees them as due", async () => {
+    const { cachedQueueDecisions, releaseStaleClaims, reviewQueueStats } = await import("../reviewQueue");
+    const { opportunityKey } = await import("../identity");
+    const { rcPool } = await import("../db");
+    const record = ambiguous(Date.now() + 7);
+    const failing = judge("mistral-small-latest", () => true, { fail: true });
+    await decideStructuredOpportunities([record], { persist: true, reviewProviders: [failing], timeBudgetMs: 60_000 });
+    const key = opportunityKey(record);
+    const pool = await rcPool();
+    await pool.query(`UPDATE opportunity_review_queue SET status = 'in_review', next_attempt_at = now() WHERE opportunity_key = $1`, [key]);
+    assert.equal(await releaseStaleClaims() >= 0, true);
+    assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "in_review", "a fresh claim is left to its run");
+    await pool.query(`UPDATE opportunity_review_queue SET updated_at = now() - interval '31 minutes' WHERE opportunity_key = $1`, [key]);
+    // Ingestion seeing the same version again must not make the abandoned claim look fresh.
+    const { enqueueForReview } = await import("../reviewQueue");
+    const hash = (await cachedQueueDecisions([key])).get(key)!.contentHash;
+    await enqueueForReview([{ opportunityKey: key, provider: "samGov", record, contentHash: hash, profileVersion: null, priority: 5, holdCode: "structured_review_queued", reason: "seen again" }]);
+    assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "in_review");
+    assert.ok((await releaseStaleClaims()) >= 1);
+    assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "queued");
+    assert.ok((await reviewQueueStats()).dueNow >= 1, "the released item now counts as due");
+  });
+
   it("never lets an in-flight review of an older version overwrite a newer decision", async () => {
     const { cachedQueueDecisions } = await import("../reviewQueue");
     const { opportunityKey } = await import("../identity");
