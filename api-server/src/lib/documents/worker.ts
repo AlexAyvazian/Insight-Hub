@@ -13,7 +13,7 @@ import { ProviderQuotaError, sharedAccountLedger } from "../providers/accountLed
 import { safeFetch, UnsafeUrlError } from "../security/safeUrl";
 import { needsSamApiKey } from "./attachments";
 import { htmlToText, parseDocumentNatively } from "./parsers";
-import { extractionCredentialPools, extractRemotely, llmWhispererPolicy } from "./remoteExtractors";
+import { AcceptedJobError, extractionCredentialPools, extractRemotely, llmWhispererPolicy } from "./remoteExtractors";
 import { buildSections } from "./sections";
 import {
   claimNextJob,
@@ -68,7 +68,13 @@ function withSamKey(url: string, key: string): string {
 }
 
 function fileNameFor(url: string, contentType: string): string {
-  const last = decodeURIComponent(new URL(url).pathname.split("/").pop() ?? "document");
+  const raw = new URL(url).pathname.split("/").pop() ?? "document";
+  let last = raw;
+  try {
+    last = decodeURIComponent(raw);
+  } catch {
+    // Malformed percent escapes: keep the undecoded name.
+  }
   if (/\.[a-z0-9]{2,5}$/i.test(last)) return last;
   const ext = contentType.includes("pdf") ? ".pdf" : contentType.includes("word") ? ".docx" : contentType.includes("sheet") ? ".xlsx" : ".bin";
   return `${last || "document"}${ext}`;
@@ -182,6 +188,7 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
   let provider: string | null = null;
   let account: string | null = null;
   let quotaWait = false;
+  let resumeAccepted = false;
   const needOcr = parsed.pages.filter((page) => page.needsOcr).map((page) => page.page);
   const remoteEligible = parsed.format === "pdf" || parsed.format === "image" || parsed.format === "legacy_office" || parsed.format === "unsupported";
   if (remoteEligible && (needOcr.length > 0 || parsed.pages.length === 0)) {
@@ -201,6 +208,7 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
         : remote.pages;
     } catch (error) {
       quotaWait = error instanceof ProviderQuotaError;
+      resumeAccepted = error instanceof AcceptedJobError;
       parsed.warnings.push(`remote extraction unavailable: ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);
     }
   }
@@ -221,6 +229,11 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
     extraction_quality: parsed.warnings.length ? parsed.warnings.join(" | ").slice(0, 500) : "ok",
   });
 
+  if (!complete && resumeAccepted && job.attempts < MAX_ATTEMPTS + 10) {
+    // A remote job was accepted and charged; come back to collect it instead of resubmitting elsewhere.
+    await finishJob(job.jobId, "queued", "waiting for accepted remote extraction", new Date(Date.now() + 10 * 60_000));
+    return { jobId: job.jobId, status: "queued", detail: `${extractedPages}/${totalPages} pages; remote job pending`, changed: false };
+  }
   if (!complete && quotaWait && job.attempts < MAX_ATTEMPTS + 10) {
     // Keep the partial text, and come back for the missing pages after the free allowance resets.
     await finishJob(job.jobId, "quota_wait", "waiting for free extraction capacity", await nextWhisperReset());

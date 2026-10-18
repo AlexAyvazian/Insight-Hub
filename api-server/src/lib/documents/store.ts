@@ -180,19 +180,33 @@ export async function recordDocumentVersion(
     await updateDocument(document.id, { sha256: sha, ...fields });
     return { documentId: document.id, changed: Boolean(document.sha256 && document.sha256 !== sha) };
   }
-  const id = randomUUID();
-  await (await rcPool()).query(
-    `INSERT INTO opportunity_documents (id, opportunity_key, opportunity_id, source_url, document_role, title, source_version, amended_at, sha256)
-     SELECT $2, opportunity_key, opportunity_id, source_url, document_role, title, source_version, now(), $3 FROM opportunity_documents WHERE id = $1`,
-    [document.id, id, sha],
+  // Content that reverts to an earlier version reuses that version's row (the unique index allows one row per hash).
+  const previous = await (await rcPool()).query(
+    `SELECT id FROM opportunity_documents WHERE opportunity_key = $1 AND source_url = $2 AND sha256 = $3 AND id <> $4 LIMIT 1`,
+    [document.opportunityKey, document.sourceUrl, sha, document.id],
   );
+  const reused: string | undefined = previous.rows[0]?.id;
+  const id = reused ?? randomUUID();
+  if (reused) {
+    await updateDocument(reused, { superseded_by: null, amended_at: new Date() });
+  } else {
+    await (await rcPool()).query(
+      `INSERT INTO opportunity_documents (id, opportunity_key, opportunity_id, source_url, document_role, title, source_version, amended_at, sha256)
+       SELECT $2, opportunity_key, opportunity_id, source_url, document_role, title, source_version, now(), $3 FROM opportunity_documents WHERE id = $1`,
+      [document.id, id, sha],
+    );
+  }
   await updateDocument(document.id, { superseded_by: id });
   await updateDocument(id, fields);
   await (await rcPool()).query(
     `INSERT INTO opportunity_audit_log (id, opportunity_key, event, details) VALUES ($1,$2,'document_version_changed',$3)`,
-    [randomUUID(), document.opportunityKey, JSON.stringify({ from: document.id, to: id, previousSha: document.sha256, sha })],
+    [randomUUID(), document.opportunityKey, JSON.stringify({ from: document.id, to: id, previousSha: document.sha256, sha, reusedVersion: Boolean(reused) })],
   );
-  await (await rcPool()).query(`UPDATE document_extraction_jobs SET document_id = $2 WHERE document_id = $1`, [document.id, id]);
+  await (await rcPool()).query(
+    `UPDATE document_extraction_jobs SET document_id = $2
+     WHERE document_id = $1 AND NOT EXISTS (SELECT 1 FROM document_extraction_jobs WHERE document_id = $2)`,
+    [document.id, id],
+  );
   return { documentId: id, changed: true };
 }
 

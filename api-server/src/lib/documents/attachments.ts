@@ -11,8 +11,16 @@ import type { AttachmentRef, DocumentRole } from "./types";
 const DOCUMENT_LINK = /\.(pdf|docx?|xlsx?|txt|rtf|zip)(?:$|[?#])|\/(?:download|attachment|attachments|files?|documents?|resources)\//i;
 const MAX_ATTACHMENTS = 40;
 
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function roleFor(url: string, title: string | null): DocumentRole {
-  const probe = `${title ?? ""} ${decodeURIComponent(url.split("?")[0] ?? "")}`.toLowerCase();
+  const probe = `${title ?? ""} ${safeDecode(url.split("?")[0] ?? "")}`.toLowerCase();
   if (/amend|modif|addend|\bmod\s?\d/.test(probe)) return "amendment";
   if (/\bsow\b|statement of work|\bpws\b|performance work|scope of (?:work|services)|statement of objectives/.test(probe)) return "sow";
   if (/q\s?&\s?a|questions|answers|clarification/.test(probe)) return "qa";

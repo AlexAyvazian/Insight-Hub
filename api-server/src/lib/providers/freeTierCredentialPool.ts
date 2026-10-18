@@ -215,6 +215,8 @@ function cooldownMs(error: unknown): number {
 }
 
 function isCredentialRetryable(error: unknown): boolean {
+  // An operation can mark its error as final for the run (for example, a remote job already accepted and charged).
+  if ((error as { credentialRetryable?: boolean } | null)?.credentialRetryable === false) return false;
   if (error instanceof ProviderQuotaError) return true;
   const message = error instanceof Error ? error.message : String(error);
   if (/\b(400|404|405|413|422)\b/.test(message)) return false;
@@ -481,9 +483,16 @@ export class FreeTierCredentialPool {
         state.failures += 1;
         state.lastOutcome = failureOutcome(error);
         if (this.accounts) {
-          await (this.accounts.ledger ?? sharedAccountLedger())
-            .recordFailure(this.accounts.policyFor(candidate.slot), error)
-            .catch(() => undefined);
+          const ledger = this.accounts.ledger ?? sharedAccountLedger();
+          const policy = this.accounts.policyFor(candidate.slot);
+          // Usage the operation reported before failing was already charged by the provider.
+          if (reportedUnits !== null && reportedUnits > 0) {
+            await ledger.recordUsage(policy, reportedUnits, "failure", reportedQuality).catch(() => undefined);
+          }
+          // An error that says the account is healthy (e.g. waiting on an accepted job) is not an account failure.
+          if ((error as { accountHealthy?: boolean } | null)?.accountHealthy !== true) {
+            await ledger.recordFailure(policy, error).catch(() => undefined);
+          }
         }
         if (!isCredentialRetryable(error)) throw error;
         const explicitReset = explicitCooldownUntilMs(error);
