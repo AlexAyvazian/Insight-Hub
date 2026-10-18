@@ -202,6 +202,19 @@ describe("free native document parsing with page citations", () => {
     assert.match(exclusion!.locator, /SOW, p\.3/);
   });
 
+  it("keeps a heading-like closing line that has nothing under it", () => {
+    const sections = buildSections([
+      { page: 1, text: "RELEASE C EXTRACTION SELF TEST\nStatement of work: annual physicals.\nProposals Due October 30 2026", needsOcr: false },
+    ]);
+    const all = sections.map((s) => `${s.heading ?? ""}\n${s.text}`).join("\n");
+    assert.match(all, /Statement of work/);
+    assert.ok(sections.some((s) => s.text.includes("Proposals Due October 30 2026")), "the last line is stored as section text, not dropped");
+
+    // Consecutive headings (a table of contents) stay labels: none becomes body text that could read as a requirement.
+    const toc = buildSections([{ page: 1, text: "STATEMENT OF WORK\nDRUG TESTING SERVICE EXCLUSIONS\nNo exclusions apply to this contract.", needsOcr: false }]);
+    assert.ok(toc.every((s) => !/^STATEMENT OF WORK$/m.test(s.text)), "a heading followed by another heading is not promoted to text");
+  });
+
   it("reads DOCX paragraphs and XLSX sheets", () => {
     const docx = zipSync({
       "[Content_Types].xml": strToU8('<Types><Override ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'),

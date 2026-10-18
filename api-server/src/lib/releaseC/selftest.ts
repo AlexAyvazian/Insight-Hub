@@ -137,7 +137,7 @@ async function execute(run: SelftestRun, base: string): Promise<void> {
   await step(run, "ocr", async () => {
     const done = await waitForDocument(keyA, scannedUrl, (doc) => doc.extractionStatus !== "pending");
     if (!done) return { ok: false, detail: "worker did not finish the scanned page in time" };
-    const text = (await sectionsFor(keyA)).filter((s) => s.documentId === done.doc.id).map((s) => s.text).join(" ");
+    const text = (await sectionsFor(keyA)).filter((s) => s.documentId === done.doc.id).map((s) => `${s.heading ?? ""} ${s.text}`).join(" ");
     const ok = done.doc.extractionStatus === "extracted" && hasMarker(text);
     return {
       ok,
