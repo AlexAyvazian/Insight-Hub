@@ -25,6 +25,7 @@ import {
   type RelevanceResult,
 } from "./relevance";
 import { decideRelevance } from "./relevanceDecision";
+import { REASON_CODES } from "./relevanceReasonCodes";
 import { getRelevanceProfile } from "./relevanceProfile";
 import {
   profileBooleanQueries,
@@ -93,6 +94,10 @@ export interface WebIntelligenceResult {
     totalCandidates: number;
     dateFiltered: number;
     preFiltered: number;
+    /** Candidates kept for enrichment because the snippet alone was review-band (not yet accepted). */
+    reviewBandKept: number;
+    /** Why candidates were skipped before enrichment, by reason (no candidate disappears without a reason). */
+    skippedByReason: Record<string, number>;
     jinaEnriched: number;
     keenableEnriched: number;
     browserbaseEnriched: number;
@@ -119,7 +124,27 @@ interface Candidate {
   enrichedBy?: string;
 }
 
-function isRfpCandidate(candidate: Candidate): boolean {
+export type DiscoveryTriage =
+  | { keep: true; band: "accept" | "review" }
+  | { keep: false; reason: "blocked_domain" | "hard_reject" | "no_procurement_signal" | "insufficient_relevance" };
+
+/**
+ * Pre-enrichment triage of a search hit from its title/snippet alone. Only cheap, safe exclusions happen here
+ * (job boards, profile hard rejects, no procurement wording, no service evidence at all). Review-band snippets are
+ * kept so the page can be fetched and judged on its full text; a short snippet is not grounds to discard.
+ */
+export function triageDiscoveryCandidate(candidate: Pick<Candidate, "title" | "content" | "url">): DiscoveryTriage {
+  if (isBlockedDomainShared(candidate.url)) return { keep: false, reason: "blocked_domain" };
+  const r = classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, allowHistorical: true });
+  if (r.reasonCodes.includes(REASON_CODES.hardReject)) return { keep: false, reason: "hard_reject" };
+  if (r.matchedProcurementSignals.length === 0) return { keep: false, reason: "no_procurement_signal" };
+  const verdict = decideRelevance(r).verdict;
+  if (verdict === "reject") return { keep: false, reason: "insufficient_relevance" };
+  return { keep: true, band: verdict };
+}
+
+/** Legacy accept-only gate, kept for callers outside discovery triage. */
+export function isRfpCandidate(candidate: Candidate): boolean {
   return isRfpCandidateShared(candidate.title, candidate.content, candidate.url);
 }
 
@@ -252,6 +277,8 @@ export async function webIntelligenceFetch(options: {
     totalCandidates: 0,
     dateFiltered: 0,
     preFiltered: 0,
+    reviewBandKept: 0,
+    skippedByReason: {} as Record<string, number>,
     jinaEnriched: 0,
     keenableEnriched: 0,
     browserbaseEnriched: 0,
@@ -530,15 +557,30 @@ export async function webIntelligenceFetch(options: {
     return Number.isNaN(parsed.getTime()) || parsed.getTime() >= publishedAfter.getTime();
   });
   stats.dateFiltered = candidates.length - dateBoundedCandidates.length;
-  const filtered = dateBoundedCandidates.filter(isRfpCandidate);
+  const triaged = dateBoundedCandidates.map((candidate) => ({ candidate, triage: triageDiscoveryCandidate(candidate) }));
+  const filtered: Candidate[] = [];
+  const reviewBand = new Set<Candidate>();
+  for (const { candidate, triage } of triaged) {
+    if (triage.keep) {
+      filtered.push(candidate);
+      if (triage.band === "review") reviewBand.add(candidate);
+    } else {
+      stats.skippedByReason[triage.reason] = (stats.skippedByReason[triage.reason] ?? 0) + 1;
+    }
+  }
+  if (stats.dateFiltered > 0) stats.skippedByReason.outside_date_range = stats.dateFiltered;
   stats.preFiltered = filtered.length;
+  stats.reviewBandKept = reviewBand.size;
   stats.rejected = candidates.length - filtered.length;
   if (filtered.length === 0) return { opportunities: [], stats, errors };
 
+  // Enrichment budget is unchanged (ENRICHMENT_MAX_URLS). Spend it first on review-band hits, which cannot be judged
+  // without the page, then on accepted hits whose snippet is still thin.
   const enrichedCandidates = [...filtered];
   const toEnrich = enrichedCandidates
     .map((candidate, index) => ({ candidate, index }))
     .filter(({ candidate }) => candidate.content.length < 800)
+    .sort((a, b) => Number(reviewBand.has(b.candidate)) - Number(reviewBand.has(a.candidate)) || a.index - b.index)
     .slice(0, ENRICHMENT_MAX_URLS);
 
   for (const { candidate, index } of toEnrich) {
@@ -637,7 +679,8 @@ export async function webIntelligenceFetch(options: {
         }
         opportunities.push(buildWebOpportunity(candidate, {
           title: extraction.title ?? candidate.title,
-          agency: extraction.agency ?? cls.category ?? "Unknown Organization",
+          // Never substitute a service category for an unknown buyer.
+          agency: extraction.agency ?? "Unknown Organization",
           description: extraction.description,
           deadline: validDeadline,
           location: extraction.location ?? undefined,
@@ -665,8 +708,9 @@ export async function webIntelligenceFetch(options: {
       }
       opportunities.push(buildWebOpportunity(candidate, {
         title: candidate.title,
-        agency: meta.agencyHint ?? cls.category ?? "Unknown Organization",
-        description: candidate.content.slice(0, 600) || undefined,
+        agency: meta.agencyHint ?? "Unknown Organization",
+        // Keep the full fetched text (already capped at 5,000 by enrichment) so scope evidence is not judged on 600.
+        description: candidate.content.slice(0, 5_000) || undefined,
         deadline: meta.deadline,
         estimatedValue: meta.estimatedValue,
         relevanceScore: cls.score,
