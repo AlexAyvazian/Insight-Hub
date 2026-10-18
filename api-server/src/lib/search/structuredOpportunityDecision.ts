@@ -514,17 +514,17 @@ export async function decideStructuredOpportunities(
     aiApproved += 1;
   }
 
-  const held: StructuredHeldRecord[] = ambiguous.flatMap((entry, index) => {
+  const held: StructuredHeldRecord[] = ambiguous.flatMap((entry, index): StructuredHeldRecord[] => {
     if (approvedIndexes.has(index)) return [];
     if (index >= reviewLimit) {
-      return [{ record: entry.record, code: "structured_review_budget" as const,
+      return [{ record: entry.record, code: "structured_review_budget",
         reason: `Not sent to AI review: per-run review budget (${reviewLimit}) reached. ${entry.reason}`.trim() }];
     }
     if (reviewFailure || review.reviewers.length === 0) {
-      return [{ record: entry.record, code: "structured_review_failed" as const,
+      return [{ record: entry.record, code: "structured_review_failed",
         reason: `AI review unavailable${reviewFailure ? ` (${reviewFailure})` : ""}. ${entry.reason}`.trim() }];
     }
-    return [{ record: entry.record, code: "structured_review_declined" as const,
+    return [{ record: entry.record, code: "structured_review_declined",
       reason: `AI review did not confirm purchased scope. ${entry.reason}`.trim() }];
   });
   const reviewHeld = held.length;
