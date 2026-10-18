@@ -58,11 +58,17 @@ export function selftestRun(id: string): SelftestRun | null {
 /** Fixture bytes for the worker to download. Unknown runs or names return null. */
 export function selftestFixture(runId: string, name: string): { body: Uint8Array | string; contentType: string } | null {
   if (!runs.has(runId)) return null;
-  if (name === "scanned.pdf" || name === "scanned-copy.pdf") {
-    return { body: Buffer.from(SELFTEST_SCANNED_PDF_BASE64, "base64"), contentType: "application/pdf" };
-  }
+  if (name === "scanned.pdf" || name === "scanned-copy.pdf") return { body: scannedBytes(runId), contentType: "application/pdf" };
   if (name === "notice.html") return { body: selftestAmendmentHtml(noticeVersion.get(runId) ?? 1), contentType: "text/html; charset=utf-8" };
   return null;
+}
+
+/**
+ * The scanned fixture with a trailing PDF comment naming the run, so every run has a new content hash and its OCR
+ * step cannot be satisfied from an earlier run's cache entry. Both URLs of one run share the bytes (the cache step).
+ */
+export function scannedBytes(runId: string): Uint8Array {
+  return Buffer.concat([Buffer.from(SELFTEST_SCANNED_PDF_BASE64, "base64"), Buffer.from(`\n% release-c-selftest ${runId}\n`)]);
 }
 
 function publicBase(): string | null {
@@ -166,7 +172,7 @@ async function execute(run: SelftestRun, base: string): Promise<void> {
 
   await step(run, "nutrient", async () => {
     const result = await extractWithNutrient({
-      bytes: Buffer.from(SELFTEST_SCANNED_PDF_BASE64, "base64"),
+      bytes: scannedBytes(run.id),
       fileName: "release-c-selftest.pdf",
       pages: [1],
       pageCount: 1,
@@ -186,12 +192,23 @@ export async function startSelftest(): Promise<StartResult> {
   if (Date.now() - lastStartedAt < COOLDOWN_MS) return { refused: "A self-test ran recently; try again later.", status: 429 };
   const base = publicBase();
   if (!base) return { refused: "No public base URL (RENDER_EXTERNAL_URL) for the worker to fetch fixtures from.", status: 503 };
-  await ensureReleaseCSchema();
-  const run: SelftestRun = { id: randomUUID().slice(0, 8), startedAt: new Date().toISOString(), finishedAt: null, status: "running", steps: [], usageBefore: await usageSnapshot(), usageAfter: null };
+  // Reserve the slot before any await, so concurrent requests cannot both start a run.
+  const id = randomUUID().slice(0, 8);
+  const previousStart = lastStartedAt;
+  active = id;
+  lastStartedAt = Date.now();
+  let usageBefore: Record<string, unknown>[];
+  try {
+    await ensureReleaseCSchema();
+    usageBefore = await usageSnapshot();
+  } catch (error) {
+    active = null;
+    lastStartedAt = previousStart;
+    throw error;
+  }
+  const run: SelftestRun = { id, startedAt: new Date().toISOString(), finishedAt: null, status: "running", steps: [], usageBefore, usageAfter: null };
   runs.set(run.id, run);
   noticeVersion.set(run.id, 1);
-  lastStartedAt = Date.now();
-  active = run.id;
   void execute(run, base)
     .catch((error) => {
       run.steps.push({ name: "ocr", ok: false, detail: `self-test aborted: ${error instanceof Error ? error.message.slice(0, 300) : String(error)}` });

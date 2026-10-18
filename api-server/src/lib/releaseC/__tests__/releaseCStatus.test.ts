@@ -181,6 +181,13 @@ describe("extraction self-test guard rails", () => {
     assert.equal(parsed.format, "pdf");
     assert.ok(parsed.pages.every((page) => page.needsOcr && !page.text.includes(SELFTEST_OCR_MARKER)));
 
+    // Each run's scanned fixture has its own hash (so OCR is never satisfied from an earlier run's cache) and still
+    // has no text layer.
+    const { sha256Hex } = await import("../../documents/store");
+    assert.notEqual(sha256Hex(selftest.scannedBytes("run-one")), sha256Hex(selftest.scannedBytes("run-two")));
+    const perRun = await parseDocumentNatively(selftest.scannedBytes("run-one"), "application/pdf", "x.pdf");
+    assert.ok(perRun.pages.length === 1 && perRun.pages[0]!.needsOcr);
+
     process.env.RELEASE_C_SELFTEST_ENABLED = "true";
     process.env.RELEASE_C_SELFTEST_BASE_URL = "";
     delete process.env.RENDER_EXTERNAL_URL;

@@ -292,9 +292,14 @@ export async function runDocumentWorker(options: {
   const outcomes: JobOutcome[] = [];
   extractionCredentialPools();
   if (!allowListRecoveryDone) {
-    allowListRecoveryDone = true;
-    const requeued = await requeueNewlyAllowedContentTypes(isAllowedContentType).catch(() => 0);
-    if (requeued > 0) console.info(JSON.stringify({ event: "document_jobs_requeued_after_allow_list_change", requeued }));
+    try {
+      const requeued = await requeueNewlyAllowedContentTypes(isAllowedContentType);
+      allowListRecoveryDone = true;
+      if (requeued > 0) console.info(JSON.stringify({ event: "document_jobs_requeued_after_allow_list_change", requeued }));
+    } catch (error) {
+      // Retried on the next batch.
+      console.warn(JSON.stringify({ event: "document_allow_list_recovery_failed", error: error instanceof Error ? error.message.slice(0, 200) : String(error) }));
+    }
   }
   while (outcomes.length < options.maxJobs) {
     if (Date.now() - started > options.deadlineMs) return { processed: outcomes.length, outcomes, stoppedBy: "deadline" };
