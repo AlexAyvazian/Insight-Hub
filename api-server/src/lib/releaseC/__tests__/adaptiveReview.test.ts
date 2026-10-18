@@ -314,6 +314,21 @@ describe("judge response handling", () => {
     delete process.env.MINIMAX_API_KEY;
   });
 
+  it("gives Gemini room to think before answering and reads the answer, not the thought", async (t) => {
+    const { GeminiProvider } = await import("../../providers/gemini");
+    process.env.GEMINI_API_KEY = "gemini-test-key";
+    let sentMax = 0;
+    t.mock.method(globalThis, "fetch", async (_url: string, init: { body: string }) => {
+      sentMax = JSON.parse(init.body).generationConfig.maxOutputTokens;
+      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "thinking...", thought: true }, { text: '{"results":[]}' }] } }] });
+    });
+    assert.equal(await new GeminiProvider().complete("x", 700), '{"results":[]}');
+    assert.ok(sentMax >= 700 + 1_000, "thinking tokens no longer eat the answer's budget");
+    t.mock.method(globalThis, "fetch", async () => Response.json({ candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [] } }] }));
+    await assert.rejects(new GeminiProvider().complete("x", 700), /output token limit/);
+    delete process.env.GEMINI_API_KEY;
+  });
+
   it("falls back to the next model when the configured one is not enabled for the account, and keeps it", async (t) => {
     const { OpenAiCompatibleProvider } = await import("../../providers/openAiCompatible");
     const { providerModelFamily } = await import("../identity");

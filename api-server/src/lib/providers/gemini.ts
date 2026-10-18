@@ -74,6 +74,16 @@ function geminiTimeoutMs(): number {
   return Number.isFinite(value) && value > 0 ? value : 60_000;
 }
 
+/**
+ * Extra output tokens for the flash model's thinking, which counts against maxOutputTokens: with only the answer's
+ * budget (700 for a panel batch) it ran out before writing any votes ("0/3 distinct valid panel votes" in
+ * production). Override with GEMINI_THINKING_HEADROOM_TOKENS.
+ */
+function geminiThinkingHeadroom(): number {
+  const value = Number(process.env.GEMINI_THINKING_HEADROOM_TOKENS);
+  return Number.isFinite(value) && value >= 0 ? value : 2_048;
+}
+
 async function callGemini(
   apiKey: string,
   prompt: string,
@@ -85,7 +95,7 @@ async function callGemini(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
+      generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens + geminiThinkingHeadroom() },
     }),
     signal: signal
       ? AbortSignal.any([signal, AbortSignal.timeout(geminiTimeoutMs())])
@@ -104,9 +114,14 @@ async function callGemini(
     throw new Error(`Gemini API error ${response.status}: ${body.slice(0, 200)}`);
   }
   const json = (await response.json()) as {
-    candidates?: { content?: { parts?: { text?: string }[] } }[];
+    candidates?: { finishReason?: string; content?: { parts?: { text?: string; thought?: boolean }[] } }[];
   };
-  return (json.candidates?.[0]?.content?.parts?.[0]?.text ?? "")
+  const candidate = json.candidates?.[0];
+  const text = (candidate?.content?.parts ?? []).filter((part) => !part.thought).map((part) => part.text ?? "").join("");
+  if (!text.trim() && candidate?.finishReason === "MAX_TOKENS") {
+    throw new Error("Gemini stopped at the output token limit before answering (thinking used the budget)");
+  }
+  return text
     .replace(/```json\n?/g, "")
     .replace(/```/g, "")
     .trim();
