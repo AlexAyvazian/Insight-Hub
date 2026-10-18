@@ -62,6 +62,19 @@ describe("remote extraction accounting", () => {
     assert.equal(nutrientPlannedCredits({ pageCount: null, pages: null, scanned: false }), 20, "unknown page count plans the conservative cap");
   });
 
+  it("never sends a document with an unknown page count to Nutrient", async () => {
+    process.env.NUTRIENT_API_KEY = "nutrient-key-0000000000000";
+    setSharedAccountLedgerForTests(new AccountLedger(new MemoryLedgerStore()));
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response("unexpected", { status: 500 });
+    }) as typeof fetch;
+    const request = { bytes: new TextEncoder().encode("legacy-doc"), fileName: "a.doc", pages: null, pageCount: null, scanned: true };
+    await assert.rejects(extractRemotely(request), /page count unknown/);
+    assert.equal(calls, 0);
+  });
+
   it("keeps valid attachments when one URL has a malformed percent escape", () => {
     const record = {
       externalId: "x",

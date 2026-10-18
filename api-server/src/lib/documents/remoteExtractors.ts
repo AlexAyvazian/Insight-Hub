@@ -352,6 +352,12 @@ export function nutrientPlannedCredits(request: Pick<RemoteExtractionRequest, "p
 }
 
 export async function extractWithNutrient(request: RemoteExtractionRequest): Promise<RemoteExtraction> {
+  // Nutrient processes the whole upload and has no page-limit option, so a document whose page count is unknown
+  // could be charged beyond any reservation. Such documents are left to LLMWhisperer (which caps pages) or stay
+  // pending until one is available.
+  if (!(request.pageCount && request.pageCount > 0)) {
+    throw Object.assign(new Error("Nutrient skipped: page count unknown, so the charge cannot be bounded"), { credentialRetryable: false });
+  }
   const plannedCredits = nutrientPlannedCredits(request);
   return nutrientPool.run(
     async (apiKey, slot, context) => {
