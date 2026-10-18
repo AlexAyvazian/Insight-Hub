@@ -133,18 +133,23 @@ export async function enqueueForReview(items: EnqueueInput[]): Promise<{ queued:
       unchanged += 1;
       continue;
     }
+    // The version read above is part of the condition, so a newer version written meanwhile is never overwritten.
+    const updated = await (await rcPool()).query(
+      `UPDATE opportunity_review_queue SET record = $2, content_hash = $3, profile_version = $4, priority = $5, status = 'queued',
+         hold_code = $6, reason = $7, response_deadline = $8, next_attempt_at = now(), decision = NULL, decided_at = NULL, updated_at = now()
+       WHERE id = $1 AND content_hash = $9`,
+      [row.id, JSON.stringify(item.record), item.contentHash, item.profileVersion, item.priority, item.holdCode, item.reason.slice(0, 500), item.record.responseDeadline ?? null, row.content_hash],
+    );
+    if ((updated.rowCount ?? 0) === 0) {
+      unchanged += 1;
+      continue;
+    }
     if (row.decision) {
       await (await rcPool()).query(
         `INSERT INTO opportunity_audit_log (id, opportunity_key, event, details) VALUES ($1,$2,'review_reopened',$3)`,
         [randomUUID(), item.opportunityKey, JSON.stringify({ previousHash: row.content_hash, newHash: item.contentHash, previousDecision: row.decision })],
       );
     }
-    await (await rcPool()).query(
-      `UPDATE opportunity_review_queue SET record = $2, content_hash = $3, profile_version = $4, priority = $5, status = 'queued',
-         hold_code = $6, reason = $7, response_deadline = $8, next_attempt_at = now(), decision = NULL, decided_at = NULL, updated_at = now()
-       WHERE id = $1`,
-      [row.id, JSON.stringify(item.record), item.contentHash, item.profileVersion, item.priority, item.holdCode, item.reason.slice(0, 500), item.record.responseDeadline ?? null],
-    );
     reopened += 1;
   }
   return { queued, reopened, unchanged };
