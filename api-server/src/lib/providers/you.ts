@@ -16,7 +16,7 @@ import type {
 } from "./types";
 import { FreeTierCredentialPool } from "./freeTierCredentialPool";
 import { getRelevanceProfile } from "../search/relevanceProfile";
-import { keywordQueries, profileNaturalQueries, spreadSample } from "../search/profileWebQueries";
+import { keywordQueries, profileNaturalQueries, queryRotationCursor, spreadSample } from "../search/profileWebQueries";
 
 const YOU_BASE = "https://api.ydc-index.io";
 
@@ -118,7 +118,7 @@ export class YouProvider implements DataSourceProvider {
     // Query text comes from the profile at call time; fetch() runs the first few, so spread them across bundles.
     return keywords
       ? keywordQueries(keywords, year).slice(0, 2)
-      : spreadSample(profileNaturalQueries(year), 4);
+      : spreadSample(profileNaturalQueries(year), 4, queryRotationCursor());
   }
 
   async getStatus(): Promise<ProviderStatus> {

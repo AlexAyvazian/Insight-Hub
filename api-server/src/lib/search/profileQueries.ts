@@ -10,6 +10,7 @@
  *   - broad "buyer lane" variants   <- the lead service term of each bundle
  *   - exclusion operators           <- bundle.exclusions + triggers of the hard post-award reject rule
  */
+import { queryRotationCursor, rotatingWindow } from "./profileWebQueries";
 import { getRelevanceProfile, type ProfileDiscoveryCode, type RelevanceProfile } from "./relevanceProfile";
 
 /** Search engines degrade on very long OR lists; this only bounds one code variant, never the vocabulary. */
@@ -110,8 +111,9 @@ export function profileProcurementExpression(profile: RelevanceProfile = getRele
 export function profileServiceQueryGroups(
   profile: RelevanceProfile = getRelevanceProfile(),
   termsPerGroup = 3,
+  cursor: number = queryRotationCursor(),
 ): string[] {
   return profile.searchBundles
     .filter((b) => b.serviceTerms.length > 0)
-    .map((b) => `(${b.serviceTerms.slice(0, termsPerGroup).join(" OR ")})`);
+    .map((b) => `(${rotatingWindow(b.serviceTerms, termsPerGroup, cursor).join(" OR ")})`);
 }

@@ -19,7 +19,7 @@ import {
   recordProviderSuccess,
 } from "../providerBudget";
 import { getRelevanceProfile } from "../search/relevanceProfile";
-import { keywordQueries, profileNaturalQueries, spreadSample } from "../search/profileWebQueries";
+import { keywordQueries, profileNaturalQueries, queryRotationCursor, spreadSample } from "../search/profileWebQueries";
 
 const LANGSEARCH_BASE = "https://api.langsearch.com/v1";
 const LANGSEARCH_REQUEST_TIMEOUT_MS = 30_000;
@@ -348,7 +348,7 @@ export class LangsearchProvider implements DataSourceProvider {
   private buildQueries(keywords?: string): string[] {
     const year = new Date().getFullYear();
     // Query text comes from the profile at call time; fetch() runs the first four, so spread them across bundles.
-    return keywords ? keywordQueries(keywords, year) : spreadSample(profileNaturalQueries(year), 4);
+    return keywords ? keywordQueries(keywords, year) : spreadSample(profileNaturalQueries(year), 4, queryRotationCursor());
   }
 
   async getStatus(): Promise<ProviderStatus> {

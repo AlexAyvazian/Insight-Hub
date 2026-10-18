@@ -11,6 +11,7 @@ import { buildBatchPrompt } from "../aiExtract";
 import { matchedServiceLines } from "../profileServiceLines";
 import {
   keywordQueries,
+  coverageGapCategories,
   profileBooleanQueries,
   profileExclusionOperators,
   profileNaturalQueries,
@@ -151,13 +152,15 @@ describe("service lines and web queries come from the profile", () => {
     assert.deepEqual(matchedServiceLines("megaaudiogram", { profile: custom }), []);
   });
 
-  it("builds one boolean and one natural query per service bundle from the bundles", () => {
+  it("builds one boolean and one natural query per service bundle (plus unbundled families) from the profile", () => {
     const profile = fixtureProfile();
     const bundles = profile.searchBundles.filter((b) => b.serviceTerms.length > 0);
-    const boolean = profileBooleanQueries(2030);
-    const natural = profileNaturalQueries(2030);
-    assert.equal(boolean.length, bundles.length);
-    assert.equal(natural.length, bundles.length);
+    // Cursor 0 starts every bundle's rotation at its first term; unbundled families follow the bundles.
+    const boolean = profileBooleanQueries(2030, undefined, 0);
+    const natural = profileNaturalQueries(2030, undefined, 0);
+    const gaps = coverageGapCategories(profile).length;
+    assert.equal(boolean.length, bundles.length + gaps);
+    assert.equal(natural.length, bundles.length + gaps);
     bundles.forEach((b, i) => {
       assert.ok(boolean[i]!.includes(b.serviceTerms[0]!));
       assert.ok(boolean[i]!.includes("2030"));

@@ -34,6 +34,8 @@ import {
   profileNaturalQueries,
   profileProcurementTerms,
   profileScopeOperand,
+  queryRotationCursor,
+  spreadSample,
 } from "./profileWebQueries";
 import type { NormalizedOpportunity } from "../providers/types";
 import type { ProviderName } from "../config/providerConfig";
@@ -60,6 +62,37 @@ type SearchCandidateProvider =
   | "websearch";
 
 /** Boolean-operator queries, one per profile search bundle (rendered at call time from the Neon profile). */
+/** Max discovery queries per run (unchanged), and the share AI-generated queries may take of it. */
+export const MAX_DISCOVERY_QUERIES = 10;
+export const MAX_GENERATED_QUERIES = 3;
+
+/**
+ * Bounded query plan: the user's keyword queries first, then at most MAX_GENERATED_QUERIES AI-generated queries,
+ * then profile/coverage queries spread across every bundle (rotating daily). AI queries can never crowd out the
+ * canonical profile coverage, and the per-run total is unchanged.
+ */
+export function planDiscoveryQueries(
+  keywordQueries: string[],
+  generated: string[],
+  profileQueries: string[],
+  cursor: number,
+): string[] {
+  const plan = Array.from(new Set([...keywordQueries, ...generated.slice(0, MAX_GENERATED_QUERIES)].map((q) => q.trim()).filter(Boolean)));
+  const remaining = Math.max(0, MAX_DISCOVERY_QUERIES - plan.length);
+  const profile = Array.from(new Set(profileQueries)).filter((q) => !plan.includes(q));
+  return [...plan, ...spreadSample(profile, remaining, cursor)].slice(0, MAX_DISCOVERY_QUERIES);
+}
+
+function discoveryQueryPlanCounts(plan: string[], keyword: string[], generated: string[]) {
+  const k = new Set(keyword);
+  const g = new Set(generated);
+  return {
+    keyword: plan.filter((q) => k.has(q)).length,
+    generated: plan.filter((q) => !k.has(q) && g.has(q)).length,
+    profile: plan.filter((q) => !k.has(q) && !g.has(q)).length,
+  };
+}
+
 function occumedWebQueries(year: number): string[] {
   return profileBooleanQueries(year);
 }
@@ -96,6 +129,8 @@ export interface WebIntelligenceResult {
     preFiltered: number;
     /** Candidates kept for enrichment because the snippet alone was review-band (not yet accepted). */
     reviewBandKept: number;
+    /** Discovery queries by origin for this run (keyword / AI-generated / profile coverage). */
+    queryPlan: { keyword: number; generated: number; profile: number };
     /** Why candidates were skipped before enrichment, by reason (no candidate disappears without a reason). */
     skippedByReason: Record<string, number>;
     jinaEnriched: number;
@@ -278,6 +313,7 @@ export async function webIntelligenceFetch(options: {
     dateFiltered: 0,
     preFiltered: 0,
     reviewBandKept: 0,
+    queryPlan: { keyword: 0, generated: 0, profile: 0 },
     skippedByReason: {} as Record<string, number>,
     jinaEnriched: 0,
     keenableEnriched: 0,
@@ -310,12 +346,14 @@ export async function webIntelligenceFetch(options: {
   const useSelfHostedSearch = options.useSelfHostedSearch === true;
   const useSelfHostedCrawler = options.useSelfHostedCrawler === true;
 
-  let baseQueries = [...occumedWebQueries(runtimeYear), ...exaQueries(runtimeYear)];
+  const profileQueries = [...occumedWebQueries(runtimeYear), ...exaQueries(runtimeYear)];
+  const keywordQueryList: string[] = [];
+  let generatedQueries: string[] = [];
   if (options.keywords?.trim()) {
     const kw = options.keywords.trim();
     const procurement = profileProcurementTerms(getRelevanceProfile(), 5).map((t) => (/\s/.test(t) ? `"${t}"` : t)).join(" OR ");
     const scope = profileScopeOperand();
-    baseQueries.unshift(
+    keywordQueryList.push(
       [`(${kw})`, procurement ? `(${procurement})` : "", scope, "government", String(runtimeYear), profileExclusionOperators()].filter(Boolean).join(" "),
       `active open government procurement opportunity for ${kw} ${profileLeadPhrases(undefined, 3).join(" ")} ${runtimeYear}`.replace(/\s+/g, " "),
     );
@@ -344,10 +382,9 @@ export async function webIntelligenceFetch(options: {
 
   if (useGemini) {
     try {
-      const generated = await geminiProvider.generateSearchQueries(
+      generatedQueries = await geminiProvider.generateSearchQueries(
         [options.keywords, feedbackHints].filter(Boolean).join(". ") || undefined,
       );
-      baseQueries.unshift(...generated);
     } catch (error: any) {
       if (error.message?.startsWith("GEMINI_QUOTA_EXCEEDED")) {
         stats.geminiRateLimited = true;
@@ -360,7 +397,8 @@ export async function webIntelligenceFetch(options: {
 
   const discoveryQueries = options.discoveryQueries?.length
     ? Array.from(new Set(options.discoveryQueries.map((query) => query.trim()).filter(Boolean)))
-    : Array.from(new Set(baseQueries)).slice(0, 10);
+    : planDiscoveryQueries(keywordQueryList, generatedQueries, profileQueries, queryRotationCursor());
+  stats.queryPlan = discoveryQueryPlanCounts(discoveryQueries, keywordQueryList, generatedQueries);
   const seen = new Set<string>();
   const candidates: Candidate[] = [];
 
