@@ -209,6 +209,10 @@ describe("free native document parsing with page citations", () => {
     const all = sections.map((s) => `${s.heading ?? ""}\n${s.text}`).join("\n");
     assert.match(all, /Statement of work/);
     assert.ok(sections.some((s) => s.text.includes("Proposals Due October 30 2026")), "the last line is stored as section text, not dropped");
+
+    // Consecutive headings (a table of contents) stay labels: none becomes body text that could read as a requirement.
+    const toc = buildSections([{ page: 1, text: "STATEMENT OF WORK\nDRUG TESTING SERVICE EXCLUSIONS\nNo exclusions apply to this contract.", needsOcr: false }]);
+    assert.ok(toc.every((s) => !/^STATEMENT OF WORK$/m.test(s.text)), "a heading followed by another heading is not promoted to text");
   });
 
   it("reads DOCX paragraphs and XLSX sheets", () => {

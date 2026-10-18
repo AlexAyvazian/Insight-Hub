@@ -55,13 +55,14 @@ interface Draft {
 }
 
 /**
- * Keeps a finished draft. A heading-like line with nothing under it (a closing "Proposals Due October 30" or
- * "Verification code 4721") is kept as its own text instead of being dropped with its empty section.
+ * Keeps a finished draft that has body text. At the end of the document only, a heading-like line with nothing under
+ * it (a closing "Proposals Due October 30" or "Verification code 4721") is kept as plain text instead of being
+ * dropped; a heading followed by another heading (a table of contents, a title over a subtitle) stays a label.
  */
-function flush(drafts: Draft[], draft: Draft | null): void {
+function flush(drafts: Draft[], draft: Draft | null, last = false): void {
   if (!draft) return;
   if (draft.lines.some((entry) => entry.text)) drafts.push(draft);
-  else if (draft.heading) drafts.push({ ...draft, lines: [{ text: draft.heading, page: draft.page }] });
+  else if (last && draft.heading) drafts.push({ heading: null, page: draft.page, lines: [{ text: draft.heading, page: draft.page }] });
 }
 
 export function buildSections(pages: ExtractedPage[]): DocumentSection[] {
@@ -84,7 +85,7 @@ export function buildSections(pages: ExtractedPage[]): DocumentSection[] {
       current.lines.push({ text: line, page: page.page });
     }
   }
-  flush(drafts, current);
+  flush(drafts, current, true);
 
   const sections: DocumentSection[] = [];
   for (const draft of drafts) {
