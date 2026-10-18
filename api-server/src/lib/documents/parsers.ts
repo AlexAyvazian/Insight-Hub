@@ -109,16 +109,25 @@ export function parseDocx(bytes: Uint8Array): ParsedDocument {
   if (!documentXml) return finalise("docx", [], "docx-xml", ["word/document.xml missing"]);
   const xml = strFromU8(documentXml);
   const pages: string[][] = [[]];
-  // Walk paragraphs; an explicit page break or a rendered page break starts a new page.
+  // Walk paragraphs in order. Only explicit page breaks start a new page: Word also writes a
+  // lastRenderedPageBreak marker for the same boundary, so counting both would double-count pages. Text before a
+  // break stays on the current page and text after it starts the next one.
   for (const paragraph of xml.split(/<\/w:p>/)) {
-    const breaks = (paragraph.match(/<w:br\b[^>]*w:type="page"[^>]*\/?>|<w:lastRenderedPageBreak\s*\/>/g) ?? []).length;
-    for (let i = 0; i < breaks; i += 1) pages.push([]);
-    const text = decodeXmlEntities(
-      [...paragraph.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>|<w:tab\s*\/>|<w:br\b[^>]*\/>/g)]
-        .map((match) => (match[1] !== undefined ? match[1] : match[0].startsWith("<w:tab") ? "\t" : "\n"))
-        .join(""),
-    ).trim();
-    if (text) pages[pages.length - 1]!.push(text);
+    let buffer = "";
+    const flush = () => {
+      const text = decodeXmlEntities(buffer).trim();
+      if (text) pages[pages.length - 1]!.push(text);
+      buffer = "";
+    };
+    for (const match of paragraph.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>|<w:tab\s*\/>|<w:br\b[^>]*\/?>/g)) {
+      if (match[1] !== undefined) buffer += match[1];
+      else if (match[0].startsWith("<w:tab")) buffer += "\t";
+      else if (/w:type="page"/.test(match[0])) {
+        flush();
+        pages.push([]);
+      } else buffer += "\n";
+    }
+    flush();
   }
   const extra = Object.entries(files)
     .filter(([name]) => name !== "word/document.xml")

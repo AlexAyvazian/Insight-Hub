@@ -32,12 +32,41 @@ function ipv4Private(ip) {
     a >= 224;
 }
 
+function expandIpv6(address) {
+  let value = address.toLowerCase();
+  const zone = value.indexOf('%');
+  if (zone >= 0) value = value.slice(0, zone);
+  const v4 = value.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4) {
+    const [a, b, c, d] = v4[2].split('.').map(Number);
+    value = `${v4[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const halves = value.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  const groups = [...head, ...Array(Math.max(0, fill)).fill('0'), ...tail];
+  if (groups.length !== 8) return null;
+  const parsed = groups.map((group) => Number.parseInt(group || '0', 16));
+  return parsed.some((n) => !Number.isFinite(n) || n < 0 || n > 0xffff) ? null : parsed;
+}
+
 function isPrivateAddress(ip) {
   if (net.isIPv4(ip)) return ipv4Private(ip);
-  const lower = ip.toLowerCase();
-  const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return ipv4Private(mapped[1]);
-  return lower === '::' || lower === '::1' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || /^ff/.test(lower) || lower.startsWith('64:ff9b:') || lower.startsWith('2002:');
+  if (!net.isIPv6(ip)) return true;
+  const g = expandIpv6(ip);
+  if (!g) return true;
+  if (g.every((x) => x === 0)) return true; // ::
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // ::1
+  // IPv4-mapped (any spelling), IPv4-compatible and NAT64 addresses: judge the embedded IPv4 address.
+  const embedded = `${g[6] >> 8}.${g[6] & 0xff}.${g[7] >> 8}.${g[7] & 0xff}`;
+  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && (g[5] === 0xffff || g[5] === 0)) return ipv4Private(embedded);
+  if (g[0] === 0x64 && g[1] === 0xff9b) return ipv4Private(embedded);
+  if ((g[0] & 0xfe00) === 0xfc00 || (g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0 || (g[0] & 0xff00) === 0xff00) return true;
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true;
+  if (g[0] === 0x2002) return ipv4Private(`${g[1] >> 8}.${g[1] & 0xff}.${g[2] >> 8}.${g[2] & 0xff}`); // 6to4
+  return false;
 }
 
 // Validated addresses per host. Connections are made to these exact addresses (see pinnedFetch), so a hostname that

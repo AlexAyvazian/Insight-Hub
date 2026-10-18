@@ -369,12 +369,13 @@ export class FreeTierCredentialPool {
     return Promise.all(this.slots.map(({ envKey }) => ledger.state(this.accounts!.policyFor(envKey))));
   }
 
+  /** Capacity check that also reserves the planned units; call the returned release() once usage is recorded. */
   private async accountAllows(
     candidate: { slot: string; value: string },
     plannedUnits: number,
     skipped: string[],
-  ): Promise<boolean> {
-    if (!this.accounts) return true;
+  ): Promise<(() => void) | null> {
+    if (!this.accounts) return () => undefined;
     const ledger = this.accounts.ledger ?? sharedAccountLedger();
     const policy = this.accounts.policyFor(candidate.slot);
     let decision = await ledger.canSpend(policy, plannedUnits, Boolean(this.accounts.probe));
@@ -391,10 +392,52 @@ export class FreeTierCredentialPool {
       }
       decision = await ledger.canSpend(policy, plannedUnits, false);
     }
-    if (!decision.ok) {
-      skipped.push(`${candidate.slot}: ${decision.reason}${decision.retryAt ? ` (retry after ${decision.retryAt})` : ""}`);
+    if (decision.ok) {
+      const reservation = await ledger.reserve(policy, plannedUnits, false);
+      if (reservation.ok) return reservation.release;
+      decision = reservation;
     }
-    return decision.ok;
+    skipped.push(`${candidate.slot}: ${decision.reason}${decision.retryAt ? ` (retry after ${decision.retryAt})` : ""}`);
+    return null;
+  }
+
+  /**
+   * Runs on one named account without selection or a capacity check: for collecting work that account already
+   * accepted (and was charged for). Usage the operation reports is still recorded.
+   */
+  async runOnSlot<T>(
+    slot: string,
+    operation: (apiKey: string, slot: string, context: CredentialRunContext) => Promise<T>,
+  ): Promise<T> {
+    const credential = (await this.credentials()).find((entry) => entry.slot === slot);
+    if (!credential) throw new Error(`${this.id} credential ${slot} is not configured`);
+    let reportedUnits = 0;
+    let reportedQuality: "good" | "poor" | undefined;
+    const context: CredentialRunContext = {
+      plannedUnits: 0,
+      reportUsage(units, quality) {
+        reportedUnits += Math.max(0, units);
+        reportedQuality = quality ?? reportedQuality;
+      },
+      reportSnapshot() {
+        // Snapshots come from the normal probe path.
+      },
+    };
+    const ledger = this.accounts ? (this.accounts.ledger ?? sharedAccountLedger()) : null;
+    const policy = this.accounts?.policyFor(slot);
+    try {
+      const value = await operation(credential.value, slot, context);
+      if (ledger && policy && reportedUnits > 0) await ledger.recordUsage(policy, reportedUnits, "success", reportedQuality);
+      return value;
+    } catch (error) {
+      if (ledger && policy) {
+        if (reportedUnits > 0) await ledger.recordUsage(policy, reportedUnits, "failure", reportedQuality).catch(() => undefined);
+        if ((error as { accountHealthy?: boolean } | null)?.accountHealthy !== true) {
+          await ledger.recordFailure(policy, error).catch(() => undefined);
+        }
+      }
+      throw error;
+    }
   }
 
   async run<T>(
@@ -436,7 +479,8 @@ export class FreeTierCredentialPool {
     const errors: string[] = [];
     const plannedUnits = runOptions.plannedUnits ?? this.accounts?.unitsPerCall ?? 1;
     for (const candidate of candidates) {
-      if (!(await this.accountAllows(candidate, plannedUnits, errors))) continue;
+      const release = await this.accountAllows(candidate, plannedUnits, errors);
+      if (!release) continue;
       const state = slotState(this.id, candidate.slot);
       state.attempts += 1;
       state.lastAttemptAt = new Date().toISOString();
@@ -461,6 +505,7 @@ export class FreeTierCredentialPool {
           await ledger.recordUsage(policy, reportedUnits ?? plannedUnits, "success", reportedQuality);
           if (reportedSnapshot) await ledger.recordSnapshot(policy, reportedSnapshot);
         }
+        release();
         state.successes += 1;
         state.lastOutcome = "success";
         state.lastSuccessAt = new Date().toISOString();
@@ -494,6 +539,7 @@ export class FreeTierCredentialPool {
             await ledger.recordFailure(policy, error).catch(() => undefined);
           }
         }
+        release();
         if (!isCredentialRetryable(error)) throw error;
         const explicitReset = explicitCooldownUntilMs(error);
         const cooldownUntil = explicitReset ?? (Date.now() + cooldownMs(error));

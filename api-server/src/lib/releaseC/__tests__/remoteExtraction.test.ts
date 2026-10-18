@@ -59,7 +59,7 @@ describe("remote extraction accounting", () => {
 
   it("reserves Nutrient credits for the whole uploaded document", () => {
     assert.equal(nutrientPlannedCredits({ pageCount: 100, pages: [7], scanned: true }), 150);
-    assert.equal(nutrientPlannedCredits({ pageCount: null, pages: null, scanned: false }), 1);
+    assert.equal(nutrientPlannedCredits({ pageCount: null, pages: null, scanned: false }), 20, "unknown page count plans the conservative cap");
   });
 
   it("keeps valid attachments when one URL has a malformed percent escape", () => {

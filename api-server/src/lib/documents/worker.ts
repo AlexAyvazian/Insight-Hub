@@ -61,9 +61,11 @@ async function samKey(): Promise<string | null> {
   return (await resolveCredential("samApiKey", "SAM_GOV_API_KEY")) ?? process.env.SAM_GOV_API_KEY_2 ?? null;
 }
 
-function withSamKey(url: string, key: string): string {
+export function withSamKey(url: string, key: string): string {
   const parsed = new URL(url);
-  if (!parsed.searchParams.has("api_key")) parsed.searchParams.set("api_key", key);
+  // resourceLinks often carry api_key=null; replace a missing, empty or "null" key.
+  const existing = parsed.searchParams.get("api_key");
+  if (!existing || existing.trim().toLowerCase() === "null") parsed.searchParams.set("api_key", key);
   return parsed.toString();
 }
 
@@ -163,6 +165,12 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
   const documentId = version.documentId;
 
   const cached = await findExtractedByHash(sha);
+  if (cached && cached.id === documentId) {
+    // Content reverted to a version already extracted: its row and sections were reactivated as they were.
+    await finishJob(job.jobId, "done", null);
+    await reopen(job.opportunityKey, "document version restored");
+    return { jobId: job.jobId, status: "done", detail: "restored earlier extracted version", changed: true };
+  }
   if (cached && cached.id !== documentId) {
     const copied = await copySections(cached.id, documentId, job.opportunityKey);
     await updateDocument(documentId, {
@@ -197,13 +205,15 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
         bytes: fetched.bytes,
         fileName: fileNameFor(fetched.finalUrl, fetched.contentType),
         pages: parsed.format === "pdf" && parsed.pages.length ? needOcr : null,
-        pageCount: parsed.pageCount || null,
+        // Only PDFs report a real page count; other formats carry a one-page placeholder.
+        pageCount: parsed.format === "pdf" ? parsed.pageCount || null : null,
         scanned: parsed.format !== "legacy_office",
       });
       provider = remote.provider;
       account = remote.account;
       const byPage = new Map(remote.pages.map((page) => [page.page, page]));
-      pages = parsed.pages.length
+      // Non-PDF formats only have a placeholder page natively, so every remote page is kept.
+      pages = parsed.format === "pdf" && parsed.pages.length
         ? parsed.pages.map((page) => (page.needsOcr && byPage.get(page.page)?.text ? { ...byPage.get(page.page)!, needsOcr: false } : page))
         : remote.pages;
     } catch (error) {

@@ -222,6 +222,8 @@ export async function replaceSections(documentId: string, opportunityKey: string
 }
 
 export async function copySections(fromDocumentId: string, toDocumentId: string, opportunityKey: string): Promise<number> {
+  // Replaces, never appends, so a reactivated row does not end up with duplicate sections.
+  await (await rcPool()).query(`DELETE FROM opportunity_document_sections WHERE document_id = $1`, [toDocumentId]);
   const result = await (await rcPool()).query(
     `INSERT INTO opportunity_document_sections (id, document_id, opportunity_key, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256)
      SELECT gen_random_uuid()::text, $2, $3, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256

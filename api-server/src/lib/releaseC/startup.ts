@@ -35,15 +35,22 @@ function startWorkerChild(log: Log, attempt = 0): void {
     return;
   }
   const heapMb = Math.max(64, Math.min(256, Number(process.env.DOCUMENT_WORKER_HEAP_MB ?? 128)));
-  child = spawn(process.execPath, [`--max-old-space-size=${heapMb}`, entry], { env: process.env, stdio: ["ignore", "inherit", "inherit"] });
-  log.info({ event: "document_worker_started", pid: child.pid, heapMb }, "Document extraction worker started");
-  child.once("exit", (code, signal) => {
-    child = null;
-    if (stopped) return;
+  const spawned = spawn(process.execPath, [`--max-old-space-size=${heapMb}`, entry], { env: process.env, stdio: ["ignore", "inherit", "inherit"] });
+  child = spawned;
+  log.info({ event: "document_worker_started", pid: spawned.pid, heapMb }, "Document extraction worker started");
+  // A spawn failure emits "error" (possibly followed by "exit"); restart is scheduled once either way, and the
+  // error never reaches the web process as an unhandled event.
+  let restartScheduled = false;
+  const scheduleRestart = (details: Record<string, unknown>) => {
+    if (child === spawned) child = null;
+    if (stopped || restartScheduled) return;
+    restartScheduled = true;
     const delay = Math.min(30 * 60_000, 30_000 * 2 ** Math.min(attempt, 6));
-    log.warn({ event: "document_worker_exited", code, signal, restartInMs: delay }, "Document extraction worker exited");
+    log.warn({ event: "document_worker_exited", ...details, restartInMs: delay }, "Document extraction worker exited");
     setTimeout(() => startWorkerChild(log, attempt + 1), delay).unref();
-  });
+  };
+  spawned.on("error", (error) => scheduleRestart({ error: error.message }));
+  spawned.once("exit", (code, signal) => scheduleRestart({ code, signal }));
 }
 
 export async function startReleaseC(log: Log): Promise<void> {

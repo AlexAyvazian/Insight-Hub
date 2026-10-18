@@ -95,6 +95,6 @@ Release C is staged behind flags; each can be turned off in the Render dashboard
 | `DOCUMENT_EXTRACTION_WORKER_MODE` | `off` | No child extraction worker (`child` spawns `dist/workers/documentExtractionWorker.mjs`). |
 | `STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT` | unset | Unset means adaptive (no fixed cap). A positive number restores a hard ceiling. |
 
-Release C tables are additive (`lib/db/migrations/rfp/release-c/up.sql`, created idempotently at startup). They do not alter existing tables or opportunity rows. `lib/db/migrations/rfp/release-c/down.sql` drops only the Release C tables; run it only after the flags are off and only if the data in those tables is no longer needed.
+Release C tables are additive (`lib/db/migrations/rfp/release-c/up.sql`, created idempotently at startup). They do not alter existing tables or opportunity rows. `lib/db/migrations/rfp/release-c/down.sql` drops only the Release C tables; run it only after the flags are off, only if the data in those tables is no longer needed, and only after a revision that no longer calls `ensureReleaseCSchema()` at startup is deployed. Otherwise the next restart of a Release C revision recreates the tables immediately.
 
 The benchmark gate (`pnpm --filter @workspace/api-server run test:release-c`) compares against `api-server/src/lib/releaseC/benchmark/baseline.json`. Rebuild the dataset with `node --import tsx src/lib/releaseC/benchmark/build.ts <label-dir>`; see `docs/quality/release-c-benchmark.md`.

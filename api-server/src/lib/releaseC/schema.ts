@@ -266,7 +266,7 @@ export function ensureReleaseCSchema(run?: Runner): Promise<void> {
   if (run) return applyReleaseCSchema(run);
   if (!ensured) {
     ensured = (async () => {
-      // One client for the whole sequence: a session advisory lock must be released on the connection that took it.
+      // One client for the whole sequence: the transaction and its advisory lock must stay on one connection.
       const client = await (await rcPool()).connect();
       try {
         await applyReleaseCSchema((statement) => client.query(statement));
@@ -281,12 +281,17 @@ export function ensureReleaseCSchema(run?: Runner): Promise<void> {
   return ensured;
 }
 
+// One transaction with a transaction-scoped lock: the production RFP endpoint is a transaction-mode pooler, where a
+// session lock and its unlock could land on different backends and leave the lock held.
 async function applyReleaseCSchema(run: Runner): Promise<void> {
-  await run(`SELECT pg_advisory_lock(hashtextextended('insight-hub-release-c-schema', 0))`);
+  await run("BEGIN");
   try {
+    await run(`SELECT pg_advisory_xact_lock(hashtextextended('insight-hub-release-c-schema', 0))`);
     for (const statement of RELEASE_C_DDL) await run(statement);
-  } finally {
-    await run(`SELECT pg_advisory_unlock(hashtextextended('insight-hub-release-c-schema', 0))`);
+    await run("COMMIT");
+  } catch (error) {
+    await Promise.resolve(run("ROLLBACK")).catch(() => undefined);
+    throw error;
   }
 }
 

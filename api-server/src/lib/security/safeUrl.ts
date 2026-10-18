@@ -265,14 +265,23 @@ const pinnedFetch: typeof fetch = (input, init) =>
         signal: init?.signal ?? undefined,
       },
       (incoming) => {
-        const headers = new Headers();
-        for (const [key, value] of Object.entries(incoming.headers)) {
-          if (Array.isArray(value)) value.forEach((item) => headers.append(key, item));
-          else if (value != null) headers.set(key, String(value));
+        try {
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(incoming.headers)) {
+            if (Array.isArray(value)) value.forEach((item) => headers.append(key, item));
+            else if (value != null) headers.set(key, String(value));
+          }
+          const raw = incoming.statusCode ?? 0;
+          const status = raw < 200 || raw > 599 ? 502 : raw;
+          // The Response constructor throws when a null-body status carries a body.
+          const nullBody = status === 204 || status === 205 || status === 304;
+          if (nullBody) incoming.resume();
+          const body = nullBody ? null : (Readable.toWeb(incoming) as ReadableStream<Uint8Array>);
+          resolve(new Response(body, { status, headers }));
+        } catch (error) {
+          incoming.destroy();
+          reject(error);
         }
-        const status = incoming.statusCode ?? 0;
-        const body = status === 204 || status === 304 ? null : (Readable.toWeb(incoming) as ReadableStream<Uint8Array>);
-        resolve(new Response(body, { status: status < 200 || status > 599 ? 502 : status, headers }));
       },
     );
     request.on("error", reject);

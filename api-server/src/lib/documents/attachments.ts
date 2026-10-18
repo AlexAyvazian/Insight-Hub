@@ -122,8 +122,10 @@ function isSamViewPage(url: string): boolean {
 /** Hosts that need the SAM.gov API key appended (official API endpoints only). */
 export function needsSamApiKey(url: string): boolean {
   try {
-    const host = new URL(url).hostname.toLowerCase();
-    return host === "api.sam.gov";
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    // SAM.gov API endpoints, including resource downloads served from sam.gov/api/...
+    return host === "api.sam.gov" || ((host === "sam.gov" || host.endsWith(".sam.gov")) && parsed.pathname.toLowerCase().startsWith("/api/"));
   } catch {
     return false;
   }

@@ -11,7 +11,7 @@
  *
  * Neither provider is ever asked to process more pages than the remaining free capacity allows.
  */
-import { FreeTierCredentialPool } from "../providers/freeTierCredentialPool";
+import { FreeTierCredentialPool, type CredentialRunContext } from "../providers/freeTierCredentialPool";
 import { ProviderQuotaError, resetFromHeaders, type AccountPolicy, type QuotaSnapshot } from "../providers/accountLedger";
 import { createHash } from "node:crypto";
 import { rcPool } from "../releaseC/db";
@@ -242,99 +242,112 @@ async function deletePendingWhisperJob(jobKey: string): Promise<void> {
   }
 }
 
-export async function extractWithLlmWhisperer(request: RemoteExtractionRequest): Promise<RemoteExtraction> {
-  const plannedPages = request.pages?.length ?? request.pageCount ?? 1;
-  const jobKey = whisperJobKey(request);
-  return whisperPool.run(
-    async (apiKey, slot, context) => {
-      let pending = await loadPendingWhisperJob(jobKey);
-      if (pending && Date.now() - pending.submittedAt > PENDING_WHISPER_TTL_MS) {
-        await deletePendingWhisperJob(jobKey);
-        pending = undefined;
-      }
-      if (pending && pending.slot !== slot) {
-        throw new AcceptedJobError(`LLMWhisperer job already accepted on ${pending.slot}; waiting to resume it`);
-      }
-      let hash = pending?.hash;
-      if (!hash) {
-        const url = new URL(`${WHISPER_BASE}/whisper`);
-        url.searchParams.set("mode", request.scanned ? "high_quality" : "native_text");
-        url.searchParams.set("output_mode", "layout_preserving");
-        url.searchParams.set("page_separator", PAGE_SEPARATOR);
-        url.searchParams.set("file_name", request.fileName.slice(0, 120));
-        const spec = pageSpec(request.pages);
-        if (spec) url.searchParams.set("pages_to_extract", spec);
-        const submit = await fetch(url, {
-          method: "POST",
-          headers: { "unstract-key": apiKey, "Content-Type": "application/octet-stream" },
-          body: request.bytes,
-          signal: request.signal ?? AbortSignal.timeout(60_000),
-        });
-        const submitBody = await submit.text();
-        if (submit.status !== 202 && !submit.ok) quotaFromResponse("LLMWhisperer", submit, submitBody);
-        hash = (JSON.parse(submitBody) as { whisper_hash?: string }).whisper_hash;
-        if (!hash) throw new Error("LLMWhisperer returned no whisper_hash");
-        await savePendingWhisperJob(jobKey, { slot, hash, submittedAt: Date.now() }, plannedPages);
-        // The accepted job is charged whether or not the result is retrieved, so it is counted now.
-        context.reportUsage(plannedPages);
-      }
+/**
+ * Pages a request may be charged for. When the real page count is unknown (legacy Office files, images), the
+ * submission is capped with pages_to_extract, so a long document can never be charged beyond the planned pages.
+ */
+export const UNKNOWN_PAGE_COUNT_CAP = 20;
 
-      try {
-        const deadline = Date.now() + 5 * 60_000;
-        let delay = 2_000;
-        while (true) {
-          if (Date.now() > deadline) throw new Error("LLMWhisperer job timed out");
-          await sleep(delay, request.signal);
-          delay = Math.min(delay * 1.5, 15_000);
-          const status = await fetch(`${WHISPER_BASE}/whisper-status?whisper_hash=${encodeURIComponent(hash)}`, {
-            headers: { "unstract-key": apiKey },
-            signal: request.signal ?? AbortSignal.timeout(20_000),
-          });
-          const statusBody = await status.text();
-          if (!status.ok) quotaFromResponse("LLMWhisperer", status, statusBody);
-          const state = (JSON.parse(statusBody) as { status?: string; message?: string }).status;
-          if (state === "processed") break;
-          if (state === "error") {
-            await deletePendingWhisperJob(jobKey);
-            throw new Error(`LLMWhisperer processing error: ${statusBody.slice(0, 200)}`);
-          }
-        }
-        const retrieve = await fetch(`${WHISPER_BASE}/whisper-retrieve?whisper_hash=${encodeURIComponent(hash)}&text_only=true`, {
+export function whisperPlannedPages(request: Pick<RemoteExtractionRequest, "pages" | "pageCount">): { pages: number; spec: string | null } {
+  if (request.pages?.length) return { pages: new Set(request.pages).size, spec: pageSpec(request.pages) };
+  if (request.pageCount && request.pageCount > 0) return { pages: request.pageCount, spec: null };
+  return { pages: UNKNOWN_PAGE_COUNT_CAP, spec: `1-${UNKNOWN_PAGE_COUNT_CAP}` };
+}
+
+export async function extractWithLlmWhisperer(request: RemoteExtractionRequest): Promise<RemoteExtraction> {
+  const { pages: plannedPages, spec } = whisperPlannedPages(request);
+  const jobKey = whisperJobKey(request);
+  let pending = await loadPendingWhisperJob(jobKey);
+  if (pending && Date.now() - pending.submittedAt > PENDING_WHISPER_TTL_MS) {
+    // Past LLMWhisperer's retention the accepted result is gone; the document is extracted again.
+    await deletePendingWhisperJob(jobKey);
+    pending = undefined;
+  }
+
+  const operation = async (apiKey: string, slot: string, context: CredentialRunContext): Promise<RemoteExtraction> => {
+    let hash = pending?.hash;
+    if (!hash) {
+      const url = new URL(`${WHISPER_BASE}/whisper`);
+      url.searchParams.set("mode", request.scanned ? "high_quality" : "native_text");
+      url.searchParams.set("output_mode", "layout_preserving");
+      url.searchParams.set("page_separator", PAGE_SEPARATOR);
+      url.searchParams.set("file_name", request.fileName.slice(0, 120));
+      if (spec) url.searchParams.set("pages_to_extract", spec);
+      const submit = await fetch(url, {
+        method: "POST",
+        headers: { "unstract-key": apiKey, "Content-Type": "application/octet-stream" },
+        body: request.bytes,
+        signal: request.signal ?? AbortSignal.timeout(60_000),
+      });
+      const submitBody = await submit.text();
+      if (submit.status !== 202 && !submit.ok) quotaFromResponse("LLMWhisperer", submit, submitBody);
+      hash = (JSON.parse(submitBody) as { whisper_hash?: string }).whisper_hash;
+      if (!hash) throw new Error("LLMWhisperer returned no whisper_hash");
+      await savePendingWhisperJob(jobKey, { slot, hash, submittedAt: Date.now() }, plannedPages);
+      // The accepted job is charged whether or not the result is retrieved, so it is counted now.
+      context.reportUsage(plannedPages);
+    }
+    try {
+      const deadline = Date.now() + 5 * 60_000;
+      let delay = 2_000;
+      while (true) {
+        if (Date.now() > deadline) throw new Error("LLMWhisperer job timed out");
+        await sleep(delay, request.signal);
+        delay = Math.min(delay * 1.5, 15_000);
+        const status = await fetch(`${WHISPER_BASE}/whisper-status?whisper_hash=${encodeURIComponent(hash)}`, {
           headers: { "unstract-key": apiKey },
-          signal: request.signal ?? AbortSignal.timeout(30_000),
+          signal: request.signal ?? AbortSignal.timeout(20_000),
         });
-        const text = await retrieve.text();
-        if (!retrieve.ok) quotaFromResponse("LLMWhisperer", retrieve, text);
-        await deletePendingWhisperJob(jobKey);
-        let resultText = text;
-        try {
-          const parsed = JSON.parse(text) as { result_text?: string };
-          if (typeof parsed.result_text === "string") resultText = parsed.result_text;
-        } catch {
-          // text_only=true returns plain text.
+        const statusBody = await status.text();
+        if (!status.ok) quotaFromResponse("LLMWhisperer", status, statusBody);
+        const state = (JSON.parse(statusBody) as { status?: string; message?: string }).status;
+        if (state === "processed") break;
+        if (state === "error") {
+          await deletePendingWhisperJob(jobKey);
+          throw new Error(`LLMWhisperer processing error: ${statusBody.slice(0, 200)}`);
         }
-        const chunks = resultText.split(PAGE_SEPARATOR);
-        const pageNumbers = request.pages?.length ? [...new Set(request.pages)].sort((a, b) => a - b) : chunks.map((_c, i) => i + 1);
-        const pages = chunks
-          .map((chunk, index) => ({ page: pageNumbers[index] ?? index + 1, text: chunk.trim(), needsOcr: chunk.trim().length < 10 }))
-          .filter((page) => page.text.length > 0 || page.needsOcr);
-        const quality = pages.some((page) => page.text.length > 40) ? "good" : "poor";
-        // Usage was counted at submission (only on a fresh submit); record any extra pages beyond the plan.
-        const used = Math.max(1, pages.length);
-        context.reportUsage(pending ? 0 : Math.max(0, used - plannedPages), quality);
-        return { provider: "llmwhisperer" as const, account: slot, pages, unitsUsed: used };
-      } catch (error) {
-        // After acceptance, never let the pool or the Nutrient fallback resubmit the same document.
-        throw new AcceptedJobError(`LLMWhisperer job ${hash.slice(0, 12)} not completed: ${error instanceof Error ? error.message : String(error)}`);
       }
-    },
-    { plannedUnits: plannedPages },
-  );
+      const retrieve = await fetch(`${WHISPER_BASE}/whisper-retrieve?whisper_hash=${encodeURIComponent(hash)}&text_only=true`, {
+        headers: { "unstract-key": apiKey },
+        signal: request.signal ?? AbortSignal.timeout(30_000),
+      });
+      const text = await retrieve.text();
+      if (!retrieve.ok) quotaFromResponse("LLMWhisperer", retrieve, text);
+      await deletePendingWhisperJob(jobKey);
+      let resultText = text;
+      try {
+        const parsed = JSON.parse(text) as { result_text?: string };
+        if (typeof parsed.result_text === "string") resultText = parsed.result_text;
+      } catch {
+        // text_only=true returns plain text.
+      }
+      const chunks = resultText.split(PAGE_SEPARATOR);
+      const pageNumbers = request.pages?.length ? [...new Set(request.pages)].sort((a, b) => a - b) : chunks.map((_c, i) => i + 1);
+      const pages = chunks
+        .map((chunk, index) => ({ page: pageNumbers[index] ?? index + 1, text: chunk.trim(), needsOcr: chunk.trim().length < 10 }))
+        .filter((page) => page.text.length > 0 || page.needsOcr);
+      const quality = pages.some((page) => page.text.length > 40) ? "good" : "poor";
+      // Usage was counted at submission (only on a fresh submit); record any extra pages beyond the plan.
+      const used = Math.max(1, pages.length);
+      context.reportUsage(pending ? 0 : Math.max(0, used - plannedPages), quality);
+      return { provider: "llmwhisperer" as const, account: slot, pages, unitsUsed: used };
+    } catch (error) {
+      // After acceptance, never let the pool or the Nutrient fallback resubmit the same document.
+      throw new AcceptedJobError(`LLMWhisperer job ${hash.slice(0, 12)} not completed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // An accepted job is collected on the account that accepted it, with no new reservation.
+  if (pending) return whisperPool.runOnSlot(pending.slot, operation);
+  return whisperPool.run(operation, { plannedUnits: plannedPages });
 }
 
 /** The whole document is uploaded (no page selection), so every page is charged, not only the OCR subset. */
 export function nutrientPlannedCredits(request: Pick<RemoteExtractionRequest, "pageCount" | "pages" | "scanned">): number {
-  const pages = Math.max(request.pageCount ?? 0, request.pages?.length ?? 0, 1);
+  // Unknown page count: plan the conservative cap (Nutrient has no page limit option, so the worker only sends
+  // such documents when this much capacity is free).
+  const known = Math.max(request.pageCount ?? 0, request.pages?.length ?? 0);
+  const pages = known > 0 ? known : UNKNOWN_PAGE_COUNT_CAP;
   return pages * (request.scanned ? 1.5 : 1);
 }
 

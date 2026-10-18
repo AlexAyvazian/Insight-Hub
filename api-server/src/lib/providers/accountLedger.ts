@@ -90,10 +90,15 @@ export interface SpendDecision {
   remaining: number | null;
 }
 
-export interface LedgerStore {
+export interface LedgerStoreIO {
   load(id: string): Promise<AccountState | null>;
   save(state: AccountState): Promise<void>;
+}
+
+export interface LedgerStore extends LedgerStoreIO {
   list(pool?: string): Promise<AccountState[]>;
+  /** Runs one read-modify-write for an account so concurrent processes cannot lose each other's updates. */
+  atomic?<T>(id: string, work: (io: LedgerStoreIO) => Promise<T>): Promise<T>;
 }
 
 const dayKey = (now: Date) => now.toISOString().slice(0, 10);
@@ -275,6 +280,32 @@ function fromRow(row: Row): AccountState {
   };
 }
 
+const UPSERT_ACCOUNT_SQL = `INSERT INTO provider_account_usage (id, pool, slot, provider, model_family, allowance_kind, unit, quota_limit,
+     quota_remaining, used_today, used_month, used_total, requests_total, day_key, month_key, reset_at, reset_source,
+     exhausted, exhausted_reason, needs_confirmation, cooldown_until, last_outcome, successes, failures,
+     quality_good, quality_poor, last_confirmed_at, updated_at)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,now())
+   ON CONFLICT (id) DO UPDATE SET provider=EXCLUDED.provider, model_family=EXCLUDED.model_family,
+     allowance_kind=EXCLUDED.allowance_kind, unit=EXCLUDED.unit, quota_limit=EXCLUDED.quota_limit,
+     quota_remaining=EXCLUDED.quota_remaining, used_today=EXCLUDED.used_today, used_month=EXCLUDED.used_month,
+     used_total=EXCLUDED.used_total, requests_total=EXCLUDED.requests_total, day_key=EXCLUDED.day_key,
+     month_key=EXCLUDED.month_key, reset_at=EXCLUDED.reset_at, reset_source=EXCLUDED.reset_source,
+     exhausted=EXCLUDED.exhausted, exhausted_reason=EXCLUDED.exhausted_reason,
+     needs_confirmation=EXCLUDED.needs_confirmation, cooldown_until=EXCLUDED.cooldown_until,
+     last_outcome=EXCLUDED.last_outcome, successes=EXCLUDED.successes, failures=EXCLUDED.failures,
+     quality_good=EXCLUDED.quality_good, quality_poor=EXCLUDED.quality_poor,
+     last_confirmed_at=EXCLUDED.last_confirmed_at, updated_at=now()`;
+
+function upsertParams(state: AccountState): unknown[] {
+  return [
+    state.id, state.pool, state.slot, state.provider, state.modelFamily, state.allowanceKind, state.unit,
+    state.quotaLimit, state.quotaRemaining, state.usedToday, state.usedMonth, state.usedTotal, state.requestsTotal,
+    state.dayKey, state.monthKey, state.resetAt, state.resetSource, state.exhausted, state.exhaustedReason,
+    state.needsConfirmation, state.cooldownUntil, state.lastOutcome, state.successes, state.failures,
+    state.qualityGood, state.qualityPoor, state.lastConfirmedAt,
+  ];
+}
+
 export class PostgresLedgerStore implements LedgerStore {
   private readonly fallback = new MemoryLedgerStore();
 
@@ -292,32 +323,47 @@ export class PostgresLedgerStore implements LedgerStore {
     await this.fallback.save(state);
     try {
       await ensureReleaseCSchema();
-      await (await rcPool()).query(
-        `INSERT INTO provider_account_usage (id, pool, slot, provider, model_family, allowance_kind, unit, quota_limit,
-           quota_remaining, used_today, used_month, used_total, requests_total, day_key, month_key, reset_at, reset_source,
-           exhausted, exhausted_reason, needs_confirmation, cooldown_until, last_outcome, successes, failures,
-           quality_good, quality_poor, last_confirmed_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,now())
-         ON CONFLICT (id) DO UPDATE SET provider=EXCLUDED.provider, model_family=EXCLUDED.model_family,
-           allowance_kind=EXCLUDED.allowance_kind, unit=EXCLUDED.unit, quota_limit=EXCLUDED.quota_limit,
-           quota_remaining=EXCLUDED.quota_remaining, used_today=EXCLUDED.used_today, used_month=EXCLUDED.used_month,
-           used_total=EXCLUDED.used_total, requests_total=EXCLUDED.requests_total, day_key=EXCLUDED.day_key,
-           month_key=EXCLUDED.month_key, reset_at=EXCLUDED.reset_at, reset_source=EXCLUDED.reset_source,
-           exhausted=EXCLUDED.exhausted, exhausted_reason=EXCLUDED.exhausted_reason,
-           needs_confirmation=EXCLUDED.needs_confirmation, cooldown_until=EXCLUDED.cooldown_until,
-           last_outcome=EXCLUDED.last_outcome, successes=EXCLUDED.successes, failures=EXCLUDED.failures,
-           quality_good=EXCLUDED.quality_good, quality_poor=EXCLUDED.quality_poor,
-           last_confirmed_at=EXCLUDED.last_confirmed_at, updated_at=now()`,
-        [
-          state.id, state.pool, state.slot, state.provider, state.modelFamily, state.allowanceKind, state.unit,
-          state.quotaLimit, state.quotaRemaining, state.usedToday, state.usedMonth, state.usedTotal, state.requestsTotal,
-          state.dayKey, state.monthKey, state.resetAt, state.resetSource, state.exhausted, state.exhaustedReason,
-          state.needsConfirmation, state.cooldownUntil, state.lastOutcome, state.successes, state.failures,
-          state.qualityGood, state.qualityPoor, state.lastConfirmedAt,
-        ],
-      );
+      await (await rcPool()).query(UPSERT_ACCOUNT_SQL, upsertParams(state));
     } catch {
       // Memory still protects the account in this process if the database is briefly unavailable.
+    }
+  }
+
+  async atomic<T>(id: string, work: (io: LedgerStoreIO) => Promise<T>): Promise<T> {
+    type Client = { query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>; release: () => void };
+    const holder: { client: Client | null } = { client: null };
+    try {
+      await ensureReleaseCSchema();
+      holder.client = (await (await rcPool()).connect()) as unknown as Client;
+      await holder.client.query("BEGIN");
+      await holder.client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`provider-account:${id}`]);
+    } catch {
+      if (holder.client) {
+        await holder.client.query("ROLLBACK").catch(() => undefined);
+        holder.client.release();
+      }
+      // Database unavailable: the in-process queue still serialises this account.
+      return work(this.fallback);
+    }
+    const tx = holder.client;
+    try {
+      const result = await work({
+        load: async (accountId) => {
+          const rows = (await tx.query(`SELECT * FROM provider_account_usage WHERE id = $1`, [accountId])).rows;
+          return rows[0] ? fromRow(rows[0]) : this.fallback.load(accountId);
+        },
+        save: async (state) => {
+          await this.fallback.save(state);
+          await tx.query(UPSERT_ACCOUNT_SQL, upsertParams(state));
+        },
+      });
+      await tx.query("COMMIT");
+      return result;
+    } catch (error) {
+      await tx.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      tx.release();
     }
   }
 
@@ -332,6 +378,10 @@ export class PostgresLedgerStore implements LedgerStore {
       return this.fallback.list(pool);
     }
   }
+}
+
+export function isAccountLevelError(message: string): boolean {
+  return /\b(408|5\d\d)\b|timeout|timed out|ECONN|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up/i.test(message) && !/abort/i.test(message);
 }
 
 /** Thrown by provider adapters when the HTTP response proves a quota or rate-limit condition. */
@@ -373,6 +423,88 @@ export class AccountLedger {
     private readonly clock: () => Date = () => new Date(),
   ) {}
 
+  private readonly queues = new Map<string, Promise<unknown>>();
+  private readonly reservations = new Map<string, number>();
+
+  /** Serialises work per account in this process; the store's atomic() also locks across processes. */
+  private serial<T>(id: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(id) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(work);
+    const tail = next.catch(() => undefined);
+    this.queues.set(id, tail);
+    void tail.then(() => {
+      if (this.queues.get(id) === tail) this.queues.delete(id);
+    });
+    return next;
+  }
+
+  private mutate(policy: AccountPolicy, change: (state: AccountState, now: Date) => void): Promise<AccountState> {
+    const id = accountId(policy.pool, policy.slot);
+    return this.serial(id, () => {
+      const run = async (io: LedgerStoreIO) => {
+        const now = this.clock();
+        const state = this.normalise(policy, await io.load(id), now);
+        change(state, now);
+        state.updatedAt = now.toISOString();
+        await io.save(state);
+        return state;
+      };
+      return this.store.atomic ? this.store.atomic(id, run) : run(this.store);
+    });
+  }
+
+  private normalise(policy: AccountPolicy, loaded: AccountState | null, now: Date): AccountState {
+    const base = loaded ?? blank(policy, now);
+    return rollWindows(
+      {
+        ...base,
+        provider: policy.provider,
+        modelFamily: policy.modelFamily ?? base.modelFamily,
+        allowanceKind: policy.allowanceKind,
+        unit: policy.unit,
+        quotaLimit: base.quotaLimit ?? policy.periodLimit,
+      },
+      now,
+    );
+  }
+
+  /** Units planned by in-flight calls in this process count against capacity until they settle. */
+  private withReservations(state: AccountState): AccountState {
+    const reserved = this.reservations.get(state.id) ?? 0;
+    if (reserved <= 0) return state;
+    return {
+      ...state,
+      usedToday: state.usedToday + reserved,
+      usedMonth: state.usedMonth + reserved,
+      usedTotal: state.usedTotal + reserved,
+      quotaRemaining: state.quotaRemaining == null ? null : Math.max(0, state.quotaRemaining - reserved),
+    };
+  }
+
+  /**
+   * Checks capacity and reserves the planned units in one step, so concurrent callers cannot all pass a check that
+   * has room for only one of them. release() must be called once the real usage has been recorded.
+   */
+  async reserve(policy: AccountPolicy, units: number, hasProbe: boolean): Promise<SpendDecision & { release: () => void }> {
+    const id = accountId(policy.pool, policy.slot);
+    return this.serial(id, async () => {
+      const decision = decideSpend(policy, this.withReservations(await this.state(policy)), units, this.clock(), hasProbe);
+      if (!decision.ok || units <= 0) return { ...decision, release: () => undefined };
+      this.reservations.set(id, (this.reservations.get(id) ?? 0) + units);
+      let released = false;
+      return {
+        ...decision,
+        release: () => {
+          if (released) return;
+          released = true;
+          const left = (this.reservations.get(id) ?? 0) - units;
+          if (left > 0) this.reservations.set(id, left);
+          else this.reservations.delete(id);
+        },
+      };
+    });
+  }
+
   async state(policy: AccountPolicy): Promise<AccountState> {
     const now = this.clock();
     const loaded = await this.store.load(accountId(policy.pool, policy.slot));
@@ -391,31 +523,28 @@ export class AccountLedger {
   }
 
   async canSpend(policy: AccountPolicy, units: number, hasProbe: boolean): Promise<SpendDecision> {
-    return decideSpend(policy, await this.state(policy), units, this.clock(), hasProbe);
+    return decideSpend(policy, this.withReservations(await this.state(policy)), units, this.clock(), hasProbe);
   }
 
   /** Records a provider-reported capacity snapshot (from a free probe or response headers/body). */
   async recordSnapshot(policy: AccountPolicy, snapshot: QuotaSnapshot): Promise<AccountState> {
-    const now = this.clock();
-    const state = await this.state(policy);
-    if (snapshot.limit != null && snapshot.limit >= 0) state.quotaLimit = snapshot.limit;
-    if (snapshot.usedToday != null && snapshot.usedToday >= 0) state.usedToday = snapshot.usedToday;
-    if (snapshot.usedMonth != null && snapshot.usedMonth >= 0) state.usedMonth = snapshot.usedMonth;
-    if (snapshot.resetAt) {
-      state.resetAt = snapshot.resetAt.toISOString();
-      state.resetSource = snapshot.source;
-    }
-    if (snapshot.remaining != null) state.quotaRemaining = Math.max(0, snapshot.remaining);
-    const remaining = state.quotaRemaining;
-    const limitCap = cap(policy, state);
-    const usedUp = (remaining != null && remaining <= 0) || (limitCap != null && periodUsed(policy, state) >= limitCap);
-    state.exhausted = usedUp;
-    state.exhaustedReason = usedUp ? `${snapshot.source}: no remaining ${policy.unit}` : null;
-    state.needsConfirmation = false;
-    state.lastConfirmedAt = now.toISOString();
-    state.updatedAt = now.toISOString();
-    await this.store.save(state);
-    return state;
+    return this.mutate(policy, (state, now) => {
+      if (snapshot.limit != null && snapshot.limit >= 0) state.quotaLimit = snapshot.limit;
+      if (snapshot.usedToday != null && snapshot.usedToday >= 0) state.usedToday = snapshot.usedToday;
+      if (snapshot.usedMonth != null && snapshot.usedMonth >= 0) state.usedMonth = snapshot.usedMonth;
+      if (snapshot.resetAt) {
+        state.resetAt = snapshot.resetAt.toISOString();
+        state.resetSource = snapshot.source;
+      }
+      if (snapshot.remaining != null) state.quotaRemaining = Math.max(0, snapshot.remaining);
+      const remaining = state.quotaRemaining;
+      const limitCap = cap(policy, state);
+      const usedUp = (remaining != null && remaining <= 0) || (limitCap != null && periodUsed(policy, state) >= limitCap);
+      state.exhausted = usedUp;
+      state.exhaustedReason = usedUp ? `${snapshot.source}: no remaining ${policy.unit}` : null;
+      state.needsConfirmation = false;
+      state.lastConfirmedAt = now.toISOString();
+    });
   }
 
   async recordUsage(
@@ -424,68 +553,64 @@ export class AccountLedger {
     outcome: "success" | "empty" | "failure",
     quality?: "good" | "poor",
   ): Promise<AccountState> {
-    const now = this.clock();
-    const state = await this.state(policy);
-    state.usedToday += units;
-    state.usedMonth += units;
-    state.usedTotal += units;
-    state.requestsTotal += 1;
-    if (state.quotaRemaining != null) state.quotaRemaining = Math.max(0, state.quotaRemaining - units);
-    if (outcome === "failure") state.failures += 1;
-    else {
-      state.successes += 1;
-      // A real successful request after a reset is itself the capacity confirmation.
-      if (state.exhausted && state.needsConfirmation) {
-        state.exhausted = false;
-        state.exhaustedReason = null;
-        state.needsConfirmation = false;
-        state.lastConfirmedAt = now.toISOString();
+    return this.mutate(policy, (state, now) => {
+      state.usedToday += units;
+      state.usedMonth += units;
+      state.usedTotal += units;
+      state.requestsTotal += 1;
+      if (state.quotaRemaining != null) state.quotaRemaining = Math.max(0, state.quotaRemaining - units);
+      if (outcome === "failure") state.failures += 1;
+      else {
+        state.successes += 1;
+        // A real successful request after a reset is itself the capacity confirmation.
+        if (state.exhausted && state.needsConfirmation) {
+          state.exhausted = false;
+          state.exhaustedReason = null;
+          state.needsConfirmation = false;
+          state.lastConfirmedAt = now.toISOString();
+        }
       }
-    }
-    if (quality === "good") state.qualityGood += 1;
-    if (quality === "poor") state.qualityPoor += 1;
-    state.lastOutcome = outcome;
-    const limitCap = cap(policy, state);
-    if (limitCap != null && periodUsed(policy, state) >= limitCap) {
-      state.exhausted = true;
-      state.exhaustedReason = `local cap reached (${periodUsed(policy, state)}/${limitCap} ${policy.unit})`;
-      state.needsConfirmation = false;
-      state.resetAt = (state.resetAt && Date.parse(state.resetAt) > now.getTime()) ? state.resetAt : nextResetGuess(state, now).toISOString();
-      state.resetSource = state.resetSource ?? "documented-period";
-    }
-    state.updatedAt = now.toISOString();
-    await this.store.save(state);
-    return state;
+      if (quality === "good") state.qualityGood += 1;
+      if (quality === "poor") state.qualityPoor += 1;
+      state.lastOutcome = outcome;
+      const limitCap = cap(policy, state);
+      if (limitCap != null && periodUsed(policy, state) >= limitCap) {
+        state.exhausted = true;
+        state.exhaustedReason = `local cap reached (${periodUsed(policy, state)}/${limitCap} ${policy.unit})`;
+        state.needsConfirmation = false;
+        state.resetAt = (state.resetAt && Date.parse(state.resetAt) > now.getTime()) ? state.resetAt : nextResetGuess(state, now).toISOString();
+        state.resetSource = state.resetSource ?? "documented-period";
+      }
+    });
   }
 
   async recordFailure(policy: AccountPolicy, error: unknown): Promise<AccountState> {
-    const now = this.clock();
-    const state = await this.state(policy);
-    state.failures += 1;
-    state.requestsTotal += 1;
-    const message = error instanceof Error ? error.message : String(error);
-    if (error instanceof ProviderQuotaError) {
-      state.lastOutcome = error.kind;
-      if (error.kind === "rate_limited") {
-        state.cooldownUntil = (error.resetAt ?? new Date(now.getTime() + 60_000)).toISOString();
-      } else if (error.kind === "auth") {
-        state.cooldownUntil = new Date(now.getTime() + 6 * 3_600_000).toISOString();
+    return this.mutate(policy, (state, now) => {
+      state.failures += 1;
+      state.requestsTotal += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof ProviderQuotaError) {
+        state.lastOutcome = error.kind;
+        if (error.kind === "rate_limited") {
+          state.cooldownUntil = (error.resetAt ?? new Date(now.getTime() + 60_000)).toISOString();
+        } else if (error.kind === "auth") {
+          state.cooldownUntil = new Date(now.getTime() + 6 * 3_600_000).toISOString();
+        } else {
+          state.exhausted = true;
+          state.exhaustedReason = message.slice(0, 200);
+          state.needsConfirmation = false;
+          state.quotaRemaining = 0;
+          if (error.kind === "trial_exhausted") state.allowanceKind = "one_time_trial";
+          state.resetAt = error.resetAt?.toISOString() ?? (state.allowanceKind === "one_time_trial" ? null : nextResetGuess(state, now).toISOString());
+          state.resetSource = error.resetAt ? "provider" : "documented-period";
+        }
       } else {
-        state.exhausted = true;
-        state.exhaustedReason = message.slice(0, 200);
-        state.needsConfirmation = false;
-        state.quotaRemaining = 0;
-        if (error.kind === "trial_exhausted") state.allowanceKind = "one_time_trial";
-        state.resetAt = error.resetAt?.toISOString() ?? (state.allowanceKind === "one_time_trial" ? null : nextResetGuess(state, now).toISOString());
-        state.resetSource = error.resetAt ? "provider" : "documented-period";
+        state.lastOutcome = "error";
+        // Only errors about the account or provider (timeouts, 5xx, network) cool it down; a bad request or a
+        // cancelled call says nothing about the account.
+        if (isAccountLevelError(message)) state.cooldownUntil = new Date(now.getTime() + 60_000).toISOString();
       }
-    } else {
-      state.lastOutcome = "error";
-      state.cooldownUntil = new Date(now.getTime() + 60_000).toISOString();
-    }
-    state.updatedAt = now.toISOString();
-    await this.store.save(state);
-    return state;
+    });
   }
 
   async list(pool?: string): Promise<AccountState[]> {

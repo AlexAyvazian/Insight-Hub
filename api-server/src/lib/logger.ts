@@ -11,12 +11,8 @@ export const logger = pino({
     "res.headers['set-cookie']",
   ],
   hooks: {
-    logMethod(args, method) {
-      method.apply(
-        this,
-        args.map((arg) => (typeof arg === "string" ? redactSensitiveText(arg) : arg)) as Parameters<typeof method>,
-      );
-    },
+    // Redacts the final serialized line, so nested fields and serialized errors are covered too.
+    streamWrite: (line) => redactSensitiveText(line),
   },
   ...(isProduction
     ? {}
