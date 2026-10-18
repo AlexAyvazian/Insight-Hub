@@ -32,3 +32,15 @@ export function releaseCFlags(env: Record<string, string | undefined> = process.
 }
 
 export type ReleaseCFlags = ReturnType<typeof releaseCFlags>;
+
+export type ReviewMode = "single" | "panel";
+
+/**
+ * single (default): one evaluator decides; a second model family is asked only for escalated records (the evaluator
+ * contradicts a deterministic accept, or would approve a record with no primary-scope evidence). panel: the
+ * Release C two-family consensus. OPPORTUNITY_REVIEW_MODE=panel restores the panel without a deploy.
+ */
+export function reviewMode(override?: ReviewMode): ReviewMode {
+  if (override) return override;
+  return process.env.OPPORTUNITY_REVIEW_MODE?.trim().toLowerCase() === "panel" ? "panel" : "single";
+}

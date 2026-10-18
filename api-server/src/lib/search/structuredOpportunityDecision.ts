@@ -23,7 +23,7 @@ import {
   recordProviderFailure,
   recordProviderSuccess,
 } from "../providerBudget";
-import { releaseCFlags } from "../releaseC/flags";
+import { releaseCFlags, reviewMode, type ReviewMode } from "../releaseC/flags";
 import { judgmentContentHash, opportunityKey, providerModelFamily } from "../releaseC/identity";
 import { isCurrentlyExtracted } from "../documents/types";
 import { cachedQueueDecisions, closeQueuedByKeys, enqueueForReview, reviewPriority, settleByKey, type CachedQueueDecision } from "../releaseC/reviewQueue";
@@ -58,7 +58,9 @@ export type StructuredHoldCode =
   /** The notice or its documents tried to steer the reviewer; never AI-approved. */
   | "structured_untrusted_content"
   /** OPPORTUNITY_REQUIRE_DOCUMENT_EVIDENCE: documents not yet read. */
-  | "structured_document_pending";
+  | "structured_document_pending"
+  /** The evaluator abstained: the evidence given was not enough to decide. Needs a person or more documents. */
+  | "structured_review_abstained";
 
 export interface StructuredHeldRecord {
   record: NormalizedOpportunity;
@@ -98,7 +100,11 @@ export interface ReviewVote {
   isOpportunity: boolean;
   relevanceScore: number;
   reason: string;
+  /** The judge declined to decide (insufficient evidence). Never counted as a yes or a no. */
+  abstain?: boolean;
 }
+
+export { reviewMode, type ReviewMode } from "../releaseC/flags";
 
 type DecisionMethod = "deterministic" | "panel-ai-review" | "single-ai-review";
 
@@ -246,7 +252,8 @@ export function parseReviewVotes(text: string): ReviewVote[] | null {
         : object.isOpportunity === true
           ? "The purchased scope is an active Occu-Med-compatible procurement."
           : "The record lacks sufficient active Occu-Med procurement evidence.";
-    return [{ index, isOpportunity: object.isOpportunity === true, relevanceScore, reason }];
+    const abstain = object.isOpportunity === null || object.abstain === true || object.decision === "needs_review";
+    return [{ index, isOpportunity: object.isOpportunity === true && !abstain, relevanceScore, reason, ...(abstain ? { abstain: true } : {}) }];
   });
 }
 
@@ -336,6 +343,8 @@ ${UNTRUSTED_EVIDENCE_RULE}
 
 ${scoreGuidance()}
 
+If the evidence given is not enough to decide (for example the purchased scope depends on a statement of work that is not included), abstain with "isOpportunity": null and say what is missing. Do not guess, and never treat a requirement as met when the text does not show it.
+
 Judge independently. Do not assume another model will correct you. Return only JSON in this shape and exactly one row per item:
 {"results":[{"index":0,"isOpportunity":true,"relevanceScore":86,"reason":"Core scope purchases ${profileServiceLabels()[0] ?? "a listed service"}; deadline is open."}]}
 
@@ -357,8 +366,27 @@ export function panelResolved(
 
 function recordResolved(rows: Array<{ provider: string; vote: ReviewVote }>): boolean {
   const yes = new Set(rows.filter((row) => row.vote.isOpportunity).map((row) => row.provider)).size;
-  const no = new Set(rows.filter((row) => !row.vote.isOpportunity).map((row) => row.provider)).size;
+  const no = new Set(rows.filter((row) => !row.vote.isOpportunity && !row.vote.abstain).map((row) => row.provider)).size;
   return yes >= PANEL_CONSENSUS || no >= PANEL_CONSENSUS;
+}
+
+/**
+ * Single-evaluator mode: does this record need a second family's opinion? Only when the one evaluator contradicts
+ * the deterministic evidence: it rejects a record the rules accept, or approves one without primary-scope evidence.
+ */
+function needsSecondOpinion(candidate: Candidate, vote: ReviewVote): boolean {
+  if (vote.abstain) return false;
+  if (!vote.isOpportunity) return candidate.verdict === "accept";
+  const { record } = candidate;
+  return !hasPrimaryOccuMedServiceEvidence(record.title ?? "", `${record.description ?? ""}\n\n${documentEvidenceText(record)}`);
+}
+
+function singleResolved(candidate: Candidate, rows: Array<{ provider: string; vote: ReviewVote }>): boolean {
+  if (rows.length === 0) return false;
+  if (recordResolved(rows)) return true;
+  const decisive = rows.filter((row) => !row.vote.abstain);
+  if (decisive.length === 0) return true; // abstained: settled as needing review
+  return decisive.length === 1 && !needsSecondOpinion(candidate, decisive[0]!.vote);
 }
 
 interface Judge {
@@ -476,7 +504,7 @@ async function callJudge(
  * where one failed). Consensus needs two distinct families. One family alone may only confirm a record the canonical
  * evidence rules already accept.
  */
-async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: string, deadline: number): Promise<PanelRun> {
+async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: string, deadline: number, mode: ReviewMode = "panel"): Promise<PanelRun> {
   const run: PanelRun = { outcomes: new Map(), reviewers: [], families: [], judgeCalls: 0, tokens: 0, diagnostics: [], anySuccess: false };
   const votes = new Map<number, FamilyVote[]>();
   batch.forEach((candidate, index) => {
@@ -504,14 +532,14 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   // Records already settled by earlier votes are not sent again.
   const unresolved = () =>
     pending.filter((index) => {
-      const rows = votes.get(index) ?? [];
-      return !recordResolved(rows.map((row) => ({ provider: row.family, vote: row.vote })));
+      const rows = (votes.get(index) ?? []).map((row) => ({ provider: row.family, vote: row.vote }));
+      return mode === "single" ? !singleResolved(batch[index]!, rows) : !recordResolved(rows);
     });
   pending = unresolved();
 
   // First round: up to two families in parallel (one when earlier votes already supply a family).
   const firstRound: Judge[] = [];
-  const firstRoundSize = votedFamilies.size > 0 ? 1 : 2;
+  const firstRoundSize = mode === "single" || votedFamilies.size > 0 ? 1 : 2;
   while (pending.length > 0 && firstRound.length < firstRoundSize && queue.length > 0) firstRound.push(queue.shift()!);
   const firstIndexes = [...pending];
   const firstRecords = firstIndexes.map((index) => batch[index]!.record);
@@ -540,11 +568,40 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   batch.forEach((candidate, index) => {
     const rows = votes.get(index) ?? [];
     const byFamily = new Map(rows.map((row) => [row.family, row] as const));
-    const distinct = [...byFamily.values()];
+    const voted = [...byFamily.values()];
+    const distinct = voted.filter((row) => !row.vote.abstain);
     const positive = distinct.filter((row) => row.vote.isOpportunity);
     const negative = distinct.filter((row) => !row.vote.isOpportunity);
-    if (distinct.length === 0) {
+    if (voted.length === 0) {
       run.outcomes.set(index, { kind: "held", code: "structured_review_failed", reason: `AI review unavailable for this record. ${candidate.reason}`.trim(), decided: false });
+      return;
+    }
+    if (distinct.length === 0) {
+      // Every judge abstained: held for a person (or new documents, which change the content hash and reopen it).
+      run.outcomes.set(index, { kind: "held", code: "structured_review_abstained", reason: `The evaluator could not decide from the evidence: ${voted[0]!.vote.reason}`.slice(0, 480), decided: true });
+      return;
+    }
+    if (mode === "single" && distinct.length === 1 && !needsSecondOpinion(candidate, distinct[0]!.vote)) {
+      const only = distinct[0]!;
+      if (only.vote.isOpportunity && only.vote.relevanceScore >= acceptMin) {
+        run.outcomes.set(index, {
+          kind: "approved",
+          method: "single-ai-review",
+          score: only.vote.relevanceScore,
+          reason: only.vote.reason,
+          reviewers: [only.provider],
+          families: [only.family],
+        });
+      } else {
+        run.outcomes.set(index, {
+          kind: "held",
+          code: "structured_review_declined",
+          reason: (only.vote.isOpportunity
+            ? `The evaluator's score ${only.vote.relevanceScore} is below accept_min ${acceptMin}.`
+            : `AI review did not confirm purchased scope: ${only.vote.reason}`).slice(0, 480),
+          decided: true,
+        });
+      }
       return;
     }
     if (positive.length >= PANEL_CONSENSUS) {
@@ -623,6 +680,8 @@ export interface DecideStructuredOptions {
    * row has since moved to another version are skipped, so a newer decision is never overwritten.
    */
   claimedHashes?: Map<string, string>;
+  /** Evaluator mode; defaults to OPPORTUNITY_REVIEW_MODE (single unless set to panel). */
+  reviewMode?: ReviewMode;
 }
 
 export async function decideStructuredOpportunities(
@@ -630,6 +689,7 @@ export async function decideStructuredOpportunities(
   options: DecideStructuredOptions = {},
 ): Promise<StructuredOpportunityDecisionResult> {
   const flags = releaseCFlags();
+  const mode = reviewMode(options.reviewMode);
   const persist = options.persist ?? flags.reviewQueue;
   const startedAt = Date.now();
   const now = options.now ?? startedAt;
@@ -690,6 +750,7 @@ export async function decideStructuredOpportunities(
         documents: documents?.documents ?? [],
         documentPipelineEnabled: flags.documentPipeline,
         now,
+        attachmentsNotRegistered: documents?.attachmentsNotRegistered ?? 0,
       });
       withLedger = { ...record, rawData: { ...(record.rawData ?? {}), requirementLedger: ledgerSummary(ledger) } };
     }
@@ -816,7 +877,7 @@ export async function decideStructuredOpportunities(
     let panel: PanelRun;
     try {
       profileContext ??= renderPromptContext(await getOccuMedPromptContext());
-      panel = await reviewBatch(batch, judges, profileContext, deadline);
+      panel = await reviewBatch(batch, judges, profileContext, deadline, mode);
     } catch (error) {
       diagnostics.push(`structured review failed: ${error instanceof Error ? error.message : String(error)}`);
       stopReason = "review_error";

@@ -139,6 +139,17 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
     return { jobId: job.jobId, status: retry ? "queued" : "failed", detail: message, changed: false };
   }
 
+  if (fetched.status === 429) {
+    // SAM.gov (and others) return 429 while a quota is spent. That is a scheduled wait, not a failure: the job keeps
+    // its attempt budget and comes back after the server's Retry-After (or the doubling backoff), however long the
+    // limit lasts and across redeploys, since the wait lives in the job row.
+    const waits = Number(/quota waits: (\d+)/.exec(job.document.retrievalError ?? "")?.[1] ?? 0) + 1;
+    const detail = `HTTP 429 (quota waits: ${waits})`;
+    await updateDocument(doc.id, { retrieval_status: "pending", retrieval_error: detail, last_checked_at: new Date() });
+    await finishJob(job.jobId, "quota_wait", detail, new Date(Date.now() + retryDelayMs(429, Math.min(waits, 6), fetched.headers.get("retry-after"))), { refundAttempt: true });
+    return { jobId: job.jobId, status: "quota_wait", detail, changed: false };
+  }
+
   if (fetched.status >= 400) {
     const detail = `HTTP ${fetched.status}`;
     // A rate limit (SAM.gov's API returns 429 once its quota is spent) is temporary, like a server error.

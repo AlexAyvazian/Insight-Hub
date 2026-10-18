@@ -245,4 +245,17 @@ CREATE TABLE IF NOT EXISTS remote_extraction_jobs (
     planned_units numeric NOT NULL DEFAULT 0,
     submitted_at timestamptz NOT NULL DEFAULT now()
   );
+
+CREATE TABLE IF NOT EXISTS source_query_checkpoints (
+    source text NOT NULL,
+    query_key text NOT NULL,
+    next_offset integer NOT NULL DEFAULT 0,
+    total_records integer,
+    window_from text,
+    window_to text,
+    complete boolean NOT NULL DEFAULT false,
+    last_error text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, query_key)
+);
 COMMIT;

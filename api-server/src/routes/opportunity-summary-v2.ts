@@ -27,9 +27,28 @@ import {
 import { isUsableAiBrief, mergeSummaryWithVerifiedFacts } from "../lib/summaryEvidence";
 import { matchedServiceLines } from "../lib/search/profileServiceLines";
 import { judgeScopeBlock, profileServiceLabels } from "../lib/search/profileText";
+import { getRelevanceProfile } from "../lib/search/relevanceProfile";
 
 const router = Router();
+// Bump when the brief prompt or merge rules change, so briefs written under the old rules are regenerated.
+export const SUMMARY_EVALUATOR_VERSION = "brief-v2.1";
 const summaryCache = new Map<string, any>();
+
+/**
+ * What a cached brief was written from, beyond the notice text: the profile version, the brief rules, and the
+ * stored document hashes and assessment. A material amendment changes one of these, so its old brief is not served.
+ */
+export function summaryCacheVersion(opp: { rawData?: unknown; raw_data?: unknown }, profileVersion: string): string {
+  const raw = ((opp.rawData ?? opp.raw_data ?? {}) as Record<string, unknown>) || {};
+  const evidence = raw.documentEvidence as { hashes?: unknown } | undefined;
+  const ledger = raw.requirementLedger as { assessment?: { summary?: unknown } } | undefined;
+  return [
+    SUMMARY_EVALUATOR_VERSION,
+    profileVersion,
+    Array.isArray(evidence?.hashes) ? [...evidence!.hashes].map(String).sort().join(",") : "",
+    typeof ledger?.assessment?.summary === "string" ? ledger.assessment.summary : "",
+  ].join("|");
+}
 const SUMMARY_CACHE_MAX = 250;
 
 function getCachedSummary(id: string): any | undefined {
@@ -273,7 +292,7 @@ router.post("/opportunities/:id/summary", async (req, res) => {
     }
     const evidenceFingerprint = summaryEvidenceFingerprint(
       quality,
-      cleanText(extracted, 6000),
+      `${cleanText(extracted, 6000)}|${summaryCacheVersion(opp, getRelevanceProfile().version)}`,
     );
     const cached = getCachedSummary(opp.id);
     if (cached?.evidenceFingerprint === evidenceFingerprint)

@@ -246,13 +246,16 @@ describe("SAM.gov bid-ready query policy", () => {
         const params = new URL(request).searchParams;
         assert.ok(params.get("title"));
         assert.deepEqual(params.getAll("ptype"), ["o", "k", "p", "r", "a"]);
-        assert.equal(params.get("limit"), "250");
+        // GSA's maximum page size; later pages are read with offset (and resumed from a checkpoint).
+        assert.equal(params.get("limit"), "1000");
+        assert.equal(params.get("offset"), "0");
       }
       for (const request of classificationRequests) {
         const params = new URL(request).searchParams;
         assert.notEqual(Boolean(params.get("ncode")), Boolean(params.get("ccode")));
         assert.deepEqual(params.getAll("ptype"), ["o", "k", "p", "r", "a"]);
-        assert.equal(params.get("limit"), "75");
+        assert.equal(params.get("limit"), "1000");
+        assert.equal(params.get("offset"), "0");
       }
 
       assert.equal(jinaRequests.length, 1);
@@ -260,6 +263,8 @@ describe("SAM.gov bid-ready query policy", () => {
       assert.match(result.records[0]!.description ?? "", /occupational medical examinations/i);
       assert.equal(result.records[0]!.rawData?.descriptionHydratedBy, "jina-reader");
       assert.equal(result.errors.length, 0);
+      // Every query fit in one short page, so none is left to resume.
+      assert.deepEqual(result.diagnostics?.incompleteQueries, []);
       assert.equal(result.diagnostics?.classificationQueryCount, classificationQueries.length);
       assert.deepEqual(
         result.diagnostics?.expandedPscCodes,

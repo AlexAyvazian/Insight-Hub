@@ -5,6 +5,9 @@
  * DOCX / XLSX: unzipped with fflate and read from their XML parts; explicit page breaks become page boundaries,
  *   worksheets become pages. Archive members are size-checked before inflation (zip-bomb guard).
  * HTML / text: scripts, styles and markup removed; one logical page.
+ * ZIP bundles: each supported member (PDF, DOCX, XLSX, HTML, text) is parsed in turn with its pages labelled by member
+ *   name, within member-count and inflated-size bounds; nested archives and members needing OCR are reported, so a
+ *   bundle with unread content is never counted as fully extracted.
  * Legacy .doc/.xls, images and unknown formats are reported as needing a remote extractor, never guessed.
  */
 import { unzipSync, strFromU8 } from "fflate";
@@ -197,6 +200,58 @@ export function parseText(bytes: Uint8Array): ParsedDocument {
   return finalise("text", [{ page: 1, text, needsOcr: false }], "plain-text");
 }
 
+export const MAX_ARCHIVE_MEMBERS = 60;
+const ARCHIVE_MEMBER = /\.(pdf|docx|xlsx|html?|txt|csv)$/i;
+const UNREAD_DOCUMENT = /\.(doc|xls|rtf|jpe?g|png|tiff?|zip)$/i;
+
+export async function parseZipBundle(bytes: Uint8Array): Promise<ParsedDocument> {
+  const warnings: string[] = [];
+  const names: string[] = [];
+  let skipped = 0;
+  const members = safeUnzip(bytes, (name) => {
+    if (name.endsWith("/") || /(^|\/)(__MACOSX|\.)/.test(name)) return false;
+    if (!ARCHIVE_MEMBER.test(name)) {
+      // Document-like members we cannot read natively (scans, legacy Office, nested archives) are unread content.
+      if (UNREAD_DOCUMENT.test(name)) skipped += 1;
+      return false;
+    }
+    if (names.length >= MAX_ARCHIVE_MEMBERS) {
+      skipped += 1;
+      return false;
+    }
+    names.push(name);
+    return true;
+  });
+  const pages: ExtractedPage[] = [];
+  for (const name of [...names].sort()) {
+    const member = members[name];
+    if (!member) continue;
+    let parsed: ParsedDocument;
+    try {
+      const format = detectFormat(member, "", name);
+      // One archive level only: a member that is itself an archive is reported, not opened.
+      parsed = format === "zip" ? { format, pageCount: 0, pages: [], extractedPageCount: 0, method: "none", warnings: ["nested archive"] } : await parseDocumentNatively(member, "", name);
+    } catch (error) {
+      warnings.push(`${name}: ${error instanceof Error ? error.message.slice(0, 120) : String(error)}`);
+      pages.push({ page: pages.length + 1, text: `[Archive member: ${name}]`, needsOcr: true });
+      continue;
+    }
+    if (parsed.pages.length === 0) {
+      warnings.push(`${name}: ${parsed.warnings.join("; ") || "no text"}`);
+      pages.push({ page: pages.length + 1, text: `[Archive member: ${name}]`, needsOcr: true });
+      continue;
+    }
+    for (const page of parsed.pages) {
+      pages.push({ page: pages.length + 1, text: `[Archive member: ${name}, page ${page.page}]\n${page.text}`, needsOcr: page.needsOcr });
+    }
+    if (parsed.pages.some((page) => page.needsOcr)) warnings.push(`${name}: scanned pages need OCR`);
+  }
+  if (skipped > 0) warnings.push(`${skipped} document members not read (scanned, legacy or nested, or over the ${MAX_ARCHIVE_MEMBERS}-member bound)`);
+  // Unread members count as unextracted pages, so the bundle reports partial rather than complete.
+  for (let i = 0; i < skipped; i += 1) pages.push({ page: pages.length + 1, text: "", needsOcr: true });
+  return finalise("zip", pages, "zip-members", warnings);
+}
+
 /** Parses a document natively. Formats that need a remote extractor return pages flagged `needsOcr`. */
 export async function parseDocumentNatively(bytes: Uint8Array, contentType = "", url = ""): Promise<ParsedDocument> {
   const format = detectFormat(bytes, contentType, url);
@@ -211,6 +266,8 @@ export async function parseDocumentNatively(bytes: Uint8Array, contentType = "",
       return parseHtml(bytes);
     case "text":
       return parseText(bytes);
+    case "zip":
+      return parseZipBundle(bytes);
     case "legacy_office":
     case "image":
       return { format, pageCount: 1, pages: [{ page: 1, text: "", needsOcr: true }], extractedPageCount: 0, method: "none", warnings: [`${format} requires a remote extractor`] };

@@ -18,6 +18,7 @@ export interface StoredDocument {
   title: string | null;
   sha256: string | null;
   retrievalStatus: RetrievalStatus;
+  retrievalError?: string | null;
   extractionStatus: ExtractionStatus;
   pageCount: number | null;
   extractedPageCount: number | null;
@@ -46,6 +47,7 @@ function toDocument(row: Record<string, unknown>): StoredDocument {
     title: (row.title as string | null) ?? null,
     sha256: (row.sha256 as string | null) ?? null,
     retrievalStatus: row.retrieval_status as RetrievalStatus,
+    retrievalError: (row.retrieval_error as string | null) ?? null,
     extractionStatus: row.extraction_status as ExtractionStatus,
     pageCount: row.page_count == null ? null : Number(row.page_count),
     extractedPageCount: row.extracted_page_count == null ? null : Number(row.extracted_page_count),
@@ -68,7 +70,7 @@ export async function registerAttachments(
   opportunityKey: string,
   attachments: AttachmentRef[],
   priority: number,
-  options: { authoritative?: boolean } = {},
+  options: { authoritative?: boolean; listedUrls?: string[] } = {},
 ): Promise<{ registered: number; queued: number; withdrawn: number }> {
   if (attachments.length === 0 && !options.authoritative) return { registered: 0, queued: 0, withdrawn: 0 };
   await ensureReleaseCSchema();
@@ -77,7 +79,7 @@ export async function registerAttachments(
     const retired = await (await rcPool()).query(
       `UPDATE opportunity_documents SET superseded_by = $3, updated_at = now()
         WHERE opportunity_key = $1 AND superseded_by IS NULL AND NOT (source_url = ANY($2::text[]))`,
-      [opportunityKey, attachments.map((a) => a.url), WITHDRAWN],
+      [opportunityKey, options.listedUrls ?? attachments.map((a) => a.url), WITHDRAWN],
     );
     withdrawn = retired.rowCount ?? 0;
   }
@@ -234,11 +236,15 @@ export async function finishJob(
   status: "done" | "failed" | "quota_wait" | "queued",
   error: string | null = null,
   retryAt: Date | null = null,
+  options: { refundAttempt?: boolean } = {},
 ): Promise<void> {
+  // A quota wait (the source said "come back later") gives back the attempt the claim took, so rate limits that
+  // outlast the retry window never exhaust the ceiling meant for real failures.
   await (await rcPool()).query(
     `UPDATE document_extraction_jobs SET status = $2, last_error = $3, next_attempt_at = coalesce($4, now()),
+       attempts = CASE WHEN $5::boolean THEN greatest(attempts - 1, 0) ELSE attempts END,
        locked_by = NULL, locked_at = NULL, updated_at = now() WHERE id = $1`,
-    [jobId, status, error?.slice(0, 500) ?? null, retryAt],
+    [jobId, status, error?.slice(0, 500) ?? null, retryAt, Boolean(options.refundAttempt)],
   );
 }
 

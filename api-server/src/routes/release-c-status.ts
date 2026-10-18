@@ -11,7 +11,7 @@
  */
 import { Router } from "express";
 import { adminReadAllowed } from "../middleware/api-hardening";
-import { releaseCFlags } from "../lib/releaseC/flags";
+import { releaseCFlags, reviewMode } from "../lib/releaseC/flags";
 import { documentWorkerState } from "../lib/releaseC/startup";
 import { rcPool } from "../lib/releaseC/db";
 import { ensureReleaseCSchema } from "../lib/releaseC/schema";
@@ -49,7 +49,7 @@ router.get("/release-c/status", async (req, res) => {
   if (!adminReadAllowed(req)) return res.status(401).json({ error: "Administrative read authorization is required." });
   try {
     await ensureReleaseCSchema();
-    const [docsByStatus, retrieval, jobs, recentDocs, sections, versions, queue, queueDue, queueErrors, decisions, usage, coverage, audit, remoteJobs] =
+    const [docsByStatus, retrieval, jobs, recentDocs, sections, versions, queue, queueDue, queueErrors, decisions, usage, coverage, audit, remoteJobs, checkpoints] =
       await Promise.all([
         rows(`SELECT extraction_status, coalesce(extraction_method, '') AS method, count(*)::int AS documents,
                      coalesce(sum(page_count), 0)::int AS pages, coalesce(sum(extracted_page_count), 0)::int AS extracted_pages
@@ -86,6 +86,8 @@ router.get("/release-c/status", async (req, res) => {
               WHERE created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 2 DESC`),
         rows(`SELECT provider, account_slot, count(*)::int AS pending, coalesce(sum(planned_units), 0)::float AS planned_units
               FROM remote_extraction_jobs GROUP BY 1, 2`),
+        rows(`SELECT source, query_key, next_offset, total_records, complete, last_error, updated_at
+              FROM source_query_checkpoints ORDER BY updated_at DESC LIMIT 40`),
       ]);
     const due = queueDue[0] ?? {};
     return res.json({
@@ -112,6 +114,9 @@ router.get("/release-c/status", async (req, res) => {
       },
       accountUsage: usage,
       coverageLast24h: coverage,
+      reviewMode: reviewMode(),
+      // Per-query paging state: complete queries, and ones resuming from an offset next run.
+      sourceCheckpoints: checkpoints.map((c) => ({ ...c, last_error: safeError(c.last_error) })),
       auditLast7Days: audit,
     });
   } catch (error) {

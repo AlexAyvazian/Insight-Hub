@@ -55,6 +55,9 @@ services:
         value: "35000"
       - key: OPPORTUNITY_REVIEW_QUEUE_ENABLED
         value: "true"
+      # single = one evaluator with abstention and escalation; panel = two-family consensus (rollback switch).
+      - key: OPPORTUNITY_REVIEW_MODE
+        value: "single"
       - key: OPPORTUNITY_REQUIREMENT_LEDGER_ENABLED
         value: "true"
       - key: OPPORTUNITY_COVERAGE_TRACKING_ENABLED

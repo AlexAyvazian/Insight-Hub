@@ -15,6 +15,7 @@ import {
 } from "../providers/openAiCompatible";
 import { prioritizeCandidatesWithCloudflare } from "./candidateSemanticPriority";
 import { runLimitedProviderPool } from "../limitedProviderPool";
+import { canonicalCandidateUrl } from "./sharedWork";
 
 export interface AiExtraction {
   isOpportunity: boolean;
@@ -128,16 +129,21 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortReason(signal);
 }
 
+/**
+ * The same page found by several search providers is one extraction: the key is the canonical URL and the page
+ * content, not each provider's title wording or tracking parameters.
+ */
 function cacheKey(input: BatchExtractInput): string {
   return createHash("sha256")
-    .update(input.url)
-    .update("\n")
-    .update(input.title)
+    .update(canonicalCandidateUrl(input.url))
     .update("\n")
     .update(input.content.slice(0, 6_000))
     .digest("hex")
     .slice(0, 24);
 }
+
+/** Extractions in progress in another batch (a parallel provider run), shared instead of requested twice. */
+const inflightExtractions = new Map<string, Promise<AiExtraction | null>>();
 
 function pruneExtractionCache(now = Date.now()): void {
   for (const [key, entry] of extractionCache) {
@@ -410,17 +416,217 @@ export async function extractOpportunitiesBatch(
 
   pruneExtractionCache();
   const pending: Array<{ input: BatchExtractInput; index: number }> = [];
+  const joined: Array<{ index: number; promise: Promise<AiExtraction | null> }> = [];
+  const owned = new Map<string, { resolve: (value: AiExtraction | null) => void; indexes: number[] }>();
   inputs.forEach((input, index) => {
     const cached = getCached(input);
     if (cached) {
       extractions[index] = cached;
       cacheHits += 1;
-    } else {
-      pending.push({ input, index });
+      return;
     }
+    const key = cacheKey(input);
+    const mine = owned.get(key);
+    if (mine) {
+      // The same page twice in one batch: extract once.
+      mine.indexes.push(index);
+      return;
+    }
+    const other = inflightExtractions.get(key);
+    if (other) {
+      joined.push({ index, promise: other });
+      return;
+    }
+    let resolve!: (value: AiExtraction | null) => void;
+    const promise = new Promise<AiExtraction | null>((done) => (resolve = done));
+    inflightExtractions.set(key, promise);
+    owned.set(key, { resolve, indexes: [index] });
+    pending.push({ input, index });
   });
 
-  if (pending.length === 0) {
+  const releaseOwned = () => {
+    for (const [key, entry] of owned) {
+      const value = entry.indexes.map((index) => extractions[index]).find((row): row is AiExtraction => Boolean(row)) ?? null;
+      for (const index of entry.indexes) if (!extractions[index] && value) extractions[index] = value;
+      entry.resolve(value);
+      if (inflightExtractions.get(key)) inflightExtractions.delete(key);
+    }
+    owned.clear();
+  };
+  try {
+    const result = await extractPending();
+    // Release this batch's pages before waiting on another batch's, so two batches sharing pages never wait on
+    // each other.
+    releaseOwned();
+    // Pages shared with another batch take that batch's result; a page it could not extract stays unextracted here
+    // (and is retried by the next run), rather than being requested twice in parallel.
+    for (const { index, promise } of joined) {
+      const value = await promise;
+      if (value) {
+        extractions[index] = value;
+        result.cacheHits += 1;
+      }
+    }
+    return result;
+  } finally {
+    releaseOwned();
+  }
+
+  async function extractPending(): Promise<BatchExtractResult> {
+    if (pending.length === 0) {
+      return {
+        extractions,
+        rateLimited,
+        usedScorers: [...usedScorers],
+        cacheHits,
+        cloudflarePrioritized,
+        cloudflareEmbedded,
+        cloudflareDirectReranked,
+        cloudflareDuplicatesRemoved,
+        cloudflareAiBudgetDeferred,
+        cloudflareErrors,
+      };
+    }
+
+    throwIfAborted(signal);
+    let prioritizedPending = pending;
+    const semantic = await prioritizeCandidatesWithCloudflare(
+      pending.map((entry) => ({
+        ...entry.input,
+        sourceProvider: sourceKey(entry.input),
+        originalIndex: entry.index,
+      })),
+      undefined,
+      aiCandidateLimit(),
+    );
+    throwIfAborted(signal);
+
+    cloudflarePrioritized = semantic.applied;
+    cloudflareEmbedded = semantic.embedded;
+    cloudflareDirectReranked = semantic.directReranked;
+    cloudflareDuplicatesRemoved = semantic.duplicatesRemoved;
+    cloudflareErrors = semantic.errors;
+    cloudflareAiBudgetDeferred = Math.max(
+      0,
+      pending.length - semantic.candidates.length,
+    );
+
+    if (semantic.applied) {
+      usedScorers.add("cloudflare-workers-ai");
+      prioritizedPending = semantic.candidates.map((candidate) => ({
+        index: candidate.originalIndex,
+        input: {
+          title: candidate.title,
+          url: candidate.url,
+          content: candidate.content,
+          sourceProvider: candidate.sourceProvider,
+          cloudflareSemanticScore: candidate.cloudflareSemanticScore,
+          cloudflareSemanticRank: candidate.cloudflareSemanticRank,
+        },
+      }));
+    }
+
+    const today = new Date().toISOString().split("T")[0] ?? "";
+
+    for (const group of chunk(prioritizedPending, CHUNK_SIZE)) {
+      throwIfAborted(signal);
+      const primary = await runProviderChain(
+        PRIMARY_PROVIDERS,
+        buildBatchPrompt(
+          group.map((entry) => entry.input),
+          today,
+          renderPromptContext(await getOccuMedPromptContext()),
+        ),
+        MAX_OUTPUT_TOKENS,
+        undefined,
+        signal,
+      );
+      if (primary.rateLimited) rateLimited = true;
+      if (!primary.rows || !primary.scorer) continue;
+      usedScorers.add(primary.scorer);
+
+      const provisional = new Map<number, AiExtraction>();
+      primary.rows.forEach((raw, order) => {
+        if (!raw || typeof raw !== "object") return;
+        const object = raw as Record<string, unknown>;
+        const localIndex =
+          typeof object.index === "number" &&
+          object.index >= 0 &&
+          object.index < group.length
+            ? object.index
+            : order;
+        if (!group[localIndex]) return;
+        const extraction = extractionFromObject(
+          raw,
+          primary.scorer ?? "unknown",
+        );
+        if (extraction) provisional.set(localIndex, extraction);
+      });
+
+      const reviewItems = [...provisional.entries()]
+        .filter(([, extraction]) => shouldCrossCheckExtraction(extraction))
+        .map(([localIndex, preliminary]) => ({
+          localIndex,
+          input: group[localIndex]!.input,
+          preliminary,
+        }));
+
+      if (reviewItems.length > 0) {
+        throwIfAborted(signal);
+        const reviewers =
+          primary.scorer === "cerebras"
+            ? CROSS_CHECK_PROVIDERS
+            : [cerebrasProvider, ...CROSS_CHECK_PROVIDERS];
+        const review = await runProviderChain(
+          reviewers,
+          buildCrossCheckPrompt(reviewItems, today, renderPromptContext(await getOccuMedPromptContext())),
+          REVIEW_OUTPUT_TOKENS,
+          primary.scorer,
+          signal,
+        );
+        if (review.rateLimited) rateLimited = true;
+        if (review.rows?.length && review.scorer) {
+          const reviewerName = review.scorer;
+          usedScorers.add(reviewerName);
+          review.rows.forEach((raw, order) => {
+            if (!raw || typeof raw !== "object") return;
+            const object = raw as Record<string, unknown>;
+            const localIndex =
+              typeof object.index === "number"
+                ? object.index
+                : reviewItems[order]?.localIndex;
+            if (
+              typeof localIndex !== "number" ||
+              !provisional.has(localIndex)
+            ) {
+              return;
+            }
+            const corrected = extractionFromObject(
+              raw,
+              primary.scorer ?? "unknown",
+            );
+            if (!corrected) return;
+            corrected.validatedBy = reviewerName;
+            corrected.validationReason =
+              typeof object.validationReason === "string"
+                ? object.validationReason
+                : undefined;
+            corrected.winnerScorer = `${primary.scorer}+${reviewerName}`;
+            provisional.set(localIndex, corrected);
+          });
+        }
+      }
+
+      throwIfAborted(signal);
+      for (const [localIndex, extraction] of provisional) {
+        const target = group[localIndex];
+        if (!target) continue;
+        extractions[target.index] = extraction;
+        setCached(target.input, extraction);
+      }
+    }
+
+    throwIfAborted(signal);
     return {
       extractions,
       rateLimited,
@@ -434,162 +640,11 @@ export async function extractOpportunitiesBatch(
       cloudflareErrors,
     };
   }
-
-  throwIfAborted(signal);
-  let prioritizedPending = pending;
-  const semantic = await prioritizeCandidatesWithCloudflare(
-    pending.map((entry) => ({
-      ...entry.input,
-      sourceProvider: sourceKey(entry.input),
-      originalIndex: entry.index,
-    })),
-    undefined,
-    aiCandidateLimit(),
-  );
-  throwIfAborted(signal);
-
-  cloudflarePrioritized = semantic.applied;
-  cloudflareEmbedded = semantic.embedded;
-  cloudflareDirectReranked = semantic.directReranked;
-  cloudflareDuplicatesRemoved = semantic.duplicatesRemoved;
-  cloudflareErrors = semantic.errors;
-  cloudflareAiBudgetDeferred = Math.max(
-    0,
-    pending.length - semantic.candidates.length,
-  );
-
-  if (semantic.applied) {
-    usedScorers.add("cloudflare-workers-ai");
-    prioritizedPending = semantic.candidates.map((candidate) => ({
-      index: candidate.originalIndex,
-      input: {
-        title: candidate.title,
-        url: candidate.url,
-        content: candidate.content,
-        sourceProvider: candidate.sourceProvider,
-        cloudflareSemanticScore: candidate.cloudflareSemanticScore,
-        cloudflareSemanticRank: candidate.cloudflareSemanticRank,
-      },
-    }));
-  }
-
-  const today = new Date().toISOString().split("T")[0] ?? "";
-
-  for (const group of chunk(prioritizedPending, CHUNK_SIZE)) {
-    throwIfAborted(signal);
-    const primary = await runProviderChain(
-      PRIMARY_PROVIDERS,
-      buildBatchPrompt(
-        group.map((entry) => entry.input),
-        today,
-        renderPromptContext(await getOccuMedPromptContext()),
-      ),
-      MAX_OUTPUT_TOKENS,
-      undefined,
-      signal,
-    );
-    if (primary.rateLimited) rateLimited = true;
-    if (!primary.rows || !primary.scorer) continue;
-    usedScorers.add(primary.scorer);
-
-    const provisional = new Map<number, AiExtraction>();
-    primary.rows.forEach((raw, order) => {
-      if (!raw || typeof raw !== "object") return;
-      const object = raw as Record<string, unknown>;
-      const localIndex =
-        typeof object.index === "number" &&
-        object.index >= 0 &&
-        object.index < group.length
-          ? object.index
-          : order;
-      if (!group[localIndex]) return;
-      const extraction = extractionFromObject(
-        raw,
-        primary.scorer ?? "unknown",
-      );
-      if (extraction) provisional.set(localIndex, extraction);
-    });
-
-    const reviewItems = [...provisional.entries()]
-      .filter(([, extraction]) => shouldCrossCheckExtraction(extraction))
-      .map(([localIndex, preliminary]) => ({
-        localIndex,
-        input: group[localIndex]!.input,
-        preliminary,
-      }));
-
-    if (reviewItems.length > 0) {
-      throwIfAborted(signal);
-      const reviewers =
-        primary.scorer === "cerebras"
-          ? CROSS_CHECK_PROVIDERS
-          : [cerebrasProvider, ...CROSS_CHECK_PROVIDERS];
-      const review = await runProviderChain(
-        reviewers,
-        buildCrossCheckPrompt(reviewItems, today, renderPromptContext(await getOccuMedPromptContext())),
-        REVIEW_OUTPUT_TOKENS,
-        primary.scorer,
-        signal,
-      );
-      if (review.rateLimited) rateLimited = true;
-      if (review.rows?.length && review.scorer) {
-        const reviewerName = review.scorer;
-        usedScorers.add(reviewerName);
-        review.rows.forEach((raw, order) => {
-          if (!raw || typeof raw !== "object") return;
-          const object = raw as Record<string, unknown>;
-          const localIndex =
-            typeof object.index === "number"
-              ? object.index
-              : reviewItems[order]?.localIndex;
-          if (
-            typeof localIndex !== "number" ||
-            !provisional.has(localIndex)
-          ) {
-            return;
-          }
-          const corrected = extractionFromObject(
-            raw,
-            primary.scorer ?? "unknown",
-          );
-          if (!corrected) return;
-          corrected.validatedBy = reviewerName;
-          corrected.validationReason =
-            typeof object.validationReason === "string"
-              ? object.validationReason
-              : undefined;
-          corrected.winnerScorer = `${primary.scorer}+${reviewerName}`;
-          provisional.set(localIndex, corrected);
-        });
-      }
-    }
-
-    throwIfAborted(signal);
-    for (const [localIndex, extraction] of provisional) {
-      const target = group[localIndex];
-      if (!target) continue;
-      extractions[target.index] = extraction;
-      setCached(target.input, extraction);
-    }
-  }
-
-  throwIfAborted(signal);
-  return {
-    extractions,
-    rateLimited,
-    usedScorers: [...usedScorers],
-    cacheHits,
-    cloudflarePrioritized,
-    cloudflareEmbedded,
-    cloudflareDirectReranked,
-    cloudflareDuplicatesRemoved,
-    cloudflareAiBudgetDeferred,
-    cloudflareErrors,
-  };
 }
 
 export function clearExtractionCache(): void {
   extractionCache.clear();
+  inflightExtractions.clear();
 }
 
 export function extractionCacheSize(): number {
