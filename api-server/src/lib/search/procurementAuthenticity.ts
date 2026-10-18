@@ -34,6 +34,7 @@ const WEB_DISCOVERY_SOURCES = new Set([
   "selfHostedCrawler",
   "selfHostedSearch",
   "serper",
+  "socrata",
   "tavily",
   "tinyfish",
   "websearch",

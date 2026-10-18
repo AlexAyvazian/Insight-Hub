@@ -14,8 +14,9 @@ import { describe, it } from "node:test";
 import type { NormalizedOpportunity } from "../../providers/types";
 import { classifyProviderRecordRelevance } from "../../providers/providerQueryMatch";
 import { decideRelevance } from "../relevanceDecision";
-import { assessProcurementAuthenticity, isWebDiscoverySource, ownNoticeText } from "../procurementAuthenticity";
-import { triageDiscoveryCandidate } from "../webIntelligence";
+import { assessProcurementAuthenticity, isWebDiscoverySource, ownNoticeText, type AuthenticityAssessment } from "../procurementAuthenticity";
+import { triageDiscoveryCandidate, withAuthenticityHold } from "../webIntelligence";
+import { decideOpportunityQuality } from "../../ingestion/opportunityIdentity";
 import { toRecord, type BenchmarkCase } from "../../releaseC/benchmark/harness";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -269,5 +270,31 @@ describe("web-discovery triage uses the same authenticity check", () => {
       }),
       { keep: true, band: "accept" },
     );
+  });
+});
+
+describe("authenticity holds survive to the stored record", () => {
+  it("marks a held web page so ingestion stages it without promoting it", () => {
+    const record: NormalizedOpportunity = {
+      externalId: "web-hold-1",
+      title: "Pre-Employment Physical Examination Services - Addendum 2",
+      agency: "County of Example",
+      type: "Solicitation",
+      status: "active",
+      postedDate: new Date(),
+      responseDeadline: new Date(Date.now() + 14 * 86_400_000),
+      description: "Addendum 2 to the request for proposals for pre-employment physical examinations and drug testing.",
+      sourceUrl: "https://example.gov/bids/1/addendum-2",
+      source: "websearch" as NormalizedOpportunity["source"],
+    };
+    const assessment: AuthenticityAssessment = { kind: "supplemental_document", action: "review", reason: "Addendum; held for review", procurementMetadata: [] };
+    const held = withAuthenticityHold(record, assessment);
+    assert.equal((held.rawData as { structuredDecision?: { status?: string } }).structuredDecision?.status, "held");
+    assert.notEqual(decideOpportunityQuality(held).status, "accepted");
+    assert.equal(withAuthenticityHold(record, { ...assessment, action: "none", reason: null }), record);
+  });
+
+  it("treats Socrata catalog hits as web discovery", () => {
+    assert.equal(isWebDiscoverySource("socrata"), true);
   });
 });
