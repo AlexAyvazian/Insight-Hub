@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { rfpDb as db } from "@workspace/db";
 import { opportunitiesTable } from "@workspace/db/schema";
-import { eq, ilike, and, or, sql, isNull, asc, gt } from "drizzle-orm";
+import { eq, and, or, isNull, asc } from "drizzle-orm";
 import { importFromCsv } from "../lib/csv-service";
 import { jinaProvider } from "../lib/providers/jina";
 import { groqProvider } from "../lib/providers/groq";
@@ -15,7 +15,6 @@ import { matchedServiceLines } from "../lib/search/profileServiceLines";
 import { classifyTestingTypes } from "../lib/search/testingTypes";
 import { hasPrimaryOccuMedServiceEvidence } from "../lib/opportunityScopeEvidence";
 import { judgeScopeBlock, profileServiceLabels } from "../lib/search/profileText";
-import { semanticRerank, isSemanticRerankEnabled } from "../lib/search/semanticRerank";
 import {
   cancelManualIngestion,
   getCurrentIngestionRun,
@@ -27,9 +26,7 @@ import {
   startManualIngestion,
 } from "../lib/ingestion/manualIngestion";
 import { createStartIngestionHandler } from "./opportunityIngestionHandlers";
-import { opportunityListErrorDetail, opportunityListSelection } from "./opportunityListQuery";
 import multer from "multer";
-import { OpportunityQualityPageAccumulator, type OpportunityViewMode } from "../lib/opportunityQuality";
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -224,191 +221,9 @@ function mapOpportunity(opp: any) {
   };
 }
 
-router.get("/opportunities", async (req, res) => {
-  try {
-    const {
-      search, status, type, naicsCode, agency, source,
-      dateRange, freshOnly, view,
-      page = "1", limit = "50",
-    } = req.query as Record<string, string>;
-
-    const pageNum = Math.max(1, parseInt(page) || 1);
-    const limitNum = Math.max(1, Math.min(200, parseInt(limit) || 50));
-
-    const days = dateRange != null ? parseInt(dateRange) : NaN;
-    const dateCutoff = Number.isFinite(days) && days > 0
-      ? new Date(Date.now() - days * 24 * 60 * 60 * 1000)
-      : null;
-    const onlyFresh = freshOnly === "true" || freshOnly === "1";
-    const viewMode: OpportunityViewMode = view === "needs-verification" || view === "closed" || view === "all" ? view : "actionable";
-    const requestNow = new Date();
-
-    // ── Build WHERE conditions ────────────────────────────────────────────────
-
-    const conditions: ReturnType<typeof and>[] = [];
-
-    // Free-text search across title, agency, description, solicitation number.
-    if (search?.trim()) {
-      const term = `%${search.trim()}%`;
-      conditions.push(
-        or(
-          ilike(opportunitiesTable.title, term),
-          ilike(opportunitiesTable.agency, term),
-          ilike(opportunitiesTable.description, term),
-          ilike(opportunitiesTable.solicitationNumber, term),
-        )!,
-      );
-    }
-
-    if (status && status !== "all") {
-      conditions.push(eq(opportunitiesTable.status, status as "active" | "archived"));
-    }
-
-    if (type) {
-      conditions.push(ilike(opportunitiesTable.type, `%${type}%`));
-    }
-
-    if (naicsCode) {
-      conditions.push(eq(opportunitiesTable.naicsCode, naicsCode));
-    }
-
-    if (agency) {
-      conditions.push(ilike(opportunitiesTable.agency, `%${agency}%`));
-    }
-
-    if (source) {
-      // statePortals is a legacy alias for publicPortalProviders.
-      if (source === "publicPortalProviders" || source === "statePortals") {
-        conditions.push(
-          or(
-            ilike(opportunitiesTable.providerName, "publicPortalProviders"),
-            ilike(opportunitiesTable.providerName, "statePortals"),
-          )!,
-        );
-      } else {
-        conditions.push(ilike(opportunitiesTable.providerName, source));
-      }
-    }
-
-    if (dateCutoff) {
-      conditions.push(sql`${opportunitiesTable.postedDate} >= ${dateCutoff}` as any);
-    }
-
-    // ── Quality filter pushed into SQL ────────────────────────────────────────
-    //
-    // shouldShowOpportunity() runs at write time (unifiedSearch) to block junk
-    // before it enters the DB. The SQL conditions below enforce the same gate
-    // at read time so that any legacy rows that predate the write-time filter
-    // are also hidden without requiring a destructive purge.
-    //
-    // Rule 1: title must be >= 10 characters (catches untitled stubs).
-    conditions.push(sql`length(${opportunitiesTable.title}) >= 10` as any);
-
-    // Occu-Med relevance is not decided in SQL. The canonical Neon decision (rules, thresholds, discovery
-    // codes) is applied to every candidate row in the batch loop below via shouldShowOpportunity().
-    //
-    // Rule 4: Stale-year-only records.
-    // hasStaleYearOnly() rejects records whose concatenated text mentions ONLY
-    // years before the current year, with no current or near-future year present.
-    // SQL equivalent: if the text contains any 20XX year at all, it must also
-    // contain at least one year >= CURRENT_YEAR.
-    //
-    // Pattern: text ~ '\y20\d{2}\y' (has some year) AND
-    //          text !~ '\y(CURRENT_YEAR|CURRENT_YEAR+1|CURRENT_YEAR+2)\y'
-    // means stale-year-only → reject.
-    // We express this as NOT (has_old_year AND NOT has_current_or_future_year).
-    //
-    // CURRENT_YEAR is evaluated once at module load; the literals are safe
-    // integers injected into the sql template (no user input involved).
-    {
-      const wideText = sql`(
-        coalesce(${opportunitiesTable.title}, '') || ' ' ||
-        coalesce(${opportunitiesTable.description}, '') || ' ' ||
-        coalesce(${opportunitiesTable.agency}, '') || ' ' ||
-        coalesce(${opportunitiesTable.providerName}, '') || ' ' ||
-        coalesce(${opportunitiesTable.solicitationNumber}, '') || ' ' ||
-        coalesce(${opportunitiesTable.samUrl}, '')
-      )`;
-      // A record has a stale-year-only problem when:
-      //   it mentions some past year  AND  it mentions NO current/future year.
-      // We reject those by requiring: NOT (past_year_present AND NOT future_year_present).
-      conditions.push(
-        sql`NOT (
-          ${wideText} ~ '\\m20[0-9]{2}\\M'
-          AND NOT ${wideText} ~ ${`\\m(${CURRENT_YEAR}|${CURRENT_YEAR + 1}|${CURRENT_YEAR + 2})\\M`}
-        )` as any,
-      );
-    }
-
-    // ── freshOnly: exclude stale/date-unknown rows ────────────────────────────
-    // These flags are stored in the JSON tags column. A simple LIKE check is
-    // sufficient since the tags field is controlled output ("stale", "date-unknown").
-    if (onlyFresh) {
-      conditions.push(
-        and(
-          sql`coalesce(${opportunitiesTable.tags}, '') NOT LIKE '%stale%'` as any,
-          sql`coalesce(${opportunitiesTable.tags}, '') NOT LIKE '%date-unknown%'` as any,
-        )!,
-      );
-    }
-
-    const where = conditions.length > 0 ? and(...conditions) : undefined;
-
-    // ── Quality/view pagination ──────────────────────────────────────────────
-    // Classification depends on derived evidence, so scan the SQL-filtered
-    // candidate set in bounded batches, collapse duplicates, then paginate the
-    // selected view. This avoids loading the entire opportunities table while
-    // ensuring view filtering/counting happen before page slicing.
-    const qualityPageAccumulator = new OpportunityQualityPageAccumulator<any>(viewMode, pageNum, limitNum, requestNow);
-    const batchSize = 500;
-    let cursor: string | null = null;
-    for (;;) {
-      const batchWhere: any = cursor ? and(where, gt(opportunitiesTable.id, cursor)) : where;
-      const batch: any[] = await db
-        .select(opportunityListSelection(opportunitiesTable))
-        .from(opportunitiesTable)
-        .where(batchWhere)
-        .orderBy(asc(opportunitiesTable.id))
-        .limit(batchSize);
-      if (batch.length === 0) break;
-      batch.filter(shouldShowOpportunity).map(mapOpportunity).forEach((row: any) => qualityPageAccumulator.add(row));
-      if (batch.length < batchSize) break;
-      cursor = String(batch[batch.length - 1].id);
-    }
-
-    const qualityPage = qualityPageAccumulator.finish();
-    let page_data = qualityPage.data;
-
-    // Optional semantic re-rank applied only to the returned page (not the full DB).
-    // Falls back to the SQL order on any failure.
-    if (isSemanticRerankEnabled() && page_data.length > 0) {
-      try {
-        const rankBase = (o: any) => o.relevance.score + (o.relevance.feedbackAdj ?? 0);
-        const reranked = await semanticRerank(
-          page_data.map((o) => ({
-            item: o,
-            baseScore: rankBase(o),
-            text: `${o.title ?? ""}. ${o.description ?? ""}`.trim(),
-          })),
-        );
-        page_data = reranked.map((r) => {
-          if (r.similarity != null) r.item.relevance.semanticSimilarity = Math.round(r.similarity * 100);
-          return r.item;
-        });
-      } catch (err) {
-        req.log.error(err, "semantic rerank failed; using base ranking");
-      }
-    }
-
-    return res.json({ data: page_data, total: qualityPage.total, page: pageNum, limit: limitNum, view: viewMode });
-  } catch (err) {
-    req.log.error(err);
-    return res.status(500).json({
-      error: "Failed to fetch opportunities",
-      details: opportunityListErrorDetail(err),
-    });
-  }
-});
+// GET /opportunities and POST /opportunities/purge-junk are owned by opportunity-safety-boundary.ts, which is
+// registered first in routes/index.ts and always responds (the purge with HTTP 410). The former duplicate list
+// handler and the destructive purge that lived here were unreachable and have been removed.
 
 router.post("/opportunities/fetch", createStartIngestionHandler(startManualIngestion));
 
@@ -498,30 +313,6 @@ router.post("/opportunities/import", upload.single("file"), async (req, res) => 
   } catch (err: any) {
     req.log.error(err);
     return res.status(500).json({ error: "Failed to import CSV", details: err.message });
-  }
-});
-
-// POST /opportunities/purge-junk — delete all DB records that fail the quality filter
-// Run this once after deploy to clean up old junk already in the database.
-router.post("/opportunities/purge-junk", async (req, res) => {
-  try {
-    const allRows = await db.select().from(opportunitiesTable).limit(5000);
-    const toDelete = allRows.filter((opp) => !shouldShowOpportunity(opp));
-    let deleted = 0;
-    for (const opp of toDelete) {
-      await db.delete(opportunitiesTable).where(eq(opportunitiesTable.id, opp.id));
-      deleted++;
-    }
-    return res.json({
-      ok: true,
-      scanned: allRows.length,
-      deleted,
-      kept: allRows.length - deleted,
-      message: `Purged ${deleted} junk records from the database.`,
-    });
-  } catch (err) {
-    req.log.error(err);
-    return res.status(500).json({ error: "Purge failed" });
   }
 });
 

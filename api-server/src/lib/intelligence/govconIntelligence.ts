@@ -60,6 +60,8 @@ function deterministicScore(record: GovConRankableRecord, mode: GovConIntelligen
     title: record.title,
     snippet: [record.description, record.naics, record.setAside].filter(Boolean).join(" "),
     allowHistorical: true,
+    // Forecasts / Recompete keep legacy containment matching until measured separately (Opportunities uses "token").
+    matchMode: "substring",
   });
   const decision = decideRelevanceWithCodes(result, [{ system: "NAICS 2022", code: record.naics }]);
   const reasons = result.rejected

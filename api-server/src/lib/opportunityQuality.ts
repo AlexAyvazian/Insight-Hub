@@ -37,6 +37,8 @@ export interface OpportunityQualityView {
   solicitationLike: boolean;
   bidReadyNotice: boolean;
   relevanceEligible: boolean;
+  /** Whether the title/description evidence a purchased Occu-Med service (see opportunityScopeEvidence). */
+  purchasedScopeEvidenced: boolean;
   relevanceScore: number;
   sourceVerified: boolean;
   sourceAuthority: "trusted" | "medium" | "low";
@@ -61,9 +63,6 @@ const DISCOVERY_PROVIDERS = new Set([
 const TRUSTED_DIRECT_PROVIDERS = new Set([
   "samGov",
   "sam_gov",
-  // Tango is a direct structured API (dates, buyer, deadline from the source).
-  // Its results are screened by code-targeted queries and the relevance gate.
-  "tango",
   "internationalPublicPortals",
   "eunaBonfire",
   "texasEsbd",
@@ -237,7 +236,11 @@ export function classifyOpportunityQuality(
   const officialHost = OFFICIAL_HOST_HINTS.some(
     (h) => host === h.replace(/^\./, "") || host.endsWith(h),
   );
-  const trustedDirectProvider = TRUSTED_DIRECT_PROVIDERS.has(provider);
+  // Tango is a structured secondary source: reliable metadata, but not independent official confirmation. It is
+  // trusted only when the record points at an official notice page (e.g. its sam.gov URL); the list route's
+  // dedupe authority uses the same "structured, below official" tier.
+  const trustedDirectProvider = TRUSTED_DIRECT_PROVIDERS.has(provider) ||
+    (provider.toLowerCase() === "tango" && officialHost);
   const completeStoredDirectEvidence =
     trustedDirectProvider &&
     confidenceOk &&
@@ -266,13 +269,19 @@ export function classifyOpportunityQuality(
         : authoritativePageEvidence || officialHost
           ? "verified-solicitation-page"
           : "unknown";
+  // Notice stage comes from the notice itself (title/type), not from URL slugs ("/forecast-medical/") or from
+  // history in the description ("the current contract was awarded to ..." in a live re-solicitation).
+  const stageText = [opp.title, opp.type].filter(Boolean).join(" ");
   const awardLike =
-    AWARD_RE.test(identityText) ||
-    /\bawarded to\b/i.test(String(opp.description ?? ""));
-  const forecastLike = FORECAST_RE.test(identityText);
+    AWARD_RE.test(stageText) ||
+    /\bcontract\.pdf\b/i.test(url) ||
+    (/\bawarded to\b/i.test(String(opp.description ?? "")) &&
+      !BID_READY_RE.test(stageText) &&
+      !hasFutureDeadline);
+  const forecastLike = FORECAST_RE.test(stageText);
   const solicitationLike =
     SOLICITATION_RE.test(fullText) &&
-    !BAD_TYPE_RE.test(identityText) &&
+    !BAD_TYPE_RE.test(stageText) &&
     !GENERAL_PAGE_RE.test(identityText);
   const bidReadyNotice =
     BID_READY_RE.test(identityText) && !EARLY_SIGNAL_RE.test(identityText);
@@ -373,7 +382,8 @@ export function classifyOpportunityQuality(
     solicitationLike,
     bidReadyNotice,
     relevanceEligible,
-    relevanceScore: purchasedScopeEvidenced ? relevance.score : Math.min(relevance.score, 49),
+    purchasedScopeEvidenced,
+    relevanceScore: purchasedScopeEvidenced ? relevance.score : Math.min(relevance.score, UNEVIDENCED_SCOPE_SCORE_CAP),
     sourceVerified,
     sourceAuthority: sourceVerified ? "trusted" : aggregator ? "medium" : "low",
     evidenceFingerprint: createHash("sha256")
@@ -399,6 +409,9 @@ export function classifyOpportunityQuality(
       .digest("hex"),
   };
 }
+
+/** Highest score shown or ranked for a record whose purchased scope is not evidenced (below the review band's top). */
+export const UNEVIDENCED_SCOPE_SCORE_CAP = 49;
 
 export function qualityMatchesView(
   quality: OpportunityQualityView,
@@ -449,9 +462,16 @@ export function calculateOpportunityRank(
     deadlineInFuture: quality.hasFutureDeadline,
     allowHistorical: true,
   });
-  // The persisted judge score is the normalized ingestion decision. Fall back
-  // to a fresh heuristic classification for legacy records only.
-  const baseRelevanceScore = numericScore(opp.relevanceScore) ?? judged.score;
+  // The persisted judge score (or an LLM's self-rating for web records) is historical. It can never lift a record
+  // above what current evidence supports: capped when purchased scope is not evidenced, and limited to the current
+  // classifier score when the current canonical decision rejects the record.
+  const persistedOrJudged = numericScore(opp.relevanceScore) ?? judged.score;
+  const currentlyRejected = decideRelevance(judged).verdict === "reject";
+  const baseRelevanceScore = Math.min(
+    persistedOrJudged,
+    quality.purchasedScopeEvidenced ? 100 : UNEVIDENCED_SCOPE_SCORE_CAP,
+    currentlyRejected ? judged.score : 100,
+  );
   const matchedServiceLines = judged.matchedServiceCategories;
   const serviceCoverageBoost = Math.min(8, matchedServiceLines.length * 1.6);
   const qualityBoost = quality.classification === "verified-open" ? 5

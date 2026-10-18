@@ -39,6 +39,8 @@ export function assessIntelText(input: {
     date: input.date ?? null,
     deadlineInFuture: input.deadlineInFuture,
     allowHistorical: true,
+    // Intel feeds keep legacy containment matching until measured separately (Opportunities uses "token").
+    matchMode: "substring",
   });
   const decision = decideRelevance(result);
   return {

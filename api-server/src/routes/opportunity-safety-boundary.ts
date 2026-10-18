@@ -9,6 +9,7 @@ import {
   classifyOpportunityQuality,
   calculateOpportunityRank,
   qualityMatchesView,
+  type OpportunityQualityView,
   type OpportunityViewMode,
 } from "../lib/opportunityQuality";
 import { contextualAdjustments } from "../lib/learning/contextualFeedback";
@@ -62,10 +63,11 @@ function sourceAuthority(provider: unknown): {
   if (value === "internationalpublicportals") {
     return { label: "official", bonus: 220 };
   }
-  // Tango is an independent secondary procurement source, not an authoritative
-  // canonical owner. Keep it in the discovery authority tier until its record
-  // is independently verified by an official source.
-  if (value === "tango") return { label: "discovery", bonus: 20 };
+  // Tango is a structured secondary procurement source: above search discovery,
+  // below official sources, so an official record of the same notice owns the
+  // canonical row. opportunityQuality uses the same tier (trusted only when the
+  // record points at an official notice page).
+  if (value === "tango") return { label: "structured", bonus: 120 };
   if (
     [
       "langsearch",
@@ -99,7 +101,11 @@ function crossSourceKey(row: Record<string, any>): string {
   return `id:${row.id}`;
 }
 
-function relevanceView(opp: Record<string, any>, contextualAdjustment = 0) {
+function relevanceView(
+  opp: Record<string, any>,
+  contextualAdjustment = 0,
+  quality: OpportunityQualityView = classifyOpportunityQuality(opp),
+) {
   const classification = classifyResult({
     title: opp.title,
     snippet: [
@@ -118,8 +124,14 @@ function relevanceView(opp: Record<string, any>, contextualAdjustment = 0) {
     allowHistorical: true,
   });
   const tags = parseTags(opp.tags);
-  const score = classification.score;
-  const decision = decideRelevance(classification);
+  // The visible score and verdict follow the authoritative quality decision: without purchased-scope evidence the
+  // score is capped and an "accept" is shown as "review", whatever the classifier or a stored score says.
+  const score = quality.relevanceScore;
+  const classifierDecision = decideRelevance(classification);
+  const scopeHeld = !quality.purchasedScopeEvidenced && classifierDecision.verdict === "accept";
+  const decision = scopeHeld
+    ? { ...classifierDecision, verdict: "review" as const }
+    : classifierDecision;
   const dateUnknown =
     tags.includes("date-unknown") ||
     !opp.postedDate ||
@@ -141,7 +153,15 @@ function relevanceView(opp: Record<string, any>, contextualAdjustment = 0) {
     // these; it never compares scores to cutoffs of its own.
     verdict: decision.verdict,
     thresholds: decision.thresholds,
-    reasons: classification.reasons.slice(0, 4),
+    reasons: [
+      ...(quality.purchasedScopeEvidenced
+        ? []
+        : ["Specific purchased-scope evidence is missing; review the solicitation."]),
+      ...classification.reasons,
+    ].slice(0, 4),
+    purchasedScopeEvidenced: quality.purchasedScopeEvidenced,
+    // Only listing text was evaluated; attachments/SOW are not read by this view.
+    documentCoverage: "listing-text-only" as const,
     category: classification.category,
     dateUnknown,
     stale: tags.includes("stale") || classification.stale,
@@ -156,7 +176,11 @@ function relevanceView(opp: Record<string, any>, contextualAdjustment = 0) {
   };
 }
 
-function mapOpportunity(opp: Record<string, any>, contextualAdjustment = 0) {
+function mapOpportunity(
+  opp: Record<string, any>,
+  contextualAdjustment = 0,
+  quality: OpportunityQualityView = classifyOpportunityQuality(opp),
+) {
   return {
     ...opp,
     awardAmount: opp.awardAmount ? Number(opp.awardAmount) : undefined,
@@ -169,7 +193,7 @@ function mapOpportunity(opp: Record<string, any>, contextualAdjustment = 0) {
       ? Number(opp.relevanceScore)
       : undefined,
     tags: parseTags(opp.tags),
-    relevance: relevanceView(opp, contextualAdjustment),
+    relevance: relevanceView(opp, contextualAdjustment, quality),
   };
 }
 
@@ -306,7 +330,7 @@ router.get("/opportunities", async (req, res) => {
         context: "",
         contextHash: "",
       };
-      const mapped = mapOpportunity(row, contextual.adjustment);
+      const mapped = mapOpportunity(row, contextual.adjustment, quality);
       const authority = sourceAuthority(row.providerName ?? row.source);
       const rankBreakdown = calculateOpportunityRank(row, quality);
       const contextualFeedback = Math.max(-5, Math.min(5, contextual.adjustment));

@@ -1,6 +1,7 @@
 import type { NormalizedOpportunity } from "../providers/types";
 import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch";
 import { getOccuMedPromptContext, renderPromptContext } from "./occumedPromptContext";
+import { hasPrimaryOccuMedServiceEvidence } from "../opportunityScopeEvidence";
 import { decideRelevance } from "./relevanceDecision";
 import { getRelevanceProfile } from "./relevanceProfile";
 import { opportunityDescriptionContext } from "./opportunityDescriptionContext";
@@ -28,8 +29,24 @@ interface ReviewProvider {
   complete(prompt: string, maxTokens?: number): Promise<string>;
 }
 
+/** Why a structured record was neither approved nor rejected. Held records are retained for review, never bid-ready. */
+export type StructuredHoldCode =
+  | "structured_review_budget"
+  | "structured_review_declined"
+  | "structured_review_failed";
+
+export interface StructuredHeldRecord {
+  record: NormalizedOpportunity;
+  code: StructuredHoldCode;
+  reason: string;
+}
+
 export interface StructuredOpportunityDecisionResult {
   approved: NormalizedOpportunity[];
+  /** Ambiguous records not approved this run (budget, AI decline or AI failure): retained, never discarded. */
+  held: StructuredHeldRecord[];
+  /** Records the canonical relevance decision rejected, kept for rejection provenance. */
+  rejectedRecords: NormalizedOpportunity[];
   deterministicApproved: number;
   aiApproved: number;
   rejected: number;
@@ -134,7 +151,9 @@ export function isDeterministicallyActionable(
     decideRelevance(relevance).verdict === "accept" &&
     hasFutureDeadline(record, now) &&
     (relevance.confidence === "verified_explicit" ||
-      relevance.confidence === "strong_combination")
+      relevance.confidence === "strong_combination") &&
+    // A classifier score alone is not purchased-scope proof; without it the record goes to review, not auto-approval.
+    hasPrimaryOccuMedServiceEvidence(record.title ?? "", record.description ?? "")
   );
 }
 
@@ -426,12 +445,14 @@ export async function decideStructuredOpportunities(
     score: number;
     reason: string;
   }> = [];
+  const rejectedRecords: NormalizedOpportunity[] = [];
   let rejected = 0;
 
   for (const record of records) {
     const relevance = classifyProviderRecordRelevance(record);
     if (decideRelevance(relevance).verdict === "reject") {
       rejected += 1;
+      rejectedRecords.push(record);
       continue;
     }
 
@@ -463,10 +484,19 @@ export async function decideStructuredOpportunities(
     return leftDeadline - rightDeadline;
   });
 
+  // The limit bounds paid review calls, never record retention: everything not approved below is held.
   const reviewLimit = structuredReviewCandidateLimit();
   const selected = ambiguous.slice(0, reviewLimit);
-  const review = await reviewAmbiguous(selected.map((entry) => entry.record));
+  let review: Awaited<ReturnType<typeof reviewAmbiguous>>;
+  let reviewFailure: string | null = null;
+  try {
+    review = await reviewAmbiguous(selected.map((entry) => entry.record));
+  } catch (error) {
+    reviewFailure = error instanceof Error ? error.message : String(error);
+    review = { decisions: [], reviewers: [], diagnostics: [`structured review failed: ${reviewFailure}`] };
+  }
   let aiApproved = 0;
+  const approvedIndexes = new Set<number>();
 
   for (const decision of review.decisions) {
     const target = selected[decision.index];
@@ -480,13 +510,29 @@ export async function decideStructuredOpportunities(
         decision.reviewers,
       ),
     );
+    approvedIndexes.add(decision.index);
     aiApproved += 1;
   }
 
-  const reviewHeld = Math.max(0, ambiguous.length - aiApproved);
+  const held: StructuredHeldRecord[] = ambiguous.flatMap((entry, index): StructuredHeldRecord[] => {
+    if (approvedIndexes.has(index)) return [];
+    if (index >= reviewLimit) {
+      return [{ record: entry.record, code: "structured_review_budget",
+        reason: `Not sent to AI review: per-run review budget (${reviewLimit}) reached. ${entry.reason}`.trim() }];
+    }
+    if (reviewFailure || review.reviewers.length === 0) {
+      return [{ record: entry.record, code: "structured_review_failed",
+        reason: `AI review unavailable${reviewFailure ? ` (${reviewFailure})` : ""}. ${entry.reason}`.trim() }];
+    }
+    return [{ record: entry.record, code: "structured_review_declined",
+      reason: `AI review did not confirm purchased scope. ${entry.reason}`.trim() }];
+  });
+  const reviewHeld = held.length;
 
   return {
     approved,
+    held,
+    rejectedRecords,
     deterministicApproved: approved.length - aiApproved,
     aiApproved,
     rejected,
