@@ -99,6 +99,9 @@ jobs:
       - name: Opportunity quality regressions
         run: pnpm --filter @workspace/api-server run test:quality
 
+      - name: Opportunity Release C regressions and benchmark gate
+        run: pnpm --filter @workspace/api-server run test:release-c
+
       - name: Frontend opportunity regressions
         run: pnpm --filter @workspace/intel-suite run test:quality
 

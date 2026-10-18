@@ -448,7 +448,10 @@ export const PROVIDER_DEFINITIONS: Record<RfpProviderName, ProviderDefinition> =
   you: provider("you", "You.com", "search", "web_discovery", [secretField("youApiKey", "YOU_API_KEY")], ["Web search", "Opportunity sourcing", "Two-account failover", "Per-account quota/reset telemetry"], "active"),
   langsearch: provider("langsearch", "LangSearch", "search", "web_discovery", [secretField("langsearchApiKey", "LANGSEARCH_API_KEY")], ["LLM-native search", "Opportunity sourcing", "Four independent account slots"], "active"),
   parallel: provider("parallel", "Parallel", "search", "web_discovery", [secretField("parallelApiKey", "PARALLEL_API_KEY")], ["Web search", "State/local/private RFP discovery", "Monthly renewable fallback"], "active"),
-  linkup: provider("linkup", "Linkup", "search", "web_discovery", [secretField("linkupApiKey", "LINKUP_API_KEY")], ["Web search", "Domain-filtered opportunity discovery"], "active"),
+  linkup: {
+    ...provider("linkup", "Linkup", "search", "web_discovery", [secretField("linkupApiKey", "LINKUP_API_KEY")], ["Web search", "Domain-filtered opportunity discovery", "Two-account failover", "Balance-checked credit accounting"], "active"),
+    optionalFields: [secretField("linkupApiKey2", "LINKUP_API_KEY_2", "API Key (second account)")],
+  },
   socrata: provider("socrata", "Tyler Data & Insights / Socrata", "procurement", "web_discovery", [secretField("socrataApiKey", "SOCRATA_API_KEY", "API Key"), secretField("socrataApiSecret", "SOCRATA_API_SECRET", "API Secret")], ["Official open-data catalog discovery", "State and municipal procurement datasets", "Structured-source fallback"], "active"),
   websearch: provider("websearch", "WebSearch API", "search", "web_discovery", [secretField("websearchApiKey", "WEBSEARCH_API_KEY")], ["Broad web search", "Opportunity sourcing"], "partial"),
   grantsGov: {

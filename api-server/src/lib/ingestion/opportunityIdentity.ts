@@ -53,6 +53,11 @@ function structuredDecisionMarker(record: NormalizedOpportunity): StructuredDeci
     : null;
 }
 
+function documentEvidenceFor(record: NormalizedOpportunity): string {
+  const evidence = (record.rawData as Record<string, unknown> | undefined)?.documentEvidence as { text?: unknown } | undefined;
+  return typeof evidence?.text === "string" ? evidence.text.slice(0, 12_000) : "";
+}
+
 function encodedQualityReason(code: string, detail: string): string {
   const legacy = "Record failed the configured Occu-Med opportunity relevance filter.";
   return `${code}|${legacy} ${detail.replace(/\s+/g, " ").trim()}`;
@@ -284,26 +289,41 @@ export function decideOpportunityQuality(
   }
 
   const samTaxonomyEvidence = samTaxonomyEvidenceFor(record);
-  const relevance = classifyResult({
-    title: record.title,
-    snippet: [
-      record.type,
-      record.solicitationNumber,
-      record.description,
-      ...samTaxonomyEvidence,
-    ]
-      .filter(Boolean)
-      .join(" "),
-    url: record.sourceUrl,
-    allowHistorical: true,
-    // Live-deadline and posted-date evidence travels with the notice, never with the provider.
-    deadlineInFuture:
-      record.responseDeadline instanceof Date &&
-      record.responseDeadline.getTime() > Date.now(),
-    date: record.postedDate ?? null,
-  });
+  const classifyWith = (extra: string) =>
+    classifyResult({
+      title: record.title,
+      snippet: [
+        record.type,
+        record.solicitationNumber,
+        record.description,
+        ...samTaxonomyEvidence,
+        extra,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      url: record.sourceUrl,
+      allowHistorical: true,
+      // Live-deadline and posted-date evidence travels with the notice, never with the provider.
+      deadlineInFuture:
+        record.responseDeadline instanceof Date &&
+        record.responseDeadline.getTime() > Date.now(),
+      date: record.postedDate ?? null,
+    });
+  let relevance = classifyWith("");
   // One decision for every provider: the Neon evidence rules plus the canonical thresholds.
-  const decision = decideRelevance(relevance);
+  let decision = decideRelevance(relevance);
+  // Release C: cited excerpts from the official documents can raise a thin notice, never sink one (boilerplate in
+  // long solicitations would otherwise trip hard rules), and never overturn a hard-rule rejection of the notice.
+  const documentEvidence = documentEvidenceFor(record);
+  if (documentEvidence && decision.verdict !== "accept" && !(relevance.rejected && relevance.confidence === "rejected" && relevance.negativeSignals.length > 0)) {
+    const withDocuments = classifyWith(documentEvidence);
+    const rank = { reject: 0, review: 1, accept: 2 } as const;
+    const documentDecision = decideRelevance(withDocuments);
+    if (rank[documentDecision.verdict] > rank[decision.verdict]) {
+      relevance = withDocuments;
+      decision = documentDecision;
+    }
+  }
   if (decision.verdict === "reject") {
     return {
       status: "rejected",

@@ -118,6 +118,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
 
   try {
     dailyScheduler?.stop();
+    await import("./lib/releaseC/startup").then((m) => m.stopReleaseC()).catch(() => undefined);
     await closeHttpServer();
     await rfpPool.end();
     logger.info({ signal }, "Graceful shutdown complete");
@@ -209,6 +210,10 @@ async function bootstrap(): Promise<void> {
   // Company Watch official contract awards (DoD daily announcements + USAspending), stored in Neon. Free sources only.
   const { startCompanyAwardWatcher } = await import("./lib/companyWatch/awardWatcher");
   startCompanyAwardWatcher();
+
+  // Release C (Opportunities): review queue tick, document worker, redaction. Each part is flag-controlled.
+  const { startReleaseC } = await import("./lib/releaseC/startup");
+  await startReleaseC(logger).catch((error) => logger.warn({ error }, "Release C startup failed; Opportunities continue without it"));
 }
 
 bootstrap().catch((error) => {

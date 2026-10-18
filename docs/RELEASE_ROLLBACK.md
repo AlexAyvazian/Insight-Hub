@@ -80,3 +80,21 @@ For each accepted production release, retain:
 - deployment timestamp;
 - rollback commit if rollback occurred;
 - any migration/backup notes relevant to that release.
+
+## Release C (Opportunities document evidence and adaptive review)
+
+Release C is staged behind flags; each can be turned off in the Render dashboard without a code rollback.
+
+| Flag | Default in `render.yaml` | Off means |
+| --- | --- | --- |
+| `OPPORTUNITY_REVIEW_QUEUE_ENABLED` | `true` | No persistent review queue; held records stay held. |
+| `OPPORTUNITY_REQUIREMENT_LEDGER_ENABLED` | `true` | No requirement-level evidence ledger is written. |
+| `OPPORTUNITY_COVERAGE_TRACKING_ENABLED` | `true` | No coverage or partition-exclusion events are written. |
+| `OPPORTUNITY_DOCUMENT_PIPELINE_ENABLED` | `false` | Attachments are not fetched or extracted. |
+| `OPPORTUNITY_REQUIRE_DOCUMENT_EVIDENCE` | `false` | Records are not held when documents are incomplete. |
+| `DOCUMENT_EXTRACTION_WORKER_MODE` | `off` | No child extraction worker (`child` spawns `dist/workers/documentExtractionWorker.mjs`). |
+| `STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT` | unset | Unset means adaptive (no fixed cap). A positive number restores a hard ceiling. |
+
+Release C tables are additive (`lib/db/migrations/rfp/release-c/up.sql`, created idempotently at startup). They do not alter existing tables or opportunity rows. `lib/db/migrations/rfp/release-c/down.sql` drops only the Release C tables; run it only after the flags are off, only if the data in those tables is no longer needed, and only after a revision that no longer calls `ensureReleaseCSchema()` at startup is deployed. Otherwise the next restart of a Release C revision recreates the tables immediately.
+
+The benchmark gate (`pnpm --filter @workspace/api-server run test:release-c`) compares against `api-server/src/lib/releaseC/benchmark/baseline.json`. Rebuild the dataset with `node --import tsx src/lib/releaseC/benchmark/build.ts <label-dir>`; see `docs/quality/release-c-benchmark.md`.

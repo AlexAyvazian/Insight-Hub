@@ -60,6 +60,8 @@ const STALE_RUN_RECOVERY_ERROR =
   "Run was marked failed during a later manual start because its durable heartbeat expired.";
 export const PROVIDER_DEADLINE_MS = 90_000;
 export const PUBLIC_PORTAL_PROVIDER_DEADLINE_MS = 12 * 60 * 1000;
+/** The review-queue drain reviews for up to 8 minutes (REVIEW_QUEUE_TIME_BUDGET_MS) and then stages results. */
+export const REVIEW_QUEUE_PROVIDER_DEADLINE_MS = 10 * 60 * 1000;
 export const RUN_DEADLINE_MS = 20 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 5_000;
 const activeRunControllers = new Map<string, AbortController>();
@@ -104,6 +106,7 @@ export type ProviderFetcher = (
 ) => Promise<ProviderRunResult>;
 
 function providerDisplayName(provider: string): string {
+  if (provider === "reviewQueue") return "AI Review Queue";
   if (provider === "aiDiscovery") return "AI Opportunity Discovery";
   if (provider === "tango") return "Tango Federal Opportunities";
   if (provider === "samGov") return "SAM.gov Official API";
@@ -795,6 +798,7 @@ class RunTimeoutError extends Error {
 }
 
 function providerDeadlineMs(provider: string): number {
+  if (provider === "reviewQueue") return REVIEW_QUEUE_PROVIDER_DEADLINE_MS;
   return provider === "publicPortalProviders"
     ? PUBLIC_PORTAL_PROVIDER_DEADLINE_MS
     : PROVIDER_DEADLINE_MS;

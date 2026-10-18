@@ -3,7 +3,15 @@ import type {
   NormalizedOpportunity,
   ProviderProgressEvent,
 } from "../providers/types";
-import { partitionProviderRecordsForQuery } from "../providers/providerQueryMatch";
+import {
+  classifyProviderRecordRelevance,
+  normalizeProviderPostedDate,
+  partitionProviderRecordsForQuery,
+  recordMatchesProviderQuery,
+} from "../providers/providerQueryMatch";
+import { decideRelevance } from "../search/relevanceDecision";
+import { releaseCFlags } from "../releaseC/flags";
+import { exclusionSamples, recordCoverage } from "../releaseC/coverage";
 import { summarizeSamVerification, verifySamPublicRecords } from "../providers/samGovPageVerification";
 import { filterExpiredOpportunities } from "./opportunityExpiration";
 import {
@@ -48,6 +56,7 @@ export const PROVIDER_ALIASES = new Map<string, string>([
   ["ted", "internationalPublicPortals"],
   ["rss_aggregator", "rssAggregator"],
   ["rssAggregator", "rssAggregator"],
+  ["review_queue", "reviewQueue"],
 ]);
 
 export const FEDERAL_MANUAL_PROVIDERS = ["samGov", "tango"] as const;
@@ -58,6 +67,8 @@ export const MANUAL_RFP_PROVIDERS = new Set([
   "emailNotifications",
   "rssAggregator",
 ]);
+/** Release C: internal provider that drains the persistent AI review queue through normal staging/promotion. */
+export const INTERNAL_RFP_PROVIDERS = new Set(["reviewQueue"]);
 
 const DEFAULT_OCCUMED_QUERY = "occupational health services";
 const DEFAULT_MANUAL_PROVIDERS = [
@@ -96,6 +107,8 @@ export interface ProviderRunResult {
 
 export interface ProviderRunnerOptions {
   runId?: string;
+  /** Wall-clock budget for adaptive AI review inside this provider call. */
+  reviewTimeBudgetMs?: number;
   keywords?: string;
   dateRange?: number;
   signal?: AbortSignal;
@@ -117,7 +130,7 @@ export function resolveManualProviders(providers?: string[]): string[] {
     ),
   );
   const unsupported = resolved.filter(
-    (provider) => !MANUAL_RFP_PROVIDERS.has(provider),
+    (provider) => !MANUAL_RFP_PROVIDERS.has(provider) && !INTERNAL_RFP_PROVIDERS.has(provider),
   );
   if (unsupported.length > 0) {
     throw new Error(`Unsupported RFP provider(s): ${unsupported.join(", ")}`);
@@ -129,16 +142,51 @@ export function effectiveProviderQuery(keywords?: string): string {
   return keywords?.trim() || DEFAULT_OCCUMED_QUERY;
 }
 
+interface GuardedProviderResult extends ProviderRunResult {
+  /** Records the query partition excluded and the canonical classifier also rejects (staged as rejected, not dropped). */
+  partitionExcluded: NormalizedOpportunity[];
+}
+
+/**
+ * Query partition + expiry guards. Release C audit: records the partition excludes are no longer dropped silently.
+ * Any excluded record the canonical relevance decision would still keep (accept or review) is a potential missed
+ * opportunity and is rescued into the normal decision path; the rest are returned for staging as rejected with the
+ * partition reason. Every call writes a coverage event (returned / matched / excluded / rescued / errors per query).
+ */
 function applyProviderGuards(
   provider: string,
   records: NormalizedOpportunity[],
   errors: string[],
   keywords?: string,
   diagnostics?: Record<string, unknown>,
-): ProviderRunResult {
+  runId?: string,
+): GuardedProviderResult {
   const query = effectiveProviderQuery(keywords);
   const partition = partitionProviderRecordsForQuery(records, query, 0);
+  const audit = releaseCFlags().coverageTracking;
+  let matched = partition.matched;
+  let partitionExcluded: NormalizedOpportunity[] = [];
+  let rescued = 0;
   if (partition.rejectedCount > 0) {
+    if (audit) {
+      const excluded = records
+        .filter((record) => !recordMatchesProviderQuery(record, query))
+        .map(normalizeProviderPostedDate);
+      const keep: NormalizedOpportunity[] = [];
+      for (const record of excluded) {
+        if (decideRelevance(classifyProviderRecordRelevance(record)).verdict === "reject") {
+          partitionExcluded.push(withStructuredDecision(record, {
+            status: "rejected",
+            code: "provider_query_partition_excluded",
+            reason: `Did not match the provider query "${query.slice(0, 120)}" and the canonical relevance decision rejects it.`,
+          }));
+        } else {
+          keep.push(record);
+        }
+      }
+      rescued = keep.length;
+      matched = [...matched, ...keep];
+    }
     console.info(
       JSON.stringify({
         event: "rfp_provider_query_partitioned",
@@ -147,10 +195,12 @@ function applyProviderGuards(
         returned: partition.rawCount,
         matched: partition.matchedCount,
         rejected: partition.rejectedCount,
+        rescued,
+        stagedAsRejected: partitionExcluded.length,
       }),
     );
   }
-  const filtered = filterExpiredOpportunities(partition.matched);
+  const filtered = filterExpiredOpportunities(matched);
   if (filtered.expiredSkipped > 0) {
     console.info(
       JSON.stringify({
@@ -161,12 +211,56 @@ function applyProviderGuards(
       }),
     );
   }
+  if (audit) {
+    const queryResults = Array.isArray(diagnostics?.queryResults)
+      ? (diagnostics!.queryResults as Array<{ query: string; family: string; returned: number; truncated: boolean; error?: string }>)
+      : [];
+    void recordCoverage([
+      {
+        runId,
+        provider,
+        query,
+        returned: partition.rawCount,
+        matched: partition.matchedCount,
+        excluded: partition.rejectedCount,
+        staged: filtered.records.length,
+        error: errors.length > 0 ? errors.slice(0, 3).join(" | ") : null,
+        details: {
+          rescuedFromPartition: rescued,
+          partitionStagedAsRejected: partitionExcluded.length,
+          expiredSkipped: filtered.expiredSkipped,
+          samples: exclusionSamples(partitionExcluded),
+        },
+      },
+      ...queryResults.map((row) => ({
+        runId,
+        provider,
+        serviceFamily: row.family,
+        query: row.query,
+        returned: row.returned,
+        matched: row.returned,
+        excluded: 0,
+        error: row.error ?? null,
+        details: { truncatedPage: row.truncated },
+      })),
+    ]);
+  } else {
+    partitionExcluded = [];
+  }
   return {
     records: filtered.records,
     errors,
     expiredSkipped: filtered.expiredSkipped,
     diagnostics,
+    partitionExcluded,
   };
+}
+
+/** Direct (non-structured) providers: excluded records travel with the result flagged as rejected. */
+function directProviderResult(guarded: GuardedProviderResult): ProviderRunResult {
+  const { partitionExcluded, ...result } = guarded;
+  if (partitionExcluded.length === 0) return result;
+  return { ...result, records: [...result.records, ...partitionExcluded], approvedCount: result.records.length };
 }
 
 function withStructuredDecision(
@@ -198,12 +292,17 @@ export async function applyStructuredFederalDecision(
     errors,
     options.keywords,
     diagnostics,
+    options.runId,
   );
-  if (guarded.records.length === 0) return guarded;
+  if (guarded.records.length === 0) return directProviderResult(guarded);
   const { decideStructuredOpportunities } = await import(
     "../search/structuredOpportunityDecision"
   );
-  const decided = await decideStructuredOpportunities(guarded.records);
+  const decided = await decideStructuredOpportunities(guarded.records, {
+    provider,
+    signal: options.signal,
+    ...(options.reviewTimeBudgetMs ? { timeBudgetMs: options.reviewTimeBudgetMs } : {}),
+  });
   if (decided.diagnostics.length > 0) {
     console.warn(
       JSON.stringify({
@@ -225,6 +324,8 @@ export async function applyStructuredFederalDecision(
       rejected: decided.rejected,
       reviewHeld: decided.reviewHeld,
       reviewer: decided.reviewer,
+      review: decided.review,
+      partitionStagedAsRejected: guarded.partitionExcluded.length,
     }),
   );
   // Held and rejected records are returned (flagged) so ingestion stages them in raw/staging with a non-accepted
@@ -234,6 +335,7 @@ export async function applyStructuredFederalDecision(
       withStructuredDecision(record, { status: "held", code, reason })),
     ...decided.rejectedRecords.map((record) =>
       withStructuredDecision(record, { status: "rejected", code: "structured_relevance_reject", reason: "Canonical relevance decision rejected the record." })),
+    ...guarded.partitionExcluded,
   ];
   return {
     records: [...decided.approved, ...audited],
@@ -247,6 +349,7 @@ export async function applyStructuredFederalDecision(
       structuredApproved: decided.approved.length,
       structuredRejected: decided.rejected,
       structuredReviewHeld: decided.reviewHeld,
+      structuredReview: decided.review,
     },
   };
 }
@@ -819,19 +922,124 @@ async function fetchConfiguredAiDiscovery(
   };
 }
 
+export const REVIEW_QUEUE_CLAIM_LIMIT = 90;
+export const REVIEW_QUEUE_TIME_BUDGET_MS = 8 * 60_000;
+
+/**
+ * Reviews queued ambiguous records with whatever free AI capacity is available now. Claimed records that are
+ * approved come back for staging/promotion; those still unreviewed return to the queue (never dropped).
+ */
+async function fetchReviewQueue(options: ProviderRunnerOptions): Promise<ProviderRunResult> {
+  const { cachedQueueDecisions, claimDueItems, completeItem } = await import("../releaseC/reviewQueue");
+  const { opportunityKey } = await import("../releaseC/identity");
+  await import("../search/occumedSearchProfile")
+    .then((module) => module.getOccuMedSearchProfile())
+    .catch(() => undefined);
+  const items = await claimDueItems(REVIEW_QUEUE_CLAIM_LIMIT);
+  if (items.length === 0) {
+    return { records: [], approvedCount: 0, errors: [], diagnostics: { reviewQueueClaimed: 0 } };
+  }
+  const { decideStructuredOpportunities } = await import("../search/structuredOpportunityDecision");
+  const decided = await decideStructuredOpportunities(
+    items.map((item) => item.record),
+    {
+      provider: "reviewQueue",
+      signal: options.signal,
+      timeBudgetMs: options.reviewTimeBudgetMs ?? REVIEW_QUEUE_TIME_BUDGET_MS,
+      claimedHashes: new Map(items.map((item) => [item.opportunityKey, item.contentHash])),
+    },
+  );
+  // A newer version of an opportunity may have been decided (or queued) by ingestion while this drain reviewed the
+  // claimed snapshot. Its row then carries the newer hash, and this drain's result for the old snapshot is dropped
+  // rather than promoted over the newer decision.
+  const current = await cachedQueueDecisions(items.map((item) => item.opportunityKey)).catch(() => null);
+  const superseded = new Set(
+    current
+      ? items
+          .map((item) => item.opportunityKey)
+          .filter((key) => current.get(key) && current.get(key)!.contentHash !== decided.contentHashes.get(key))
+      : [],
+  );
+  if (superseded.size > 0) {
+    const keep = (record: NormalizedOpportunity) => !superseded.has(opportunityKey(record));
+    decided.approved = decided.approved.filter(keep);
+    decided.rejectedRecords = decided.rejectedRecords.filter(keep);
+    decided.held = decided.held.filter((entry) => keep(entry.record));
+  }
+  // Records decided outside the AI path (deterministic approval once documents arrived, or a relevance reject after
+  // a profile change) are closed here; AI-path records were settled by the decision itself.
+  const closed = new Map<string, Record<string, unknown>>();
+  for (const record of decided.approved) {
+    if ((record.rawData as Record<string, unknown> | undefined)?.opportunityDecisionMethod === "deterministic") {
+      closed.set(opportunityKey(record), { kind: "approved", method: "deterministic" });
+    }
+  }
+  for (const record of decided.rejectedRecords) closed.set(opportunityKey(record), { kind: "rejected", code: "structured_relevance_reject" });
+  for (const item of items) {
+    const decision = closed.get(item.opportunityKey);
+    if (decision && !superseded.has(item.opportunityKey)) {
+      await completeItem(item.id, { status: "decided", decision }, decided.contentHashes.get(item.opportunityKey) ?? null).catch(() => undefined);
+    }
+  }
+  console.info(
+    JSON.stringify({
+      event: "rfp_review_queue_drained",
+      claimed: items.length,
+      approved: decided.approved.length,
+      aiApproved: decided.aiApproved,
+      held: decided.reviewHeld,
+      rejected: decided.rejected,
+      review: decided.review,
+    }),
+  );
+  if (decided.diagnostics.length > 0) {
+    console.warn(JSON.stringify({ event: "rfp_review_queue_diagnostics", diagnostics: decided.diagnostics }));
+  }
+  const audited = [
+    ...decided.held.map(({ record, code, reason }) => withStructuredDecision(record, { status: "held", code, reason })),
+    ...decided.rejectedRecords.map((record) =>
+      withStructuredDecision(record, { status: "rejected", code: "structured_relevance_reject", reason: "Canonical relevance decision rejected the record." })),
+  ];
+  recordIngestionProviderTelemetry(options.runId, {
+    provider: "reviewQueue",
+    status: decided.diagnostics.length > 0 ? "warning" : "used",
+    candidates: items.length,
+    accepted: decided.approved.length,
+    spent: decided.review.judgeCalls > 0,
+    note: `Persistent AI review queue: ${decided.review.reviewed} reviewed, ${decided.review.queued} still queued (${decided.review.stopReason ?? "complete"})`,
+  });
+  return {
+    records: [...decided.approved, ...audited],
+    approvedCount: decided.approved.length,
+    errors: decided.review.stopReason === "no_reviewer_configured" ? ["No AI reviewer is configured; queued records stay queued."] : [],
+    diagnostics: {
+      reviewQueueClaimed: items.length,
+      structuredApproved: decided.approved.length,
+      structuredReviewHeld: decided.reviewHeld,
+      structuredReview: decided.review,
+      structuredReviewer: decided.reviewer,
+    },
+  };
+}
+
 export async function fetchOneProvider(
   provider: string,
   options: ProviderRunnerOptions,
 ): Promise<ProviderRunResult> {
+  if (provider === "reviewQueue") {
+    return fetchReviewQueue(options);
+  }
+
   if (provider === "aiDiscovery") {
     const result = await fetchConfiguredAiDiscovery(options);
-    return applyProviderGuards(
+    return directProviderResult(applyProviderGuards(
       provider,
       result.records,
       result.errors,
       options.keywords,
       result.diagnostics,
-    );
+      options.runId,
+    ));
   }
 
   if (provider === "rssAggregator") {
@@ -840,13 +1048,14 @@ export async function fetchOneProvider(
       limit: 100,
       signal: options.signal,
     });
-    return applyProviderGuards(
+    return directProviderResult(applyProviderGuards(
       provider,
       result.records,
       result.errors ?? [],
       options.keywords,
       result.diagnostics,
-    );
+      options.runId,
+    ));
   }
 
   if (isStructuredFederalProvider(provider)) {
@@ -894,13 +1103,14 @@ export async function fetchOneProvider(
       },
       spent: true,
     });
-    return applyProviderGuards(
+    return directProviderResult(applyProviderGuards(
       provider,
       filtered,
       result.errors,
       options.keywords,
       { aiScorers: result.stats.aiScorers },
-    );
+      options.runId,
+    ));
   }
 
   const { providerRegistry } = await import("../providers");
@@ -913,11 +1123,12 @@ export async function fetchOneProvider(
     signal: options.signal,
     onProgress: options.onProgress,
   });
-  return applyProviderGuards(
+  return directProviderResult(applyProviderGuards(
     provider,
     result.records,
     result.errors ?? [],
     options.keywords,
     result.diagnostics,
-  );
+    options.runId,
+  ));
 }

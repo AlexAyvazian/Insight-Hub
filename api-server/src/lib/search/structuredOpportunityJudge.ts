@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { judgmentContentHash } from "../releaseC/identity";
 import type { NormalizedOpportunity } from "../providers/types";
 import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch";
 import { getOccuMedPromptContext, renderPromptContext } from "./occumedPromptContext";
@@ -71,7 +71,6 @@ export const STRUCTURED_JUDGE_PROVIDER_ORDER = JUDGE_PROVIDERS.map(
 const PANEL_SIZE = 3;
 const MIN_PANEL_SIZE = 2;
 const CHUNK_SIZE = 4;
-const DEFAULT_CANDIDATE_LIMIT = 10;
 const PROVIDER_TIMEOUT_MS = 28_000;
 const MAX_DESCRIPTION_CHARS = 12_000;
 const MAX_OUTPUT_TOKENS = 900;
@@ -95,17 +94,12 @@ interface ProviderCooldown {
 const decisionCache = new Map<string, CachedDecision>();
 const providerCooldowns = new Map<string, ProviderCooldown>();
 
+/**
+ * Full-content key: the whole description (not a prefix), buyer, notice type, deadline, set-aside, place, codes,
+ * modification date and the OCCU_MED_AWARE profile version. A change anywhere invalidates the cached judgment.
+ */
 function cacheKey(record: NormalizedOpportunity): string {
-  return createHash("sha256")
-    .update(record.sourceUrl ?? "")
-    .update("\n")
-    .update(record.externalId ?? "")
-    .update("\n")
-    .update(record.title ?? "")
-    .update("\n")
-    .update((record.description ?? "").slice(0, 6_000))
-    .digest("hex")
-    .slice(0, 28);
+  return judgmentContentHash(record, { profileVersion: getRelevanceProfile().version });
 }
 
 function getCached(record: NormalizedOpportunity): StructuredJudgeDecision | null {
@@ -174,13 +168,14 @@ function conciseError(error: unknown): string {
     .slice(0, 240);
 }
 
+/** Optional operator ceiling (STRUCTURED_RFP_JUDGE_CANDIDATE_LIMIT). Unset: every candidate is judged. */
 function configuredCandidateLimit(): number {
   const parsed = Number.parseInt(
     process.env.STRUCTURED_RFP_JUDGE_CANDIDATE_LIMIT ?? "",
     10,
   );
-  if (!Number.isFinite(parsed)) return DEFAULT_CANDIDATE_LIMIT;
-  return Math.max(5, Math.min(30, parsed));
+  if (!Number.isFinite(parsed) || parsed <= 0) return Number.POSITIVE_INFINITY;
+  return parsed;
 }
 
 function chunk<T>(items: T[], size: number): T[][] {
@@ -563,7 +558,7 @@ export async function judgeStructuredOpportunities(
 
   const deterministicRejected = records.length - deterministic.length;
   const limit = configuredCandidateLimit();
-  const selected = deterministic.slice(0, limit).map(({ record }) => record);
+  const selected = (Number.isFinite(limit) ? deterministic.slice(0, limit) : deterministic).map(({ record }) => record);
   const deferred = Math.max(0, deterministic.length - selected.length);
   const approved: NormalizedOpportunity[] = [];
   let panelRejected = 0;
@@ -675,7 +670,8 @@ export async function judgeStructuredOpportunities(
 
   return {
     approved,
-    rejected: deterministicRejected + panelRejected + unjudged + deferred,
+    // Unjudged and deferred records are not rejections; they are reported separately.
+    rejected: deterministicRejected + panelRejected,
     deterministicRejected,
     panelRejected,
     unjudged,

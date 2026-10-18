@@ -6,7 +6,7 @@
     "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
     "build:prod": "pnpm --filter @workspace/api-server run build && pnpm --filter @workspace/intel-suite run build",
-    "start:prod": "NODE_ENV=production DATABASE_POOL_MAX=1 PUBLIC_PORTAL_CONCURRENCY=1 PUBLIC_PORTAL_ROTATION_BATCH_SIZE=3 WEB_INTELLIGENCE_AI_CANDIDATE_LIMIT=20 STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT=3 MALLOC_ARENA_MAX=2 UV_THREADPOOL_SIZE=2 node --max-old-space-size=224 --max-semi-space-size=8 ./api-server/dist/index.mjs",
+    "start:prod": "NODE_ENV=production DATABASE_POOL_MAX=1 PUBLIC_PORTAL_CONCURRENCY=1 PUBLIC_PORTAL_ROTATION_BATCH_SIZE=3 WEB_INTELLIGENCE_AI_CANDIDATE_LIMIT=20 MALLOC_ARENA_MAX=2 UV_THREADPOOL_SIZE=2 node --max-old-space-size=224 --max-semi-space-size=8 ./api-server/dist/index.mjs",
     "db:push": "pnpm --filter @workspace/db run push",
     "db:push:intel": "pnpm --filter @workspace/db run push:intel",
     "db:verify-silo": "pnpm --filter @workspace/scripts run verify:database-silo",

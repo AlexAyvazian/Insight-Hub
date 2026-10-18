@@ -48,8 +48,33 @@ services:
         value: "3"
       - key: WEB_INTELLIGENCE_AI_CANDIDATE_LIMIT
         value: "20"
-      - key: STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT
-        value: "3"
+      # Release C: the structured AI review is adaptive (free capacity, rate limits, time budget) and backed by a
+      # persistent queue, so there is no fixed per-run ceiling. STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT is an optional
+      # operator override only and is intentionally unset.
+      - key: STRUCTURED_RFP_REVIEW_TIME_BUDGET_MS
+        value: "35000"
+      - key: OPPORTUNITY_REVIEW_QUEUE_ENABLED
+        value: "true"
+      - key: OPPORTUNITY_REQUIREMENT_LEDGER_ENABLED
+        value: "true"
+      - key: OPPORTUNITY_COVERAGE_TRACKING_ENABLED
+        value: "true"
+      # Document pipeline: staged activation (off until enabled on the service after deploy).
+      - key: OPPORTUNITY_DOCUMENT_PIPELINE_ENABLED
+        value: "false"
+      - key: OPPORTUNITY_REQUIRE_DOCUMENT_EVIDENCE
+        value: "false"
+      - key: DOCUMENT_EXTRACTION_WORKER_MODE
+        value: "off"
+      # Free-tier document extraction accounts (two LLMWhisperer accounts, Nutrient fallback). Never on a paid plan.
+      - key: LLMWHISPERER_API_KEY
+        sync: false
+      - key: LLMWHISPERER_API_KEY_2
+        sync: false
+      - key: NUTRIENT_API_KEY
+        sync: false
+      - key: LINKUP_API_KEY_2
+        sync: false
       - key: SAM_GOV_API_KEY
         sync: false
       - key: SAM_GOV_API_KEY_2

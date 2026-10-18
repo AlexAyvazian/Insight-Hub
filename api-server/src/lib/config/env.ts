@@ -44,6 +44,12 @@ export const env = {
   EXA_API_KEY_3: process.env.EXA_API_KEY_3,
   PARALLEL_API_KEY: process.env.PARALLEL_API_KEY,
   LINKUP_API_KEY: process.env.LINKUP_API_KEY,
+  LINKUP_API_KEY_2: process.env.LINKUP_API_KEY_2,
+
+  // Document extraction (Release C): free-tier accounts only, hard-capped below the free allowance
+  LLMWHISPERER_API_KEY: process.env.LLMWHISPERER_API_KEY,
+  LLMWHISPERER_API_KEY_2: process.env.LLMWHISPERER_API_KEY_2,
+  NUTRIENT_API_KEY: process.env.NUTRIENT_API_KEY,
   YOU_API_KEY: process.env.YOU_API_KEY,
   YOU_API_KEY_2: process.env.YOU_API_KEY_2,
   LANGSEARCH_API_KEY: process.env.LANGSEARCH_API_KEY,

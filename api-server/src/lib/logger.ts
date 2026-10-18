@@ -1,4 +1,5 @@
 import pino from "pino";
+import { redactSensitiveText } from "./security/logRedaction";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -9,6 +10,10 @@ export const logger = pino({
     "req.headers.cookie",
     "res.headers['set-cookie']",
   ],
+  hooks: {
+    // Redacts the final serialized line, so nested fields and serialized errors are covered too.
+    streamWrite: (line) => redactSensitiveText(line),
+  },
   ...(isProduction
     ? {}
     : {

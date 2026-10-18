@@ -83,15 +83,17 @@ test("incidental medical wording in unrelated procurements is not actionable", (
   );
 });
 
-test("structured AI review stays within a small trial-key budget", () => {
+test("structured AI review is adaptive by default; the env value is only an optional ceiling", () => {
   const original = process.env.STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT;
   try {
     delete process.env.STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT;
-    assert.equal(structuredReviewCandidateLimit(), 3);
+    assert.equal(structuredReviewCandidateLimit(), null, "no fixed 3/5 ceiling");
     process.env.STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT = "99";
-    assert.equal(structuredReviewCandidateLimit(), 5);
+    assert.equal(structuredReviewCandidateLimit(), 99, "no hidden maximum of 5");
     process.env.STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT = "0";
     assert.equal(structuredReviewCandidateLimit(), 0);
+    process.env.STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT = "nonsense";
+    assert.equal(structuredReviewCandidateLimit(), null);
   } finally {
     if (original === undefined) {
       delete process.env.STRUCTURED_RFP_REVIEW_CANDIDATE_LIMIT;

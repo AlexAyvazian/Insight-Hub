@@ -102,6 +102,14 @@ export function isOfficialSamOpportunityUrl(value?: string): boolean {
   }
 }
 
+export interface SamQueryCoverage {
+  query: string;
+  family: string;
+  returned: number;
+  truncated: boolean;
+  error?: string;
+}
+
 export class SamGovProvider implements DataSourceProvider {
   readonly name = "samGov" as const;
 
@@ -364,10 +372,12 @@ export class SamGovProvider implements DataSourceProvider {
     records: NormalizedOpportunity[];
     errors: string[];
     attempted: number;
+    queryResults: SamQueryCoverage[];
   }> {
     const records: NormalizedOpportunity[] = [];
     const seen = new Set<string>();
     const errors: string[] = [];
+    const queryResults: SamQueryCoverage[] = [];
     let attempted = 0;
 
     for (let index = 0; index < queries.length; index += SAM_GOV_CLASSIFICATION_CONCURRENCY) {
@@ -397,9 +407,16 @@ export class SamGovProvider implements DataSourceProvider {
         if (result.status === "fulfilled") {
           providerCapacityExhausted = false;
           SamGovProvider.addUnique(records, seen, result.value);
+          queryResults.push({
+            query: `${query.parameter}:${query.code}`,
+            family: query.title,
+            returned: result.value.length,
+            truncated: result.value.length >= SAM_GOV_MAX_RESULTS_PER_CLASSIFICATION,
+          });
           continue;
         }
         const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        queryResults.push({ query: `${query.parameter}:${query.code}`, family: query.title, returned: 0, truncated: false, error: message.slice(0, 200) });
         errors.push(`SAM.gov ${query.parameter}=${query.code} (${query.title}) failed: ${message}`);
         if (!/credential pool exhausted|quota|rate.?limit|throttl/i.test(message)) {
           providerCapacityExhausted = false;
@@ -411,7 +428,7 @@ export class SamGovProvider implements DataSourceProvider {
       if (providerCapacityExhausted) break;
     }
 
-    return { records, errors, attempted };
+    return { records, errors, attempted, queryResults };
   }
 
   async fetch(options: FetchOptions): Promise<ProviderFetchResult> {
@@ -430,6 +447,7 @@ export class SamGovProvider implements DataSourceProvider {
     const allClassificationQueries = await this.withProfileCodes(buildSamGovClassificationQueries());
     const classificationQueries = this.classificationQueriesForRun(allClassificationQueries);
     const titleErrors: string[] = [];
+    const titleCoverage: SamQueryCoverage[] = [];
     let samCapacityExhausted = false;
 
     for (const title of titleQueries) {
@@ -447,8 +465,10 @@ export class SamGovProvider implements DataSourceProvider {
           ),
         );
         SamGovProvider.addUnique(normalized, seen, matches);
+        titleCoverage.push({ query: `title:${title}`, family: title, returned: matches.length, truncated: matches.length >= limit });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        titleCoverage.push({ query: `title:${title}`, family: title, returned: 0, truncated: false, error: message.slice(0, 200) });
         titleErrors.push(`SAM.gov title="${title}" failed: ${message}`);
         if (/credential pool exhausted|credential pool cooling down|quota|rate.?limit|throttl/i.test(message)) {
           samCapacityExhausted = true;
@@ -458,7 +478,7 @@ export class SamGovProvider implements DataSourceProvider {
     }
 
     const classified = samCapacityExhausted
-      ? { records: [], errors: [], attempted: 0 }
+      ? { records: [], errors: [], attempted: 0, queryResults: [] as SamQueryCoverage[] }
       : await this.runClassificationQueries(
       classificationQueries,
       baseUrl,
@@ -485,6 +505,9 @@ export class SamGovProvider implements DataSourceProvider {
       scheduledClassificationCodes: classificationQueries.map(
         (query) => `${query.parameter}:${query.code}`,
       ),
+      // Release C coverage: per-query results (a full page may mean more results exist beyond this page).
+      queryResults: [...titleCoverage, ...classified.queryResults],
+      classificationQueriesSkippedForCapacity: samCapacityExhausted ? classificationQueries.length : 0,
     };
 
     if (normalized.length === 0) {
