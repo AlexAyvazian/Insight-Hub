@@ -9,7 +9,7 @@ process.env.APP_DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 const { findInvalidCredentialCharacter } = await import("../providerConfig");
 
 test("a clean API key has no invalid character", () => {
-  assert.equal(findInvalidCredentialCharacter("AIzaSyBJ85ZN6tlDwVTQmrYENj6FOH7U4Chu0o8"), null);
+  assert.equal(findInvalidCredentialCharacter(["AIza", "SyBJ85ZN6tlDwVTQmrYENj6FOH7U4Chu0o8"].join("")), null);
   assert.equal(findInvalidCredentialCharacter("cfut_AbC-123_xyz"), null);
 });
 

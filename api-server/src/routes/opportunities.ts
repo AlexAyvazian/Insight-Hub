@@ -13,6 +13,7 @@ import { decideRelevanceWithCodes } from "../lib/search/relevanceDecision";
 import { getRelevanceProfile } from "../lib/search/relevanceProfile";
 import { matchedServiceLines } from "../lib/search/profileServiceLines";
 import { classifyTestingTypes } from "../lib/search/testingTypes";
+import { hasPrimaryOccuMedServiceEvidence } from "../lib/opportunityScopeEvidence";
 import { judgeScopeBlock, profileServiceLabels } from "../lib/search/profileText";
 import { semanticRerank, isSemanticRerankEnabled } from "../lib/search/semanticRerank";
 import {
@@ -144,7 +145,12 @@ function buildRelevanceView(opp: any) {
 
   const tags = parseTags(opp.tags);
   const storedScore = opp.relevanceScore != null ? parseFloat(opp.relevanceScore) : NaN;
-  const score = Number.isFinite(storedScore) ? Math.round(storedScore) : cls.score;
+  const primaryScopeEvidenced = hasPrimaryOccuMedServiceEvidence(
+    String(opp.title ?? ""), String(opp.description ?? ""),
+  );
+  // Persisted scores are historical rankings, not proof of purchased-scope fit.
+  const rawScore = Number.isFinite(storedScore) ? Math.round(storedScore) : cls.score;
+  const score = primaryScopeEvidenced ? rawScore : Math.min(rawScore, 49);
 
   const notesText = typeof opp.notes === "string" ? opp.notes : "";
   const whyMatch = notesText.match(/\[why:\s*([^\]]+?)(?:\s*\|\s*via:\s*([\w-]+))?\s*\]/);
@@ -175,7 +181,10 @@ function buildRelevanceView(opp: any) {
   if (feedbackAdj >= 5) feedbackReasons.push("Matches your feedback preferences");
   else if (feedbackAdj <= -5) feedbackReasons.push("Down-ranked by your feedback");
 
-  const reasons = [...feedbackReasons, ...baseReasons].slice(0, 4);
+  const reasons = [
+    ...(!primaryScopeEvidenced ? ["Specific purchased-scope evidence is missing; review the solicitation."] : []),
+    ...feedbackReasons, ...baseReasons,
+  ].slice(0, 4);
 
   const dateUnknown = tags.includes("date-unknown");
   const stale = tags.includes("stale") || cls.stale;

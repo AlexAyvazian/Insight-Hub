@@ -58,7 +58,7 @@ function normalize(value: string | null | undefined): string {
 function prepareTerms(terms: string[]): string[] {
   return Array.from(
     new Set(
-      terms.map((t) => normalize(t).trimEnd()).filter((t) => t.trim().length > 0),
+      terms.map((t) => normalize(t).trim()).filter((t) => t.length > 0),
     ),
   );
 }
@@ -120,8 +120,10 @@ function scoreTerms(
   let count = 0;
   let weighted = 0;
   for (const term of terms) {
-    const inTitle = title.includes(term);
-    if (!inTitle && !body.includes(term)) continue;
+    // Require complete token boundaries, not prefixes inside unrelated words.
+    const bounded = ` ${term} `;
+    const inTitle = title.includes(bounded);
+    if (!inTitle && !body.includes(bounded)) continue;
     count += 1;
     const specificity = 1 / (frequency.get(term) ?? 1);
     weighted += weight * specificity * (inTitle ? TITLE_MULTIPLIER : 1);

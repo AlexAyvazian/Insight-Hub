@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { classifyResult } from "./search/relevance";
+import { hasPrimaryOccuMedServiceEvidence } from "./opportunityScopeEvidence";
 import { decideRelevance } from "./search/relevanceDecision";
 import { isServiceNameNotBuyer } from "./search/profileServiceName";
 
@@ -291,9 +292,13 @@ export function classifyOpportunityQuality(
     deadlineInFuture: hasFutureDeadline,
     allowHistorical: true,
   });
+  const purchasedScopeEvidenced = hasPrimaryOccuMedServiceEvidence(
+    String(opp.title ?? ""), String(opp.description ?? ""),
+  );
   const relevanceEligible =
     decideRelevance(relevance).verdict === "accept" &&
-    relevance.confidence !== "possible_adjacent";
+    relevance.confidence !== "possible_adjacent" &&
+    purchasedScopeEvidenced;
   const structuredDirectEvidence =
     normalizedEvidenceVerified || completeStoredDirectEvidence;
   const reasons: string[] = [];
@@ -336,10 +341,10 @@ export function classifyOpportunityQuality(
     reasons.push(
       "The notice is early-stage market research or not yet a bid-ready solicitation.",
     );
-  if (!relevanceEligible)
-    reasons.push(
-      "The record does not have a strong current match to Occu-Med service lines.",
-    );
+  if (!purchasedScopeEvidenced)
+    reasons.push("Specific purchased-scope evidence is unconfirmed; retained for review.");
+  else if (!relevanceEligible)
+    reasons.push("The record does not have a strong current match to Occu-Med service lines.");
   if (classification === "award")
     reasons.push(
       "The record appears to be an award, purchase order, tabulation, or contract document.",
@@ -368,7 +373,7 @@ export function classifyOpportunityQuality(
     solicitationLike,
     bidReadyNotice,
     relevanceEligible,
-    relevanceScore: relevance.score,
+    relevanceScore: purchasedScopeEvidenced ? relevance.score : Math.min(relevance.score, 49),
     sourceVerified,
     sourceAuthority: sourceVerified ? "trusted" : aggregator ? "medium" : "low",
     evidenceFingerprint: createHash("sha256")
