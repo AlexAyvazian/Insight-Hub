@@ -15,7 +15,7 @@ import type { NormalizedOpportunity } from "../providers/types";
 import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch";
 import type { RelevanceResult } from "../search/relevance";
 import { decideRelevance, type RelevanceVerdict } from "../search/relevanceDecision";
-import { discoverAttachments } from "../documents/attachments";
+import { discoverAttachments, hasAuthoritativeAttachmentList } from "../documents/attachments";
 import { documentsFor, registerAttachments, sectionsFor, type StoredDocument } from "../documents/store";
 import { countInjectionSignals } from "../security/untrustedContent";
 import type { ReleaseCFlags } from "./flags";
@@ -61,7 +61,7 @@ export async function loadDocumentContext(
 ): Promise<DocumentContext> {
   if (!flags.documentPipeline) return EMPTY;
   try {
-    await registerAttachments(opportunityKey, discoverAttachments(record), priority);
+    await registerAttachments(opportunityKey, discoverAttachments(record), priority, { authoritative: hasAuthoritativeAttachmentList(record) });
     const [documents, sections] = await Promise.all([documentsFor(opportunityKey), sectionsFor(opportunityKey)]);
     const excerpt = evidenceExcerpts(sections, DOCUMENT_EVIDENCE_CHARS);
     const hashes = documents.map((d) => d.sha256).filter((h): h is string => Boolean(h));

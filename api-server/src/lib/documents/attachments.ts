@@ -62,6 +62,14 @@ function absoluteUrl(url: string | undefined | null, base: string | null): strin
   }
 }
 
+const ATTACHMENT_LIST_KEYS = ["resourceLinks", "attachments", "documents", "files", "bidDocuments", "solicitationDocuments"];
+
+/** True when the record carries an explicit attachment list, so attachments missing from it were withdrawn. */
+export function hasAuthoritativeAttachmentList(record: NormalizedOpportunity): boolean {
+  const raw = (record.rawData ?? {}) as Record<string, unknown>;
+  return ATTACHMENT_LIST_KEYS.some((key) => Array.isArray(raw[key]));
+}
+
 export function discoverAttachments(record: NormalizedOpportunity): AttachmentRef[] {
   const base = record.sourceUrl && /^https?:\/\//i.test(record.sourceUrl) ? record.sourceUrl : null;
   const out: AttachmentRef[] = [];

@@ -53,14 +53,32 @@ function toDocument(row: Record<string, unknown>): StoredDocument {
   };
 }
 
-/** Registers attachments for an opportunity (idempotent per URL) and queues one extraction job per new document. */
+/** superseded_by marker for a document the latest notice no longer lists (kept for audit, not used as evidence). */
+export const WITHDRAWN = "withdrawn";
+
+/**
+ * Registers attachments for an opportunity (idempotent per URL) and queues one extraction job per new document.
+ * When the record's attachment list is authoritative (it carries an explicit list, possibly empty), current
+ * documents whose URL the latest notice no longer lists are retired, so withdrawn attachments stop counting as
+ * evidence. A record without an attachment list never retires anything.
+ */
 export async function registerAttachments(
   opportunityKey: string,
   attachments: AttachmentRef[],
   priority: number,
-): Promise<{ registered: number; queued: number }> {
-  if (attachments.length === 0) return { registered: 0, queued: 0 };
+  options: { authoritative?: boolean } = {},
+): Promise<{ registered: number; queued: number; withdrawn: number }> {
+  if (attachments.length === 0 && !options.authoritative) return { registered: 0, queued: 0, withdrawn: 0 };
   await ensureReleaseCSchema();
+  let withdrawn = 0;
+  if (options.authoritative) {
+    const retired = await (await rcPool()).query(
+      `UPDATE opportunity_documents SET superseded_by = $3, updated_at = now()
+        WHERE opportunity_key = $1 AND superseded_by IS NULL AND NOT (source_url = ANY($2::text[]))`,
+      [opportunityKey, attachments.map((a) => a.url), WITHDRAWN],
+    );
+    withdrawn = retired.rowCount ?? 0;
+  }
   let registered = 0;
   let queued = 0;
   for (const attachment of attachments) {
@@ -69,6 +87,17 @@ export async function registerAttachments(
       [opportunityKey, attachment.url],
     );
     let documentId = existing.rows[0]?.id as string | undefined;
+    if (!documentId) {
+      // An attachment that was withdrawn and is listed again is restored rather than duplicated.
+      const restored = await (await rcPool()).query(
+        `UPDATE opportunity_documents SET superseded_by = NULL, updated_at = now()
+          WHERE id = (SELECT id FROM opportunity_documents WHERE opportunity_key = $1 AND source_url = $2 AND superseded_by = $3
+                      ORDER BY first_seen_at DESC LIMIT 1)
+          RETURNING id`,
+        [opportunityKey, attachment.url, WITHDRAWN],
+      );
+      documentId = restored.rows[0]?.id as string | undefined;
+    }
     if (!documentId) {
       documentId = randomUUID();
       await (await rcPool()).query(
@@ -94,7 +123,7 @@ export async function registerAttachments(
     );
     if (job.rows[0]?.inserted) queued += 1;
   }
-  return { registered, queued };
+  return { registered, queued, withdrawn };
 }
 
 export interface ClaimedJob {

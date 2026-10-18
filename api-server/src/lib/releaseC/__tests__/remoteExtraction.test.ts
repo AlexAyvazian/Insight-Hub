@@ -114,3 +114,28 @@ describe("document versions", () => {
     assert.equal(current[0]!.id, a.documentId);
   });
 });
+
+describe("withdrawn attachments", () => {
+  it("retires documents an authoritative notice no longer lists and restores them when relisted", async () => {
+    const { registerAttachments, documentsFor } = await import("../../documents/store");
+    const key = `rc-withdraw-${Date.now()}`;
+    const ref = (url: string) => ({ url, title: null, role: "attachment" as const, sourceVersion: null, amendedAt: null });
+    const sow = "https://example.gov/files/sow.pdf";
+    const pws = "https://example.gov/files/pws.pdf";
+    await registerAttachments(key, [ref(sow), ref(pws)], 1, { authoritative: true });
+    assert.equal((await documentsFor(key)).length, 2);
+
+    // A record without an explicit attachment list says nothing about withdrawals.
+    await registerAttachments(key, [], 1);
+    assert.equal((await documentsFor(key)).length, 2);
+
+    // The amended notice lists no attachments at all.
+    const result = await registerAttachments(key, [], 1, { authoritative: true });
+    assert.equal(result.withdrawn, 2);
+    assert.equal((await documentsFor(key)).length, 0);
+
+    await registerAttachments(key, [ref(sow)], 1, { authoritative: true });
+    const current = await documentsFor(key);
+    assert.deepEqual(current.map((d) => d.sourceUrl), [sow], "the relisted attachment is restored, not duplicated");
+  });
+});
