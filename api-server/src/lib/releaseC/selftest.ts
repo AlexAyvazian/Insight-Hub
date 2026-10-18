@@ -171,12 +171,14 @@ async function execute(run: SelftestRun, base: string): Promise<void> {
       `SELECT count(*)::int AS n FROM opportunity_audit_log WHERE opportunity_key = $1 AND event = 'document_version_changed'`,
       [keyA],
     );
-    const superseded = second.docs.some((d) => d.id === first.doc.id && d.supersededBy === second.doc.id);
+    // documentsFor lists only current documents, so the old version's marker is read directly.
+    const previous = await (await rcPool()).query(`SELECT superseded_by FROM opportunity_documents WHERE id = $1`, [first.doc.id]);
+    const superseded = previous.rows[0]?.superseded_by === second.doc.id;
     const ok = superseded && /Amendment 1/.test(text) && Number(audit.rows[0]?.n ?? 0) >= 1;
     return {
       ok,
       detail: ok ? "old version superseded, amended text stored, version change audited" : `superseded ${superseded}; amended text ${/Amendment 1/.test(text)}`,
-      evidence: { previousDocument: first.doc.id, currentDocument: second.doc.id, auditEvents: audit.rows[0]?.n ?? 0 },
+      evidence: { previousDocument: first.doc.id, previousSupersededBy: previous.rows[0]?.superseded_by ?? null, currentDocument: second.doc.id, auditEvents: audit.rows[0]?.n ?? 0 },
     };
   });
 
