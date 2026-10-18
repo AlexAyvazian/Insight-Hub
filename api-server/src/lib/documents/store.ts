@@ -22,6 +22,7 @@ export interface StoredDocument {
   pageCount: number | null;
   extractedPageCount: number | null;
   extractionProvider: string | null;
+  extractionMethod: string | null;
   supersededBy: string | null;
 }
 
@@ -49,6 +50,7 @@ function toDocument(row: Record<string, unknown>): StoredDocument {
     pageCount: row.page_count == null ? null : Number(row.page_count),
     extractedPageCount: row.extracted_page_count == null ? null : Number(row.extracted_page_count),
     extractionProvider: (row.extraction_provider as string | null) ?? null,
+    extractionMethod: (row.extraction_method as string | null) ?? null,
     supersededBy: (row.superseded_by as string | null) ?? null,
   };
 }

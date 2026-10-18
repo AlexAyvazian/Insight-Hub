@@ -13,7 +13,7 @@ import { ProviderQuotaError, sharedAccountLedger } from "../providers/accountLed
 import { safeFetch, UnsafeUrlError } from "../security/safeUrl";
 import { needsSamApiKey } from "./attachments";
 import { htmlToText, parseDocumentNatively } from "./parsers";
-import { AcceptedJobError, extractionCredentialPools, extractRemotely, llmWhispererPolicy } from "./remoteExtractors";
+import { acceptedJobError, CAPPED_METHOD_SUFFIX, extractionCredentialPools, extractRemotely, llmWhispererPolicy, PENDING_WHISPER_TTL_MS } from "./remoteExtractors";
 import { buildSections } from "./sections";
 import {
   claimNextJob,
@@ -156,8 +156,10 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
   };
 
   // Only fully extracted content takes the unchanged fast path: a partial document (OCR deferred for quota or an
-  // accepted job still running) must be processed again so its missing pages are collected.
-  if (doc.sha256 === sha && doc.extractionStatus === "extracted") {
+  // accepted job still running) must be processed again so its missing pages are collected. The exception is a
+  // document cut off at the unknown-length page cap: re-running it would only pay again for the same pages.
+  const cappedPartial = doc.extractionStatus === "partial" && Boolean(doc.extractionMethod?.endsWith(CAPPED_METHOD_SUFFIX));
+  if (doc.sha256 === sha && (doc.extractionStatus === "extracted" || cappedPartial)) {
     await updateDocument(doc.id, base);
     await finishJob(job.jobId, "done", null);
     return { jobId: job.jobId, status: "done", detail: "unchanged", changed: false };
@@ -200,7 +202,8 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
   let provider: string | null = null;
   let account: string | null = null;
   let quotaWait = false;
-  let resumeAccepted = false;
+  let acceptedAt: number | null = null;
+  let capped = false;
   const needOcr = parsed.pages.filter((page) => page.needsOcr).map((page) => page.page);
   const remoteEligible = parsed.format === "pdf" || parsed.format === "image" || parsed.format === "legacy_office" || parsed.format === "unsupported";
   if (remoteEligible && (needOcr.length > 0 || parsed.pages.length === 0)) {
@@ -215,6 +218,8 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
       });
       provider = remote.provider;
       account = remote.account;
+      capped = Boolean(remote.capped);
+      if (capped) parsed.warnings.push("page cap reached for a document of unknown length; later pages were not extracted");
       const byPage = new Map(remote.pages.map((page) => [page.page, page]));
       // Non-PDF formats only have a placeholder page natively, so every remote page is kept.
       pages = parsed.format === "pdf" && parsed.pages.length
@@ -222,7 +227,7 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
         : remote.pages;
     } catch (error) {
       quotaWait = error instanceof ProviderQuotaError;
-      resumeAccepted = error instanceof AcceptedJobError;
+      acceptedAt = acceptedJobError(error)?.submittedAt ?? null;
       parsed.warnings.push(`remote extraction unavailable: ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);
     }
   }
@@ -231,20 +236,22 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
   await replaceSections(documentId, job.opportunityKey, sections);
   const extractedPages = pages.filter((page) => !page.needsOcr && page.text.trim()).length;
   const totalPages = Math.max(parsed.pageCount, pages.length);
-  const complete = totalPages > 0 && extractedPages >= totalPages;
+  // A capped unknown-length document is never complete: nothing shows that its last page was reached.
+  const complete = !capped && totalPages > 0 && extractedPages >= totalPages;
   const status = complete ? "extracted" : extractedPages > 0 ? "partial" : quotaWait ? "quota_wait" : parsed.format === "unsupported" ? "unsupported" : "failed";
   await updateDocument(documentId, {
     page_count: totalPages || null,
     extracted_page_count: extractedPages,
     extraction_status: status,
-    extraction_method: provider ? `${parsed.method}+${provider}` : parsed.method,
+    extraction_method: provider ? `${parsed.method}+${provider}${capped ? CAPPED_METHOD_SUFFIX : ""}` : parsed.method,
     extraction_provider: provider,
     extraction_account: account,
     extraction_quality: parsed.warnings.length ? parsed.warnings.join(" | ").slice(0, 500) : "ok",
   });
 
-  if (!complete && resumeAccepted && job.attempts < MAX_ATTEMPTS + 10) {
-    // A remote job was accepted and charged; come back to collect it instead of resubmitting elsewhere.
+  if (!complete && acceptedAt !== null && Date.now() - acceptedAt < PENDING_WHISPER_TTL_MS) {
+    // A remote job was accepted and charged; come back to collect it until its result expires, instead of
+    // resubmitting elsewhere. The retention window, not the attempt count, bounds these retries.
     await finishJob(job.jobId, "queued", "waiting for accepted remote extraction", new Date(Date.now() + 10 * 60_000));
     return { jobId: job.jobId, status: "queued", detail: `${extractedPages}/${totalPages} pages; remote job pending`, changed: false };
   }

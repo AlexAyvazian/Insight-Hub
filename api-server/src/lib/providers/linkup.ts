@@ -43,10 +43,12 @@ export async function linkupBalance(apiKey: string, signal?: AbortSignal): Promi
   }
   if (!response.ok) throw new Error(`Linkup balance error ${response.status}`);
   const json = (await response.json()) as { balance?: number };
-  const balance = Number(json.balance);
+  const balance = typeof json.balance === "number" ? json.balance : Number.NaN;
+  // A response without a usable balance is a failed probe, never an account with unknown (unbounded) capacity.
+  if (!Number.isFinite(balance)) throw new Error("Linkup balance response had no numeric balance");
   return {
     // Keep a one-call reserve so a nearly empty account is not driven into a 429.
-    remaining: Number.isFinite(balance) ? Math.max(0, balance - LINKUP_FAST_SEARCH_COST_USD) : null,
+    remaining: Math.max(0, balance - LINKUP_FAST_SEARCH_COST_USD),
     source: "linkup:/v1/credits/balance",
   };
 }

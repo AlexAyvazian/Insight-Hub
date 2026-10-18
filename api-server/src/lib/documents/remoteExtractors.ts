@@ -27,6 +27,8 @@ export interface RemoteExtraction {
   account: string;
   pages: ExtractedPage[];
   unitsUsed: number;
+  /** The page cap for an unknown-length document was reached, so pages beyond it may be missing. */
+  capped?: boolean;
 }
 
 export interface RemoteExtractionRequest {
@@ -169,10 +171,20 @@ async function sleep(ms: number, signal?: AbortSignal) {
 export class AcceptedJobError extends Error {
   readonly credentialRetryable = false;
   readonly accountHealthy = true;
-  constructor(message: string) {
+  /** When the remote job was accepted; its result can be collected until PENDING_WHISPER_TTL_MS after this. */
+  readonly submittedAt: number;
+  constructor(message: string, submittedAt: number = Date.now()) {
     super(message);
     this.name = "AcceptedJobError";
+    this.submittedAt = submittedAt;
   }
+}
+
+/** The AcceptedJobError behind an error, whether thrown directly or wrapped as a cause. */
+export function acceptedJobError(error: unknown): AcceptedJobError | null {
+  if (error instanceof AcceptedJobError) return error;
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  return cause instanceof AcceptedJobError ? cause : null;
 }
 
 interface PendingWhisperJob {
@@ -182,7 +194,7 @@ interface PendingWhisperJob {
 }
 
 // LLMWhisperer keeps processed results for a limited time; after this an accepted job is treated as lost.
-const PENDING_WHISPER_TTL_MS = 6 * 60 * 60_000;
+export const PENDING_WHISPER_TTL_MS = 6 * 60 * 60_000;
 const pendingWhisperJobs = new Map<string, PendingWhisperJob>();
 
 function whisperJobKey(request: RemoteExtractionRequest): string {
@@ -247,6 +259,8 @@ async function deletePendingWhisperJob(jobKey: string): Promise<void> {
  * submission is capped with pages_to_extract, so a long document can never be charged beyond the planned pages.
  */
 export const UNKNOWN_PAGE_COUNT_CAP = 20;
+/** extraction_method suffix for a document cut off at UNKNOWN_PAGE_COUNT_CAP (kept partial, not re-run unchanged). */
+export const CAPPED_METHOD_SUFFIX = "+capped";
 
 export function whisperPlannedPages(request: Pick<RemoteExtractionRequest, "pages" | "pageCount">): { pages: number; spec: string | null } {
   if (request.pages?.length) return { pages: new Set(request.pages).size, spec: pageSpec(request.pages) };
@@ -266,6 +280,7 @@ export async function extractWithLlmWhisperer(request: RemoteExtractionRequest):
 
   const operation = async (apiKey: string, slot: string, context: CredentialRunContext): Promise<RemoteExtraction> => {
     let hash = pending?.hash;
+    let submittedAt = pending?.submittedAt ?? Date.now();
     if (!hash) {
       const url = new URL(`${WHISPER_BASE}/whisper`);
       url.searchParams.set("mode", request.scanned ? "high_quality" : "native_text");
@@ -283,7 +298,8 @@ export async function extractWithLlmWhisperer(request: RemoteExtractionRequest):
       if (submit.status !== 202 && !submit.ok) quotaFromResponse("LLMWhisperer", submit, submitBody);
       hash = (JSON.parse(submitBody) as { whisper_hash?: string }).whisper_hash;
       if (!hash) throw new Error("LLMWhisperer returned no whisper_hash");
-      await savePendingWhisperJob(jobKey, { slot, hash, submittedAt: Date.now() }, plannedPages);
+      submittedAt = Date.now();
+      await savePendingWhisperJob(jobKey, { slot, hash, submittedAt }, plannedPages);
       // The accepted job is charged whether or not the result is retrieved, so it is counted now.
       context.reportUsage(plannedPages);
     }
@@ -330,10 +346,12 @@ export async function extractWithLlmWhisperer(request: RemoteExtractionRequest):
       // Usage was counted at submission (only on a fresh submit); record any extra pages beyond the plan.
       const used = Math.max(1, pages.length);
       context.reportUsage(pending ? 0 : Math.max(0, used - plannedPages), quality);
-      return { provider: "llmwhisperer" as const, account: slot, pages, unitsUsed: used };
+      // With an unknown length, reaching the cap means the document may continue beyond the extracted pages.
+      const capped = !request.pages?.length && !(request.pageCount && request.pageCount > 0) && chunks.length >= UNKNOWN_PAGE_COUNT_CAP;
+      return { provider: "llmwhisperer" as const, account: slot, pages, unitsUsed: used, capped };
     } catch (error) {
       // After acceptance, never let the pool or the Nutrient fallback resubmit the same document.
-      throw new AcceptedJobError(`LLMWhisperer job ${hash.slice(0, 12)} not completed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new AcceptedJobError(`LLMWhisperer job ${hash.slice(0, 12)} not completed: ${error instanceof Error ? error.message : String(error)}`, submittedAt);
     }
   };
 
@@ -399,7 +417,7 @@ export async function extractRemotely(request: RemoteExtractionRequest): Promise
     try {
       return await extractWithLlmWhisperer(request);
     } catch (error) {
-      if (error instanceof AcceptedJobError || (error as { cause?: unknown })?.cause instanceof AcceptedJobError) throw error;
+      if (acceptedJobError(error)) throw error;
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }

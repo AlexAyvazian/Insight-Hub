@@ -10,6 +10,7 @@ import { UNKNOWN_PAGE_COUNT_CAP, nutrientPlannedCredits, whisperPlannedPages } f
 import { withSamKey } from "../../documents/worker";
 import { parseDocx } from "../../documents/parsers";
 import { FreeTierCredentialPool } from "../../providers/freeTierCredentialPool";
+import { linkupBalance } from "../../providers/linkup";
 
 const policy: AccountPolicy = {
   pool: "test-pool",
@@ -105,5 +106,23 @@ describe("required capacity probes", () => {
     );
     assert.equal(called, false, "no billable call after a failed required probe");
     delete process.env.RC_PROBE_KEY_1;
+  });
+});
+
+describe("Linkup balance probe", () => {
+  it("fails the probe when the balance is missing or not a number", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      for (const body of [{}, { balance: null }, { balance: "lots" }]) {
+        globalThis.fetch = (async () => Response.json(body)) as typeof fetch;
+        await assert.rejects(linkupBalance("linkup-key-000000000"), /no numeric balance/, JSON.stringify(body));
+      }
+      globalThis.fetch = (async () => Response.json({ balance: 4.5 })) as typeof fetch;
+      const snapshot = await linkupBalance("linkup-key-000000000");
+      const remaining = snapshot.remaining ?? 0;
+      assert.ok(remaining > 0 && remaining < 4.5, String(snapshot.remaining));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });

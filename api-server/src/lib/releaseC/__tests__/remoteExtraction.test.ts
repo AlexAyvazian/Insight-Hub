@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { AccountLedger, MemoryLedgerStore, setSharedAccountLedgerForTests } from "../../providers/accountLedger";
 import { clearFreeTierCredentialPoolState } from "../../providers/freeTierCredentialPool";
-import { AcceptedJobError, clearPendingWhisperJobs, extractRemotely, nutrientPlannedCredits } from "../../documents/remoteExtractors";
+import { AcceptedJobError, UNKNOWN_PAGE_COUNT_CAP, acceptedJobError, clearPendingWhisperJobs, extractRemotely, nutrientPlannedCredits } from "../../documents/remoteExtractors";
 import { discoverAttachments } from "../../documents/attachments";
 import type { NormalizedOpportunity } from "../../providers/types";
 
@@ -43,7 +43,11 @@ describe("remote extraction accounting", () => {
     }) as typeof fetch;
     const request = { bytes: new TextEncoder().encode(`doc-${Date.now()}-${Math.random()}`), fileName: "a.pdf", pages: [1], pageCount: 1, scanned: true };
 
-    await assert.rejects(extractRemotely(request), AcceptedJobError);
+    const before = Date.now();
+    const rejection = await extractRemotely(request).then(() => null, (error: unknown) => error);
+    assert.ok(rejection instanceof AcceptedJobError);
+    assert.ok(rejection.submittedAt >= before && rejection.submittedAt <= Date.now(), "carries when the job was accepted");
+    assert.equal(acceptedJobError(new Error("wrapped", { cause: rejection })), rejection, "found behind a wrapping error");
     assert.equal(calls.filter((c) => c.endsWith(":whisper")).length, 1, "submitted once");
     assert.ok(!calls.some((c) => c.startsWith("whisper-second")), "second account not used");
     assert.ok(!calls.some((c) => c.startsWith("nutrient")), "Nutrient fallback not used");
@@ -55,6 +59,31 @@ describe("remote extraction accounting", () => {
     assert.equal(result.provider, "llmwhisperer");
     assert.equal(calls.filter((c) => c.endsWith(":whisper")).length, 0, "resumed without resubmitting");
     assert.match(result.pages[0]!.text, /Page one/);
+  });
+
+  it("flags an unknown-length document cut off at the page cap", async () => {
+    process.env.LLMWHISPERER_API_KEY = "whisper-primary-key-000000";
+    setSharedAccountLedgerForTests(new AccountLedger(new MemoryLedgerStore()));
+    let pageTotal = UNKNOWN_PAGE_COUNT_CAP;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const path = new URL(String(input instanceof Request ? input.url : input)).pathname.split("/").pop()!;
+      if (path === "get-usage-info") return Response.json({ daily_quota: 100, today_page_count: 0 });
+      if (path === "whisper") return new Response(JSON.stringify({ whisper_hash: `hash-${pageTotal}` }), { status: 202 });
+      if (path === "whisper-status") return Response.json({ status: "processed" });
+      if (path === "whisper-retrieve") {
+        return new Response(Array.from({ length: pageTotal }, (_v, i) => `Page ${i + 1} text long enough to count.`).join("<<<INSIGHT_HUB_PAGE_BREAK>>>"));
+      }
+      return new Response("unexpected", { status: 500 });
+    }) as typeof fetch;
+    const request = (tag: string) => ({ bytes: new TextEncoder().encode(`legacy-${tag}-${Math.random()}`), fileName: "a.doc", pages: null, pageCount: null, scanned: false });
+
+    const capped = await extractRemotely(request("long"));
+    assert.equal(capped.pages.length, UNKNOWN_PAGE_COUNT_CAP);
+    assert.equal(capped.capped, true, "reaching the cap does not prove the document ended");
+
+    pageTotal = 3;
+    const short = await extractRemotely(request("short"));
+    assert.equal(short.capped, false, "a document that ends before the cap is complete");
   });
 
   it("reserves Nutrient credits for the whole uploaded document", () => {
@@ -125,6 +154,36 @@ describe("document versions", () => {
     const current = await documentsFor(key);
     assert.equal(current.length, 1);
     assert.equal(current[0]!.id, a.documentId);
+  });
+});
+
+describe("judgment hash document identities", () => {
+  it("changes the document identities as soon as a new attachment is listed, before it is fetched", async () => {
+    const { loadDocumentContext } = await import("../documentEvidence");
+    const { releaseCFlags } = await import("../flags");
+    const flags = { ...releaseCFlags({}), documentPipeline: true };
+    const key = `rc-hash-${Date.now()}`;
+    const record = (urls: string[]) =>
+      ({
+        externalId: key,
+        title: "Exams",
+        agency: "City",
+        type: "Solicitation",
+        status: "active",
+        source: "web",
+        sourceUrl: "https://city.example.gov/bids/7",
+        rawData: { attachments: urls.map((url) => ({ url })) },
+      }) as unknown as NormalizedOpportunity;
+    const before = await loadDocumentContext(record(["https://city.example.gov/files/sow.pdf"]), key, flags);
+    const after = await loadDocumentContext(
+      record(["https://city.example.gov/files/sow.pdf", "https://city.example.gov/files/amendment-1.pdf"]),
+      key,
+      flags,
+    );
+    assert.equal(before.error, null);
+    assert.ok(before.documentHashes.length >= 1);
+    assert.equal(after.documentHashes.length, before.documentHashes.length + 1, "the unfetched amendment counts");
+    assert.notDeepEqual([...after.documentHashes].sort(), [...before.documentHashes].sort());
   });
 });
 

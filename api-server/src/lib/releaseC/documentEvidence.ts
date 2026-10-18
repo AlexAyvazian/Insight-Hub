@@ -64,13 +64,16 @@ export async function loadDocumentContext(
     await registerAttachments(opportunityKey, discoverAttachments(record), priority, { authoritative: hasAuthoritativeAttachmentList(record) });
     const [documents, sections] = await Promise.all([documentsFor(opportunityKey), sectionsFor(opportunityKey)]);
     const excerpt = evidenceExcerpts(sections, DOCUMENT_EVIDENCE_CHARS);
+    // Every current document counts, including ones not fetched yet, so a newly listed attachment changes the
+    // judgment hash at once and a decision made before it was read is not reused.
+    const identities = documents.map((d) => d.sha256 ?? `pending:${d.sourceUrl}`);
     const hashes = documents.map((d) => d.sha256).filter((h): h is string => Boolean(h));
     const extracted = documents.filter((d) => d.extractionStatus === "extracted").length;
     return {
       available: true,
       sections,
       documents,
-      documentHashes: hashes,
+      documentHashes: identities,
       evidence: excerpt.text
         ? { text: excerpt.text, citations: excerpt.citations, documents: documents.length, extracted, pending: documents.length - extracted, hashes }
         : null,
