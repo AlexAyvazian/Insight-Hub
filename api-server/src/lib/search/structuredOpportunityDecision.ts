@@ -197,7 +197,8 @@ export function structuredReviewTimeBudgetMs(): number {
 }
 
 function stripJson(text: string): string {
-  return text.replace(/```json\n?/gi, "").replace(/```/g, "").trim();
+  // Reasoning models may prefix the answer with a <think> block whose braces would break the JSON search.
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/```json\n?/gi, "").replace(/```/g, "").trim();
 }
 
 export function parseReviewVotes(text: string): ReviewVote[] | null {

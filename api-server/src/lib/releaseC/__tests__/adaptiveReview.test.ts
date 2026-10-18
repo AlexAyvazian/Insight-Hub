@@ -261,3 +261,20 @@ describe("query partition audit", () => {
     assert.match(String(marker(janitorial)?.code), /partition|structured_relevance_reject/);
   });
 });
+
+describe("judge response handling", () => {
+  it("reads votes after a reasoning model's <think> block", async () => {
+    const { parseReviewVotes } = await import("../../search/structuredOpportunityDecision");
+    const votes = parseReviewVotes('<think>Item {0} looks like {physicals}.</think>\n{"results":[{"index":0,"isOpportunity":true,"relevanceScore":88,"reason":"Physicals"}]}');
+    assert.equal(votes?.length, 1);
+    assert.equal(votes?.[0]?.relevanceScore, 88);
+  });
+
+  it("surfaces MiniMax account errors sent as HTTP 200 instead of returning an empty answer", async (t) => {
+    const { MinimaxProvider } = await import("../../providers/minimax");
+    process.env.MINIMAX_API_KEY = "minimax-test-key";
+    t.mock.method(globalThis, "fetch", async () => Response.json({ choices: null, base_resp: { status_code: 1008, status_msg: "insufficient balance" } }));
+    await assert.rejects(new MinimaxProvider().complete("x"), /Minimax error 1008: insufficient balance/);
+    delete process.env.MINIMAX_API_KEY;
+  });
+});

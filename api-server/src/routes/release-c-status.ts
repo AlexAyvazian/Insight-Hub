@@ -5,6 +5,9 @@
  *                               usage ledger, coverage and audit events. No document text and no key material.
  *   GET /release-c/credentials  free capacity probes for the extraction and Linkup account slots (usage/balance
  *                               endpoints only; nothing billable). Cached for a few minutes.
+ *   POST /release-c/extraction-selftest, GET /release-c/extraction-selftest/:id
+ *                               the capped extraction self-test (lib/releaseC/selftest.ts); off unless enabled.
+ *   GET /release-c/selftest-fixture/:run/:name  the self-test's synthetic documents, fetched by the worker.
  */
 import { Router } from "express";
 import { adminReadAllowed } from "../middleware/api-hardening";
@@ -13,6 +16,7 @@ import { documentWorkerState } from "../lib/releaseC/startup";
 import { rcPool } from "../lib/releaseC/db";
 import { ensureReleaseCSchema } from "../lib/releaseC/schema";
 import { redactSensitiveText } from "../lib/security/logRedaction";
+import { selftestFixture, selftestRun, startSelftest } from "../lib/releaseC/selftest";
 
 const router = Router();
 
@@ -154,5 +158,30 @@ async function probeCredentials(): Promise<unknown> {
   probeCache = { at: Date.now(), value };
   return value;
 }
+
+router.post("/release-c/extraction-selftest", async (req, res) => {
+  if (!adminReadAllowed(req)) return res.status(401).json({ error: "Administrative read authorization is required." });
+  try {
+    const result = await startSelftest();
+    if ("refused" in result) return res.status(result.status).json({ error: result.refused });
+    return res.status(202).json(result.started);
+  } catch (error) {
+    return res.status(503).json({ error: safeError(error instanceof Error ? error.message : String(error)) });
+  }
+});
+
+router.get("/release-c/extraction-selftest/:id", (req, res) => {
+  if (!adminReadAllowed(req)) return res.status(401).json({ error: "Administrative read authorization is required." });
+  const run = selftestRun(req.params.id);
+  return run ? res.json(run) : res.status(404).json({ error: "Unknown self-test run." });
+});
+
+router.get("/release-c/selftest-fixture/:run/:name", (req, res) => {
+  const fixture = selftestFixture(req.params.run, req.params.name);
+  if (!fixture) return res.status(404).end();
+  res.setHeader("Content-Type", fixture.contentType);
+  res.setHeader("Cache-Control", "no-store");
+  return res.send(typeof fixture.body === "string" ? fixture.body : Buffer.from(fixture.body));
+});
 
 export default router;

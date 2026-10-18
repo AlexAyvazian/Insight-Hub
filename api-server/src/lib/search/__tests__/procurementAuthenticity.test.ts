@@ -66,9 +66,8 @@ const AMBIGUOUS_HELD = {
 };
 /**
  * Not web-page authenticity problems: a medications/vaccines supply contract and clinical laboratory testing /
- * research. The canonical profile has no out-of-scope rule covering them (its supply rules name kits, laboratory
- * supplies and equipment; laboratory testing is an in-scope component), so they are left alone and stay listed as
- * remaining benchmark false positives.
+ * research. The authenticity check leaves them alone; the primary-purchased-scope check holds them for review
+ * (see primaryPurchasedScope.test.ts).
  */
 const REMAINING_OUT_OF_AUTHENTICITY_SCOPE = ["prod-b8b5b4b4", "prod-5c5b2162", "prod-d62a22bf", "prod-69bb0a4e", "prod-20d9c3e5"];
 
