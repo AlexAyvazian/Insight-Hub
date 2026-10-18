@@ -94,6 +94,26 @@ async function hostAllowed(hostname) {
 }
 
 const MAX_RESOURCE_BYTES = parseInt(process.env.CRAWLER_MAX_RESOURCE_BYTES || String(15 * 1024 * 1024), 10);
+// Process-wide ceiling on response bytes held in memory at once, across every page and routed sub-resource, so a
+// page referencing many large resources cannot exhaust the crawler. Requests that would exceed it are aborted.
+const MAX_BUFFERED_BYTES = parseInt(process.env.CRAWLER_MAX_BUFFERED_BYTES || String(64 * 1024 * 1024), 10);
+const MAX_ROUTED_REQUESTS = parseInt(process.env.CRAWLER_MAX_ROUTED_REQUESTS || '16', 10);
+let bufferedBytes = 0;
+function releaseBytes(n) {
+  bufferedBytes = Math.max(0, bufferedBytes - n);
+}
+let routedInFlight = 0;
+const routedWaiters = [];
+async function withRoutedSlot(work) {
+  if (routedInFlight >= MAX_ROUTED_REQUESTS) await new Promise((resolve) => routedWaiters.push(resolve));
+  routedInFlight += 1;
+  try {
+    return await work();
+  } finally {
+    routedInFlight -= 1;
+    routedWaiters.shift()?.();
+  }
+}
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length', 'upgrade', 'proxy-connection']);
 
 /** One request from Node, connected only to a validated address. */
@@ -103,6 +123,15 @@ function pinnedRequest(target, addresses, { method, headers, body }) {
   const outgoing = { ...headers, 'accept-encoding': 'identity' };
   delete outgoing.host;
   return new Promise((resolve, reject) => {
+    let size = 0;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      releaseBytes(size);
+      req.destroy(error);
+      reject(error);
+    };
     const req = client.request(
       target,
       {
@@ -117,13 +146,12 @@ function pinnedRequest(target, addresses, { method, headers, body }) {
       },
       (res) => {
         const chunks = [];
-        let size = 0;
         res.on('data', (chunk) => {
+          if (settled) return;
+          if (size + chunk.length > MAX_RESOURCE_BYTES) return fail(new Error('resource too large'));
+          if (bufferedBytes + chunk.length > MAX_BUFFERED_BYTES) return fail(new Error('crawler buffer budget exceeded'));
           size += chunk.length;
-          if (size > MAX_RESOURCE_BYTES) {
-            req.destroy(new Error('resource too large'));
-            return;
-          }
+          bufferedBytes += chunk.length;
           chunks.push(chunk);
         });
         res.on('end', () => {
@@ -132,13 +160,17 @@ function pinnedRequest(target, addresses, { method, headers, body }) {
             if (value === undefined || HOP_BY_HOP.has(key)) continue;
             outHeaders[key] = Array.isArray(value) ? value.join(', ') : String(value);
           }
+          if (settled) return;
+          settled = true;
+          // The caller releases the body's bytes (releaseBytes) once it has handed the body on.
           resolve({ status: res.statusCode || 502, headers: outHeaders, body: Buffer.concat(chunks) });
         });
-        res.on('error', reject);
+        res.on('error', fail);
+        res.on('aborted', () => fail(new Error('response aborted')));
       },
     );
     req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.on('error', reject);
+    req.on('error', fail);
     if (body) req.write(body);
     req.end();
   });
@@ -163,6 +195,7 @@ async function pinnedFetch(rawUrl, init) {
     const response = await pinnedRequest(target, addresses, request);
     const location = response.headers.location;
     if (response.status >= 300 && response.status < 400 && location) {
+      releaseBytes(response.body.length);
       target = new URL(location, target);
       if (response.status === 303 || ((response.status === 301 || response.status === 302) && request.method === 'POST')) {
         request = { ...request, method: 'GET', body: null };
@@ -236,12 +269,19 @@ async function getPage() {
       // Fetched from Node against the validated address instead of route.continue(), which would let Chromium
       // resolve the name again (DNS rebinding).
       const request = route.request();
-      const { status, headers, body } = await pinnedFetch(target.toString(), {
-        method: request.method(),
-        headers: await request.allHeaders(),
-        body: request.postDataBuffer(),
+      const headersIn = await request.allHeaders();
+      return await withRoutedSlot(async () => {
+        const { status, headers, body } = await pinnedFetch(target.toString(), {
+          method: request.method(),
+          headers: headersIn,
+          body: request.postDataBuffer(),
+        });
+        try {
+          return await route.fulfill({ status, headers, body });
+        } finally {
+          releaseBytes(body.length);
+        }
       });
-      return route.fulfill({ status, headers, body });
     } catch {
       return route.abort('blockedbyclient');
     }
@@ -274,7 +314,9 @@ async function crawlUrl(url, options = {}) {
     url = await assertCrawlableUrl(url);
     // Resolve redirects first (pinned and re-validated per hop) so the page loads at its final URL and relative
     // links resolve correctly.
-    url = (await pinnedFetch(url, { method: 'GET', headers: { 'user-agent': USER_AGENT }, body: null })).url;
+    const resolved = await pinnedFetch(url, { method: 'GET', headers: { 'user-agent': USER_AGENT }, body: null });
+    releaseBytes(resolved.body.length);
+    url = resolved.url;
     page = await getPage();
 
     // Set timeout
