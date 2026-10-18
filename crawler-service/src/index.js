@@ -196,7 +196,16 @@ async function pinnedFetch(rawUrl, init) {
     const location = response.headers.location;
     if (response.status >= 300 && response.status < 400 && location) {
       releaseBytes(response.body.length);
-      target = new URL(location, target);
+      const next = new URL(location, target);
+      if (next.origin !== target.origin) {
+        // Origin-bound credentials never follow a redirect to another origin.
+        const headers = { ...(request.headers || {}) };
+        for (const key of Object.keys(headers)) {
+          if (['cookie', 'authorization', 'proxy-authorization'].includes(key.toLowerCase())) delete headers[key];
+        }
+        request = { ...request, headers };
+      }
+      target = next;
       if (response.status === 303 || ((response.status === 301 || response.status === 302) && request.method === 'POST')) {
         request = { ...request, method: 'GET', body: null };
       }

@@ -124,6 +124,39 @@ describe("adaptive structured review", () => {
   });
 });
 
+describe("review queue persistence", () => {
+  it("keeps one family's vote across retries and only asks a missing family next time", async () => {
+    const record = ambiguous(Date.now());
+    const a = judge("mistral-small-latest", () => false);
+    const first = await decideStructuredOpportunities([record], { persist: true, reviewProviders: [a], timeBudgetMs: 60_000 });
+    assert.equal(first.held[0]?.code, "structured_review_queued", "one family alone cannot settle the record");
+    assert.equal(a.calls.length, 1);
+
+    const b = judge("deepseek-chat", () => false);
+    const second = await decideStructuredOpportunities([record], { persist: true, reviewProviders: [a, b], timeBudgetMs: 60_000 });
+    assert.equal(a.calls.length, 1, "the family that already voted is not asked again");
+    assert.equal(b.calls.length, 1);
+    assert.equal(second.held[0]?.code, "structured_review_declined", "the stored vote and the new family form the panel");
+  });
+
+  it("closes a stale queue row when the current version is approved deterministically", async () => {
+    const { cachedQueueDecisions } = await import("../reviewQueue");
+    const { opportunityKey } = await import("../identity");
+    const record = ambiguous(Date.now() + 1);
+    const failing = judge("mistral-small-latest", () => true, { fail: true });
+    await decideStructuredOpportunities([record], { persist: true, reviewProviders: [failing], timeBudgetMs: 60_000 });
+    const key = opportunityKey(record);
+    assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "queued");
+
+    const amended = { ...record, responseDeadline: new Date(Date.now() + 20 * DAY_MS) } as NormalizedOpportunity;
+    const result = await decideStructuredOpportunities([amended], { persist: true, reviewProviders: [], timeBudgetMs: 60_000 });
+    assert.equal(result.deterministicApproved, 1);
+    const row = (await cachedQueueDecisions([key])).get(key);
+    assert.equal(row?.status, "decided");
+    assert.equal((row?.decision as { method?: string } | null)?.method, "deterministic");
+  });
+});
+
 describe("review priority", () => {
   it("urgent deadlines and near-threshold scope come first; expired records leave", () => {
     const thresholds = { reviewMin: 40, acceptMin: 70 };

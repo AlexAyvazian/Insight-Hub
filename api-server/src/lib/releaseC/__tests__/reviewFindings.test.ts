@@ -9,6 +9,7 @@ import { AccountLedger, MemoryLedgerStore, isAccountLevelError, type AccountPoli
 import { UNKNOWN_PAGE_COUNT_CAP, nutrientPlannedCredits, whisperPlannedPages } from "../../documents/remoteExtractors";
 import { withSamKey } from "../../documents/worker";
 import { parseDocx } from "../../documents/parsers";
+import { FreeTierCredentialPool } from "../../providers/freeTierCredentialPool";
 
 const policy: AccountPolicy = {
   pool: "test-pool",
@@ -75,5 +76,34 @@ describe("DOCX pagination", () => {
     assert.match(parsed.pages[0]!.text, /Page one intro[\s\S]*Before break/);
     assert.doesNotMatch(parsed.pages[0]!.text, /After break/);
     assert.match(parsed.pages[1]!.text, /After break[\s\S]*Still page two/);
+  });
+});
+
+describe("required capacity probes", () => {
+  it("skips an account whose required probe fails instead of trusting stale capacity", async () => {
+    process.env.RC_PROBE_KEY_1 = "probe-key-one-000000";
+    const ledger = new AccountLedger(new MemoryLedgerStore());
+    const accountPolicy = (slot: string): AccountPolicy => ({ ...policy, pool: "rc-probe", slot, periodLimit: 100 });
+    // The account had room when last confirmed.
+    await ledger.recordSnapshot(accountPolicy("RC_PROBE_KEY_1"), { remaining: 100, source: "probe" });
+    const pool = new FreeTierCredentialPool("rc-probe", [{ envKey: "RC_PROBE_KEY_1" }], {
+      accounts: {
+        ledger,
+        policyFor: accountPolicy,
+        probe: async () => {
+          throw new SyntaxError("Unexpected token < in JSON at position 0");
+        },
+        probeBeforeEachRun: true,
+      },
+    });
+    let called = false;
+    await assert.rejects(
+      pool.run(async () => {
+        called = true;
+        return "billable";
+      }),
+    );
+    assert.equal(called, false, "no billable call after a failed required probe");
+    delete process.env.RC_PROBE_KEY_1;
   });
 });

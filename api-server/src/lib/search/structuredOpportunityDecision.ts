@@ -25,7 +25,7 @@ import {
 } from "../providerBudget";
 import { releaseCFlags } from "../releaseC/flags";
 import { judgmentContentHash, opportunityKey, providerModelFamily } from "../releaseC/identity";
-import { cachedQueueDecisions, enqueueForReview, reviewPriority, settleByKey, type CachedQueueDecision } from "../releaseC/reviewQueue";
+import { cachedQueueDecisions, closeQueuedByKeys, enqueueForReview, reviewPriority, settleByKey, type CachedQueueDecision } from "../releaseC/reviewQueue";
 import {
   classifyWithDocumentEvidence,
   documentEvidenceText,
@@ -362,10 +362,19 @@ async function availableJudges(providers: ReviewProvider[], excludeFamilies: Set
   return { judges: [...byFamily.values()].map((row) => row.judge), configured: configured.length };
 }
 
+/** One model family's vote on one record, kept across queue retries so a later run only adds missing families. */
+interface FamilyVote {
+  provider: string;
+  family: string;
+  vote: ReviewVote;
+}
+
 interface Candidate {
   record: NormalizedOpportunity;
   key: string;
   hash: string;
+  /** Votes from earlier runs on this exact content hash. */
+  priorVotes?: FamilyVote[];
   score: number;
   reason: string;
   priority: number;
@@ -376,7 +385,7 @@ interface Candidate {
 
 type Outcome =
   | { kind: "approved"; method: DecisionMethod; score: number; reason: string; reviewers: string[]; families: string[] }
-  | { kind: "held"; code: StructuredHoldCode; reason: string; decided: boolean; retryAt?: Date | null };
+  | { kind: "held"; code: StructuredHoldCode; reason: string; decided: boolean; retryAt?: Date | null; votes?: FamilyVote[] };
 
 interface PanelRun {
   outcomes: Map<number, Outcome>;
@@ -420,8 +429,13 @@ async function callJudge(
  */
 async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: string, deadline: number): Promise<PanelRun> {
   const run: PanelRun = { outcomes: new Map(), reviewers: [], families: [], judgeCalls: 0, tokens: 0, diagnostics: [], anySuccess: false };
-  const votes = new Map<number, Array<{ provider: string; family: string; vote: ReviewVote }>>();
-  const queue = [...judges];
+  const votes = new Map<number, FamilyVote[]>();
+  batch.forEach((candidate, index) => {
+    if (candidate.priorVotes?.length) votes.set(index, candidate.priorVotes.map((row) => ({ ...row, vote: { ...row.vote, index } })));
+  });
+  // Families that already voted on this batch go last, so a retry spends capacity on the missing families first.
+  const votedFamilies = new Set(batch.flatMap((candidate) => (candidate.priorVotes ?? []).map((row) => row.family)));
+  const queue = [...judges].sort((a, b) => Number(votedFamilies.has(a.family)) - Number(votedFamilies.has(b.family)));
   let pending = batch.map((_, index) => index);
 
   const addVotes = (judge: Judge, indexes: number[], got: ReviewVote[]) => {
@@ -431,30 +445,36 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
     for (const vote of got) {
       const target = indexes[vote.index];
       if (target === undefined) continue;
-      const rows = votes.get(target) ?? [];
+      // A family votes once per record: a fresh vote replaces that family's earlier one.
+      const rows = (votes.get(target) ?? []).filter((row) => row.family !== judge.family);
       rows.push({ provider: judge.provider.name, family: judge.family, vote: { ...vote, index: target } });
       votes.set(target, rows);
     }
   };
 
-  // First round: up to two families in parallel.
-  const firstRound: Judge[] = [];
-  while (firstRound.length < 2 && queue.length > 0) firstRound.push(queue.shift()!);
-  const firstPrompt = buildReviewPrompt(batch.map((c) => c.record), profileContext);
-  const firstResults = await Promise.all(firstRound.map((judge) => callJudge(judge, firstPrompt, batch.length)));
-  firstResults.forEach((result, i) => {
-    run.judgeCalls += 1;
-    run.tokens += result.tokens;
-    if (result.votes) addVotes(firstRound[i]!, pending, result.votes);
-    else if (result.error) run.diagnostics.push(result.error);
-  });
-
-  // Further families only for unresolved records, while time remains.
+  // Records already settled by earlier votes are not sent again.
   const unresolved = () =>
     pending.filter((index) => {
       const rows = votes.get(index) ?? [];
       return !recordResolved(rows.map((row) => ({ provider: row.family, vote: row.vote })));
     });
+  pending = unresolved();
+
+  // First round: up to two families in parallel (one when earlier votes already supply a family).
+  const firstRound: Judge[] = [];
+  const firstRoundSize = votedFamilies.size > 0 ? 1 : 2;
+  while (pending.length > 0 && firstRound.length < firstRoundSize && queue.length > 0) firstRound.push(queue.shift()!);
+  const firstIndexes = [...pending];
+  const firstPrompt = buildReviewPrompt(firstIndexes.map((index) => batch[index]!.record), profileContext);
+  const firstResults = await Promise.all(firstRound.map((judge) => callJudge(judge, firstPrompt, firstIndexes.length)));
+  firstResults.forEach((result, i) => {
+    run.judgeCalls += 1;
+    run.tokens += result.tokens;
+    if (result.votes) addVotes(firstRound[i]!, firstIndexes, result.votes);
+    else if (result.error) run.diagnostics.push(result.error);
+  });
+
+  // Further families only for unresolved records, while time remains.
   pending = unresolved();
   while (pending.length > 0 && queue.length > 0 && Date.now() < deadline) {
     const judge = queue.shift()!;
@@ -494,7 +514,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
         return;
       }
       if (negative.length >= positive.length) {
-        run.outcomes.set(index, { kind: "held", code: "structured_review_disputed", reason: `Judges disagree (${positive.length} yes / ${negative.length} no). ${candidate.reason}`.trim(), decided: false });
+        run.outcomes.set(index, { kind: "held", votes: distinct, code: "structured_review_disputed", reason: `Judges disagree (${positive.length} yes / ${negative.length} no). ${candidate.reason}`.trim(), decided: false });
         return;
       }
       run.outcomes.set(index, { kind: "held", code: "structured_review_declined", reason: `Judges agree on scope but the consensus score ${score} is below accept_min ${acceptMin}.`, decided: true });
@@ -518,6 +538,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
     }
     run.outcomes.set(index, {
       kind: "held",
+      votes: distinct,
       code: positive.length > 0 && negative.length > 0 ? "structured_review_disputed" : "structured_review_queued",
       reason:
         positive.length > 0 && negative.length > 0
@@ -567,6 +588,8 @@ export async function decideStructuredOpportunities(
   const candidates: Candidate[] = [];
   let rejected = 0;
   let deterministicApproved = 0;
+  // Opportunities decided outside AI review in this run; any older queue row for them is closed below.
+  const settledOutsideReview = new Map<string, { hash: string; decision: Record<string, unknown>; reason: string }>();
 
   for (const original of records) {
     const baseRelevance = classifyProviderRecordRelevance(original);
@@ -579,6 +602,11 @@ export async function decideStructuredOpportunities(
     if (decideRelevance(baseRelevance).verdict === "reject" && !(flags.documentPipeline && thinButSignalled)) {
       rejected += 1;
       rejectedRecords.push(original);
+      settledOutsideReview.set(opportunityKey(original), {
+        hash: judgmentContentHash(original, { documentHashes: [], profileVersion: profile.version }),
+        decision: { kind: "rejected", code: "structured_relevance_reject" },
+        reason: "Rejected by relevance rules on the current notice.",
+      });
       continue;
     }
     const key = opportunityKey(original);
@@ -594,6 +622,11 @@ export async function decideStructuredOpportunities(
     if (verdict === "reject") {
       rejected += 1;
       rejectedRecords.push(record);
+      settledOutsideReview.set(key, {
+        hash: judgmentContentHash(original, { documentHashes: documents?.documentHashes ?? [], profileVersion: profile.version }),
+        decision: { kind: "rejected", code: "structured_relevance_reject" },
+        reason: "Rejected by relevance rules on the current notice and documents.",
+      });
       continue;
     }
 
@@ -631,6 +664,7 @@ export async function decideStructuredOpportunities(
     if (!excluded && isDeterministicallyActionable(withLedger, now)) {
       approved.push(withDecision(withLedger, "deterministic", relevance.score, reason || "Explicit Occu-Med service scope with a future response deadline."));
       deterministicApproved += 1;
+      settledOutsideReview.set(key, { hash, decision: { kind: "approved", method: "deterministic" }, reason: "Approved deterministically on the current notice." });
       continue;
     }
 
@@ -663,7 +697,11 @@ export async function decideStructuredOpportunities(
   const toReview: Candidate[] = [];
   for (const candidate of reviewable) {
     const hit = cache.get(candidate.key);
-    const decision = hit?.decision as (Outcome & { kind?: string }) | null | undefined;
+    const stored = hit?.decision as { kind?: string; votes?: unknown } | null | undefined;
+    const decision = stored?.kind === "pending_votes" ? null : (stored as (Outcome & { kind?: string }) | null | undefined);
+    if (hit && hit.contentHash === candidate.hash && stored?.kind === "pending_votes" && Array.isArray(stored.votes)) {
+      candidate.priorVotes = (stored.votes as FamilyVote[]).filter((row) => row && typeof row.family === "string" && row.vote);
+    }
     if (hit && hit.contentHash === candidate.hash && (hit.status === "decided" || hit.status === "held") && decision?.kind) {
       outcomes.set(candidate.key, decision as Outcome);
       cached += 1;
@@ -797,12 +835,31 @@ export async function decideStructuredOpportunities(
         if (!decided) queuedCount += 1;
         await settleByKey(candidate.key, candidate.hash, {
           status: decided ? (outcome.kind === "held" && outcome.code === "structured_untrusted_content" ? "held" : "decided") : "queued",
-          decision: decided ? (outcome as unknown as Record<string, unknown>) : null,
+          // Undecided outcomes keep the family votes gathered so far; the next run on the same content adds to them.
+          decision: decided
+            ? (outcome as unknown as Record<string, unknown>)
+            : outcome.kind === "held" && outcome.votes?.length
+              ? { kind: "pending_votes", votes: outcome.votes }
+              : null,
           holdCode: outcome.kind === "held" ? outcome.code : null,
           reason: outcome.reason,
           retryAt: decided ? null : nextRetry(stopReason, outcome),
         });
       }
+    } catch (error) {
+      storageFailed(diagnostics, error);
+    }
+  }
+
+  if (storageAvailable(persist) && settledOutsideReview.size > 0) {
+    try {
+      const groups = new Map<string, { entries: Array<{ opportunityKey: string; contentHash: string }>; decision: Record<string, unknown>; reason: string }>();
+      for (const [key, settled] of settledOutsideReview) {
+        const group = groups.get(settled.reason) ?? { entries: [], decision: settled.decision, reason: settled.reason };
+        group.entries.push({ opportunityKey: key, contentHash: settled.hash });
+        groups.set(settled.reason, group);
+      }
+      for (const group of groups.values()) await closeQueuedByKeys(group.entries, group.decision, group.reason);
     } catch (error) {
       storageFailed(diagnostics, error);
     }

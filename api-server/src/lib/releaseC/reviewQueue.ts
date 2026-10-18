@@ -179,6 +179,26 @@ export async function completeItem(
   );
 }
 
+/**
+ * Closes waiting queue rows for opportunities whose current version was decided outside AI review (deterministic
+ * approval or a relevance reject), so a later drain never reviews or promotes the stale queued snapshot.
+ */
+export async function closeQueuedByKeys(
+  entries: Array<{ opportunityKey: string; contentHash: string }>,
+  decision: Record<string, unknown>,
+  reason: string,
+): Promise<void> {
+  if (entries.length === 0) return;
+  // The row takes the current version's hash, so its decision is never mistaken for one about the old snapshot.
+  await (await rcPool()).query(
+    `UPDATE opportunity_review_queue q SET status = 'decided', content_hash = v.hash, decision = $3, reason = $4,
+       decided_at = now(), updated_at = now()
+     FROM unnest($1::text[], $2::text[]) AS v(key, hash)
+     WHERE q.opportunity_key = v.key AND q.status IN ('queued','held')`,
+    [entries.map((e) => e.opportunityKey), entries.map((e) => e.contentHash), JSON.stringify(decision), reason.slice(0, 500)],
+  );
+}
+
 /** Reopens one opportunity (used when new document evidence arrives). */
 export async function reopenOpportunity(opportunityKey: string, reason: string): Promise<void> {
   await ensureReleaseCSchema();

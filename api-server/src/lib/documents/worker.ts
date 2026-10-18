@@ -155,7 +155,9 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
     storage_ref: `sha256:${sha}`,
   };
 
-  if (doc.sha256 === sha && (doc.extractionStatus === "extracted" || doc.extractionStatus === "partial")) {
+  // Only fully extracted content takes the unchanged fast path: a partial document (OCR deferred for quota or an
+  // accepted job still running) must be processed again so its missing pages are collected.
+  if (doc.sha256 === sha && doc.extractionStatus === "extracted") {
     await updateDocument(doc.id, base);
     await finishJob(job.jobId, "done", null);
     return { jobId: job.jobId, status: "done", detail: "unchanged", changed: false };
@@ -164,7 +166,9 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
   const version = await recordDocumentVersion(doc, sha, base);
   const documentId = version.documentId;
 
-  const cached = await findExtractedByHash(sha);
+  const found = await findExtractedByHash(sha);
+  // A partial extraction is never reused as a cache hit, for the same reason.
+  const cached = found?.extractionStatus === "extracted" ? found : null;
   if (cached && cached.id === documentId) {
     // Content reverted to a version already extracted: its row and sections were reactivated as they were.
     await finishJob(job.jobId, "done", null);

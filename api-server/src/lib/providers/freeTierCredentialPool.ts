@@ -384,11 +384,22 @@ export class FreeTierCredentialPool {
     // that is already empty (e.g. used up elsewhere) never receives a billable call.
     const unconfirmed = Boolean(this.accounts.probe) && !(await ledger.state(policy)).lastConfirmedAt;
     if (this.accounts.probe && !cooling && (this.accounts.probeBeforeEachRun || unconfirmed || (!decision.ok && decision.needsProbe))) {
+      const required = Boolean(this.accounts.probeBeforeEachRun) || unconfirmed;
+      let confirmed = false;
       try {
         const snapshot = await this.accounts.probe(candidate.value, candidate.slot);
-        if (snapshot) await ledger.recordSnapshot(policy, snapshot);
+        if (snapshot) {
+          await ledger.recordSnapshot(policy, snapshot);
+          confirmed = true;
+        }
       } catch (error) {
         await ledger.recordFailure(policy, error);
+      }
+      // A required probe that fails or returns nothing fails closed: stale or unknown capacity never authorises a
+      // billable call.
+      if (required && !confirmed) {
+        skipped.push(`${candidate.slot}: capacity probe failed; account skipped`);
+        return null;
       }
       decision = await ledger.canSpend(policy, plannedUnits, false);
     }
