@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      INSIGHT_PRODUCTION_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.base_url || vars.INSIGHT_PRODUCTION_URL || 'https://insight-hub-eyza.onrender.com' }}
+      INSIGHT_PRODUCTION_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.base_url || vars.INSIGHT_PRODUCTION_URL || 'https://insight-hub-952b.onrender.com' }}
       EXPECTED_COMMIT_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_commit || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.workflow_run.head_sha }}
       ACCEPTANCE_TIMEOUT_MS: "12000"
 
