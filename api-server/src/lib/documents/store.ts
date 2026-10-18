@@ -168,6 +168,29 @@ export async function requeueNewlyAllowedContentTypes(isAllowed: (contentType: s
   return result.rowCount ?? 0;
 }
 
+/**
+ * Re-queues current documents whose last fetch failed with HTTP 429 when that was still treated as final. The worker
+ * now retries a rate-limited fetch with backoff, so this only recovers jobs failed by older builds (or that ran out of
+ * attempts), once per process. Returns how many jobs were re-queued.
+ */
+export async function requeueRateLimitedFetches(): Promise<number> {
+  await ensureReleaseCSchema();
+  const pool = await rcPool();
+  const failed = await pool.query(
+    `SELECT d.id FROM opportunity_documents d JOIN document_extraction_jobs j ON j.document_id = d.id
+      WHERE d.superseded_by IS NULL AND d.retrieval_status = 'failed' AND d.retrieval_error = 'HTTP 429' AND j.status = 'failed'`,
+  );
+  const ids = failed.rows.map((row) => String(row.id));
+  if (ids.length === 0) return 0;
+  await pool.query(`UPDATE opportunity_documents SET retrieval_status = 'pending', updated_at = now() WHERE id = ANY($1::text[])`, [ids]);
+  const result = await pool.query(
+    `UPDATE document_extraction_jobs SET status = 'queued', attempts = 0, next_attempt_at = now(), last_error = NULL, updated_at = now()
+      WHERE document_id = ANY($1::text[]) AND status = 'failed'`,
+    [ids],
+  );
+  return result.rowCount ?? 0;
+}
+
 export interface ClaimedJob {
   jobId: string;
   documentId: string;

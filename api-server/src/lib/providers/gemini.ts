@@ -65,6 +65,15 @@ export function occumedExtractionGuidance(): string {
   return [judgeScopeBlock(), scoreGuidance()].filter(Boolean).join("\n");
 }
 
+/**
+ * Per-request timeout. Panel prompts of 20k+ characters on the flash model ran past 30 s in production, failing every
+ * key in turn; callers with their own deadline still pass a signal. Override with GEMINI_TIMEOUT_MS.
+ */
+function geminiTimeoutMs(): number {
+  const value = Number(process.env.GEMINI_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 60_000;
+}
+
 async function callGemini(
   apiKey: string,
   prompt: string,
@@ -79,8 +88,8 @@ async function callGemini(
       generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
     }),
     signal: signal
-      ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
-      : AbortSignal.timeout(30_000),
+      ? AbortSignal.any([signal, AbortSignal.timeout(geminiTimeoutMs())])
+      : AbortSignal.timeout(geminiTimeoutMs()),
   });
   if (response.status === 429) {
     const body = (await response.json().catch(() => ({}))) as {

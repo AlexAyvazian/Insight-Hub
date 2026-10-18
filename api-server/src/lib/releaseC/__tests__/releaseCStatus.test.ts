@@ -164,6 +164,49 @@ describe("documents rejected only for their content type", () => {
   });
 });
 
+describe("documents whose fetch was rate limited", () => {
+  it("are re-queued, and a 429 now backs off and retries instead of failing", async () => {
+    const { rcPool } = await import("../db");
+    const { ensureReleaseCSchema } = await import("../schema");
+    const { requeueRateLimitedFetches } = await import("../../documents/store");
+    const { retryDelayMs } = await import("../../documents/worker");
+    await ensureReleaseCSchema();
+    const pool = await rcPool();
+    const stamp = Date.now();
+    const rows = [
+      { id: `429-${stamp}`, error: "HTTP 429" },
+      { id: `404b-${stamp}`, error: "HTTP 404" },
+    ];
+    for (const row of rows) {
+      await pool.query(
+        `INSERT INTO opportunity_documents (id, opportunity_key, source_url, retrieval_status, retrieval_error, extraction_status)
+         VALUES ($1, 'ratelimit-test', $2, 'failed', $3, 'failed')`,
+        [row.id, `https://api.sam.gov/prod/opportunities/v1/noticedesc?id=${row.id}`, row.error],
+      );
+      await pool.query(
+        `INSERT INTO document_extraction_jobs (id, document_id, opportunity_key, status, attempts) VALUES ($1, $2, 'ratelimit-test', 'failed', 1)`,
+        [`job-${row.id}`, row.id],
+      );
+    }
+    assert.equal(await requeueRateLimitedFetches(), 1);
+    const jobs = await pool.query(`SELECT document_id, status, attempts FROM document_extraction_jobs WHERE opportunity_key = 'ratelimit-test'`);
+    const byId = Object.fromEntries(jobs.rows.map((r) => [r.document_id, r]));
+    assert.equal(byId[`429-${stamp}`].status, "queued");
+    assert.equal(byId[`429-${stamp}`].attempts, 0);
+    assert.equal(byId[`404b-${stamp}`].status, "failed");
+    assert.equal(await requeueRateLimitedFetches(), 0);
+    await pool.query(`DELETE FROM document_extraction_jobs WHERE opportunity_key = 'ratelimit-test'`);
+    await pool.query(`DELETE FROM opportunity_documents WHERE opportunity_key = 'ratelimit-test'`);
+
+    assert.equal(retryDelayMs(503, 1, null), 20 * 60_000);
+    assert.equal(retryDelayMs(429, 1, null), 30 * 60_000);
+    assert.equal(retryDelayMs(429, 3, null), 120 * 60_000);
+    assert.equal(retryDelayMs(429, 1, "7200"), 7_200_000, "a later Retry-After wins");
+    assert.equal(retryDelayMs(429, 1, "5"), 30 * 60_000, "an earlier Retry-After does not shorten the backoff");
+    assert.equal(retryDelayMs(429, 1, "999999"), 24 * 3_600_000, "capped at a day");
+  });
+});
+
 describe("extraction self-test guard rails", () => {
   it("is off unless enabled, serves fixtures only for its own runs, and runs at most once per cooldown", async () => {
     const selftest = await import("../selftest");

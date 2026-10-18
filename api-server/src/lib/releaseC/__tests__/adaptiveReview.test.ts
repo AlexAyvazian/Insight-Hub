@@ -86,6 +86,19 @@ describe("adaptive structured review", () => {
     assert.equal(a.calls.length + b.calls.length, 1, "only one of the same-family judges is called");
   });
 
+  it("counts a judge that fell back to another model under the family that actually answered", async () => {
+    const a = judge("qwen/qwen2.5-72b-instruct", () => true);
+    const answer = a.complete.bind(a);
+    a.complete = async (prompt: string) => {
+      a.defaultModel = "meta/llama-3.3-70b-instruct"; // the configured model was missing; a Llama fallback answered
+      return answer(prompt);
+    };
+    const b = judge("meta-llama/llama-3.1-8b-instruct:free", () => true);
+    const result = await decideStructuredOpportunities([ambiguous(25), ambiguous(26)], { persist: false, reviewProviders: [a, b] });
+    assert.deepEqual([...new Set(result.review.families)], ["meta-llama"]);
+    assert.ok(result.approved.every((r) => (r.rawData as Record<string, unknown>).opportunityDecisionMethod !== "panel-ai-review"), "two Llama votes are not a panel");
+  });
+
   it("calls a third model family only for records the first two disagree on", async () => {
     const a = judge("mistral-small-latest", () => true);
     const b = judge("deepseek-chat", (title) => !title.endsWith("31"));
@@ -276,5 +289,27 @@ describe("judge response handling", () => {
     t.mock.method(globalThis, "fetch", async () => Response.json({ choices: null, base_resp: { status_code: 1008, status_msg: "insufficient balance" } }));
     await assert.rejects(new MinimaxProvider().complete("x"), /Minimax error 1008: insufficient balance/);
     delete process.env.MINIMAX_API_KEY;
+  });
+
+  it("falls back to the next model when the configured one is not enabled for the account, and keeps it", async (t) => {
+    const { OpenAiCompatibleProvider } = await import("../../providers/openAiCompatible");
+    const { providerModelFamily } = await import("../identity");
+    process.env.FALLBACK_TEST_KEY = "fallback-test-key";
+    const provider = new OpenAiCompatibleProvider({
+      name: "nvidia", dbKey: "fallbackTestKey", envKey: "FALLBACK_TEST_KEY", displayName: "Test", baseUrl: "https://example.test/v1",
+      defaultModel: "vendor/missing-model", fallbackModels: ["meta/llama-3.3-70b-instruct"],
+    });
+    const models: string[] = [];
+    t.mock.method(globalThis, "fetch", async (_url: string, init: { body: string }) => {
+      const model = JSON.parse(init.body).model as string;
+      models.push(model);
+      return model === "vendor/missing-model" ? new Response("Function not found for account", { status: 404 }) : Response.json({ choices: [{ message: { content: "ok" } }] });
+    });
+    assert.equal(await provider.complete("x"), "ok");
+    assert.deepEqual(models, ["vendor/missing-model", "meta/llama-3.3-70b-instruct"]);
+    assert.equal(await providerModelFamily(provider), "meta-llama", "the panel sees the model actually answering");
+    assert.equal(await provider.complete("y"), "ok");
+    assert.equal(models.length, 3, "the working model is used directly next time");
+    delete process.env.FALLBACK_TEST_KEY;
   });
 });

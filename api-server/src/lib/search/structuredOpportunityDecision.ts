@@ -451,7 +451,7 @@ async function callJudge(
   judge: Judge,
   records: NormalizedOpportunity[],
   profileContext: string,
-): Promise<{ votes: ReviewVote[] | null; tokens: number; error: string | null }> {
+): Promise<{ votes: ReviewVote[] | null; tokens: number; error: string | null; family: string }> {
   const count = records.length;
   const prompt = buildReviewPrompt(records, profileContext, reviewPromptCharLimit(judge.provider.name));
   try {
@@ -463,10 +463,11 @@ async function callJudge(
       throw new Error(`${judge.provider.name} returned ${votes.length}/${count} distinct valid panel votes`);
     }
     await recordProviderSuccess(judge.budgetName, votes.length, { tokens });
-    return { votes, tokens, error: null };
+    // Re-resolved after the call: a provider that fell back to another model may now be a different family.
+    return { votes, tokens, error: null, family: await providerModelFamily(judge.provider).catch(() => judge.family) };
   } catch (error) {
     await recordProviderFailure(judge.budgetName, error);
-    return { votes: null, tokens: Math.ceil(prompt.length / 4), error: `${judge.provider.name}: ${error instanceof Error ? error.message : String(error)}` };
+    return { votes: null, tokens: Math.ceil(prompt.length / 4), error: `${judge.provider.name}: ${error instanceof Error ? error.message : String(error)}`, family: judge.family };
   }
 }
 
@@ -486,16 +487,16 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   const queue = [...judges].sort((a, b) => Number(votedFamilies.has(a.family)) - Number(votedFamilies.has(b.family)));
   let pending = batch.map((_, index) => index);
 
-  const addVotes = (judge: Judge, indexes: number[], got: ReviewVote[]) => {
+  const addVotes = (judge: Judge, indexes: number[], got: ReviewVote[], family: string) => {
     run.anySuccess = true;
     run.reviewers.push(judge.provider.name);
-    run.families.push(judge.family);
+    run.families.push(family);
     for (const vote of got) {
       const target = indexes[vote.index];
       if (target === undefined) continue;
       // A family votes once per record: a fresh vote replaces that family's earlier one.
-      const rows = (votes.get(target) ?? []).filter((row) => row.family !== judge.family);
-      rows.push({ provider: judge.provider.name, family: judge.family, vote: { ...vote, index: target } });
+      const rows = (votes.get(target) ?? []).filter((row) => row.family !== family);
+      rows.push({ provider: judge.provider.name, family, vote: { ...vote, index: target } });
       votes.set(target, rows);
     }
   };
@@ -518,7 +519,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   firstResults.forEach((result, i) => {
     run.judgeCalls += 1;
     run.tokens += result.tokens;
-    if (result.votes) addVotes(firstRound[i]!, firstIndexes, result.votes);
+    if (result.votes) addVotes(firstRound[i]!, firstIndexes, result.votes, result.family);
     else if (result.error) run.diagnostics.push(result.error);
   });
 
@@ -530,7 +531,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
     const result = await callJudge(judge, subset, profileContext);
     run.judgeCalls += 1;
     run.tokens += result.tokens;
-    if (result.votes) addVotes(judge, pending, result.votes);
+    if (result.votes) addVotes(judge, pending, result.votes, result.family);
     else if (result.error) run.diagnostics.push(result.error);
     pending = unresolved();
   }
