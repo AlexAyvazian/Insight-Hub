@@ -216,3 +216,14 @@ describe("withdrawn attachments", () => {
     assert.equal(job.rows[0]?.due, true, "the re-check is due now");
   });
 });
+
+describe("SAM.gov notice description", () => {
+  it("accepts the HAL JSON that noticedesc returns and extracts its HTML description", async () => {
+    const { ALLOWED_TYPES, samDescription } = await import("../../documents/worker");
+    assert.ok(ALLOWED_TYPES.some((type) => "application/hal+json".startsWith(type)));
+    const body = new TextEncoder().encode(JSON.stringify({ description: "<p>Provide <b>pre-employment physicals</b> and DOT exams.</p>", _links: {} }));
+    const parsed = samDescription(body, "application/hal+json");
+    assert.equal(parsed?.method, "sam-noticedesc");
+    assert.match(parsed!.pages[0]!.text, /pre-employment physicals and DOT exams/);
+  });
+});
