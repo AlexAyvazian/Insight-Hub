@@ -5,6 +5,7 @@ import requestObservability from "../middleware/request-observability";
 import healthRouter from "./health";
 import databaseStatusRouter from "./database-status";
 import hardeningDiagnosticsRouter from "./hardening-diagnostics";
+import releaseCStatusRouter from "./release-c-status";
 import retentionLifecycleRouter from "./retention-lifecycle";
 import opportunitySafetyBoundaryRouter from "./opportunity-safety-boundary";
 import opportunityFeedbackRouter from "./opportunity-feedback";
@@ -39,6 +40,7 @@ router.use(apiRequestValidationRouter);
 router.use(healthRouter);
 router.use(databaseStatusRouter);
 router.use(hardeningDiagnosticsRouter);
+router.use(releaseCStatusRouter);
 router.use(retentionLifecycleRouter);
 
 // Non-procurement intelligence workspaces are owned by Insight Hub 2. Keep the

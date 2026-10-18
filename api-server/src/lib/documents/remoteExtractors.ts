@@ -20,6 +20,7 @@ import type { ExtractedPage } from "./types";
 
 const WHISPER_BASE = "https://llmwhisperer-api.us-central.unstract.com/api/v2";
 const NUTRIENT_PARSE_URL = "https://api.nutrient.io/extraction/parse";
+const NUTRIENT_ACCOUNT_URL = "https://api.nutrient.io/account/info";
 const PAGE_SEPARATOR = "<<<INSIGHT_HUB_PAGE_BREAK>>>";
 
 export interface RemoteExtraction {
@@ -119,6 +120,30 @@ const nutrientPool = new FreeTierCredentialPool(
   [{ envKey: "NUTRIENT_API_KEY" }],
   { rotateOnSuccess: false, accounts: { policyFor: nutrientPolicy, unitsPerCall: 1 } },
 );
+
+/**
+ * Free Nutrient account check (GET /account/info, no credits used), for status reporting. Only the plan name and
+ * numeric credit/usage fields are kept; the response also lists API keys, which are never read out.
+ */
+export async function nutrientAccountInfo(apiKey: string, signal?: AbortSignal): Promise<QuotaSnapshot & { plan: string | null; credits: Record<string, number> }> {
+  const response = await fetch(NUTRIENT_ACCOUNT_URL, { headers: { Authorization: `Bearer ${apiKey}` }, signal: signal ?? AbortSignal.timeout(10_000) });
+  if (response.status === 401 || response.status === 403) throw new ProviderQuotaError(`Nutrient account ${response.status}: authentication failed`, "auth");
+  if (!response.ok) throw new Error(`Nutrient account error ${response.status}`);
+  const json = (await response.json()) as Record<string, unknown>;
+  const credits: Record<string, number> = {};
+  const walk = (value: unknown, path: string) => {
+    if (!value || typeof value !== "object" || /apikey/i.test(path)) return;
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const name = path ? `${path}.${key}` : key;
+      if (/apikey/i.test(key)) continue;
+      if (typeof child === "number" && /credit|usage|used|remaining|limit|total/i.test(name)) credits[name] = child;
+      else if (child && typeof child === "object") walk(child, name);
+    }
+  };
+  walk(json, "");
+  const plan = typeof json.subscriptionType === "string" ? json.subscriptionType : null;
+  return { plan, credits, source: "nutrient:/account/info" };
+}
 
 export function extractionCredentialPools() {
   return { llmwhisperer: whisperPool, nutrient: nutrientPool };

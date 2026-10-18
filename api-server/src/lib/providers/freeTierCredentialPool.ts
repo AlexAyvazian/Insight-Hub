@@ -29,6 +29,21 @@ export interface FreeTierCredentialPoolOptions {
   accounts?: PoolAccountAccounting;
 }
 
+export interface SlotProbe {
+  slot: string;
+  configured: boolean;
+  /** Earlier slot holding the same key; the pool uses it once. */
+  duplicateOf: string | null;
+  /** null when not probed (unconfigured, duplicate, or the pool has no probe). */
+  ok: boolean | null;
+  limit?: number | null;
+  remaining?: number | null;
+  usedToday?: number | null;
+  resetAt?: string | null;
+  source?: string | null;
+  error?: string;
+}
+
 export interface PoolAccountAccounting {
   policyFor(slot: string): AccountPolicy;
   /** Free capacity probe (usage/balance endpoint). Must not consume billable units. */
@@ -293,6 +308,47 @@ export class FreeTierCredentialPool {
 
   async isConfigured(): Promise<boolean> {
     return (await this.credentials()).length > 0;
+  }
+
+  /**
+   * Read-only check of every slot with the pool's free capacity probe (or `probe`). Never returns key material;
+   * a slot holding the same key as an earlier slot is reported as a duplicate and not probed.
+   */
+  async probeSlots(probe?: (apiKey: string, slot: string) => Promise<QuotaSnapshot | null>): Promise<SlotProbe[]> {
+    const check = probe ?? this.accounts?.probe;
+    const seen = new Map<string, string>();
+    const results: SlotProbe[] = [];
+    for (const { dbKey, envKey } of this.slots) {
+      const value = (dbKey ? await resolveCredential(dbKey, envKey) : (process.env[envKey] ?? null))?.trim();
+      if (!value) {
+        results.push({ slot: envKey, configured: false, duplicateOf: null, ok: null });
+        continue;
+      }
+      const duplicateOf = seen.get(value) ?? null;
+      seen.set(value, duplicateOf ?? envKey);
+      if (duplicateOf || !check) {
+        results.push({ slot: envKey, configured: true, duplicateOf, ok: null });
+        continue;
+      }
+      try {
+        const snapshot = await check(value, envKey);
+        results.push({
+          slot: envKey,
+          configured: true,
+          duplicateOf: null,
+          ok: snapshot !== null,
+          limit: snapshot?.limit ?? null,
+          remaining: snapshot?.remaining ?? null,
+          usedToday: snapshot?.usedToday ?? null,
+          resetAt: snapshot?.resetAt ? snapshot.resetAt.toISOString() : null,
+          source: snapshot?.source ?? null,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        results.push({ slot: envKey, configured: true, duplicateOf: null, ok: false, error: message.split(value).join("[redacted]").slice(0, 200) });
+      }
+    }
+    return results;
   }
 
   recordRateLimitHeaders(slot: string, headers: Headers): void {
