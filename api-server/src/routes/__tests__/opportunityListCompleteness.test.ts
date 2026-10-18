@@ -43,7 +43,11 @@ function chain() {
       let result: unknown[] = [];
       if (state.table === opportunitiesTable) {
         // Scan batches use limit/offset; the page fetch (by id) has no limit and the route picks its ids.
-        result = state.limit === undefined ? dataset : dataset.slice(state.offset, state.offset + state.limit);
+        // Scan batches mirror the route's projection: descriptions cut at 8,000 characters and flagged.
+        result = state.limit === undefined ? dataset : dataset.slice(state.offset, state.offset + state.limit).map((r) => {
+          const description = typeof r.description === "string" ? r.description : null;
+          return { ...r, description: description?.slice(0, 8_000) ?? null, descriptionTruncated: (description?.length ?? 0) > 8_000 };
+        });
         if (state.limit !== undefined) selectCalls.push(result.length);
       }
       return Promise.resolve(result).then(resolve, reject);
@@ -88,6 +92,33 @@ describe("complete, bounded listing", () => {
     } finally {
       delete process.env.OPPORTUNITY_LIST_MAX_SCAN_ROWS;
     }
+  });
+
+  it("a ceiling that is not a multiple of the batch size is honored exactly", async () => {
+    process.env.OPPORTUNITY_LIST_MAX_SCAN_ROWS = "1500";
+    try {
+      dataset = Array.from({ length: 2_500 }, (_, i) => row(`row-${i}`));
+      const body = (await (await fetch(`${base}/opportunities?view=all&limit=5`)).json()) as any;
+      assert.equal(body.ranking.candidateCount, 1_500);
+      assert.equal(body.ranking.candidateCap, 1_500);
+      assert.equal(body.ranking.truncated, true);
+    } finally {
+      delete process.env.OPPORTUNITY_LIST_MAX_SCAN_ROWS;
+    }
+  });
+
+  it("classifies on the full description when scope evidence sits past the scan projection", async () => {
+    const late = row("late", {
+      title: "Medical Services RFP",
+      description: `${"General terms and conditions apply. ".repeat(250)}${EXAM}`,
+      providerName: "samGov",
+      samUrl: "https://sam.gov/opp/late/view",
+    });
+    assert.ok(String(late.description).length > 8_000);
+    dataset = [late];
+    const body = (await (await fetch(`${base}/opportunities?view=actionable`)).json()) as any;
+    assert.equal(body.total, 1);
+    assert.equal(body.data[0].id, "late");
   });
 
   it("scans in bounded batches (no single 10k-row load)", async () => {

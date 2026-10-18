@@ -34,7 +34,10 @@ function maxScanRows(): number {
   const parsed = Number.parseInt(process.env.OPPORTUNITY_LIST_MAX_SCAN_ROWS ?? "", 10);
   return Number.isFinite(parsed) && parsed >= SCAN_BATCH_SIZE ? Math.min(parsed, 200_000) : DEFAULT_MAX_SCAN_ROWS;
 }
-/** Description characters used for ranking; the returned page carries the full description. */
+/**
+ * Description characters projected by the scan. Longer descriptions are re-read in full before classification, so
+ * scope evidence or a rejection signal late in a solicitation is never missed; this only bounds the common case.
+ */
 const RANKING_DESCRIPTION_CHARS = 8_000;
 
 interface RankedEntry {
@@ -54,7 +57,25 @@ function rankingScanSelection(table: typeof opportunitiesTable) {
   return {
     ...opportunityListSelection(table),
     description: sql<string | null>`left(${table.description}, ${RANKING_DESCRIPTION_CHARS})`,
+    descriptionTruncated: sql<boolean>`coalesce(length(${table.description}) > ${RANKING_DESCRIPTION_CHARS}, false)`,
   };
+}
+
+/** Restores the full description on scan rows whose projection was cut, so classification sees the whole text. */
+async function withFullDescriptions<T extends { id: unknown; description: string | null; descriptionTruncated?: boolean }>(
+  batch: T[],
+): Promise<T[]> {
+  const ids = batch.filter((row) => row.descriptionTruncated).map((row) => String(row.id));
+  if (!ids.length) return batch;
+  const full = await db
+    .select({ id: opportunitiesTable.id, description: opportunitiesTable.description })
+    .from(opportunitiesTable)
+    .where(inArray(opportunitiesTable.id, ids));
+  const byId = new Map(full.map((row) => [String(row.id), row.description]));
+  return batch.map((row) =>
+    row.descriptionTruncated && byId.has(String(row.id))
+      ? { ...row, description: byId.get(String(row.id)) ?? null }
+      : row);
 }
 
 function parseTags(raw: unknown): string[] {
@@ -317,14 +338,16 @@ router.get("/opportunities", async (req, res) => {
     const scanCeiling = maxScanRows();
     let scanned = 0;
     let truncated = false;
-    for (let offset = 0; ; offset += SCAN_BATCH_SIZE) {
-      const batch = await db
+    for (;;) {
+      // Never request past the ceiling, so a ceiling that is not a multiple of the batch size is honored exactly.
+      const batchLimit = Math.min(SCAN_BATCH_SIZE, scanCeiling - scanned);
+      const batch = await withFullDescriptions(await db
         .select(rankingScanSelection(opportunitiesTable))
         .from(opportunitiesTable)
         .where(where)
         .orderBy(...candidateOrder)
-        .limit(SCAN_BATCH_SIZE)
-        .offset(offset);
+        .limit(batchLimit)
+        .offset(scanned));
       scanned += batch.length;
       const eligible = batch.flatMap((row) => {
         const quality = classifyOpportunityQuality(row);
@@ -364,7 +387,7 @@ router.get("/opportunities", async (req, res) => {
         }
         existing.rank = Math.max(existing.rank, rank);
       }
-      if (batch.length < SCAN_BATCH_SIZE) break;
+      if (batch.length < batchLimit) break;
       if (scanned >= scanCeiling) {
         const more = await db
           .select({ id: opportunitiesTable.id })
