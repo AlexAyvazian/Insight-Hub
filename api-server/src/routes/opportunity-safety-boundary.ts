@@ -1,13 +1,13 @@
 import { Router } from "express";
-import { and, asc, desc, eq, gt, ilike, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, ilike, inArray, or, sql } from "drizzle-orm";
 import { rfpDb as db } from "@workspace/db";
 import { opportunitiesTable } from "@workspace/db/schema";
 import { classifyResult } from "../lib/search/relevance";
 import { decideRelevance } from "../lib/search/relevanceDecision";
 import {
-  canonicalSamOpportunityUrl,
   classifyOpportunityQuality,
   calculateOpportunityRank,
+  canonicalOpportunityKey,
   qualityMatchesView,
   type OpportunityQualityView,
   type OpportunityViewMode,
@@ -26,7 +26,36 @@ const VIEW_MODES = new Set<OpportunityViewMode>([
   "all",
 ]);
 const FEEDBACK_RANK_WEIGHT = 15;
-const MAX_RANKING_CANDIDATES = 10_000;
+/** Rows ranked per database round trip; bounds transient memory per batch. */
+const SCAN_BATCH_SIZE = 1_000;
+/** Safety ceiling for one list request; exceeding it is reported (`truncated`, `totalBasis: "partial"`). */
+const DEFAULT_MAX_SCAN_ROWS = 50_000;
+function maxScanRows(): number {
+  const parsed = Number.parseInt(process.env.OPPORTUNITY_LIST_MAX_SCAN_ROWS ?? "", 10);
+  return Number.isFinite(parsed) && parsed >= SCAN_BATCH_SIZE ? Math.min(parsed, 200_000) : DEFAULT_MAX_SCAN_ROWS;
+}
+/** Description characters used for ranking; the returned page carries the full description. */
+const RANKING_DESCRIPTION_CHARS = 8_000;
+
+interface RankedEntry {
+  id: string;
+  title: string;
+  rank: number;
+  authority: ReturnType<typeof sourceAuthority>;
+  contextualAdjustment: number;
+  contextualFeedback: number;
+  contextHash: string;
+  suppressed: boolean;
+  /** Providers whose records collapsed into this canonical notice (provenance). */
+  sources: string[];
+}
+
+function rankingScanSelection(table: typeof opportunitiesTable) {
+  return {
+    ...opportunityListSelection(table),
+    description: sql<string | null>`left(${table.description}, ${RANKING_DESCRIPTION_CHARS})`,
+  };
+}
 
 function parseTags(raw: unknown): string[] {
   if (Array.isArray(raw)) return raw.map(String);
@@ -84,21 +113,6 @@ function sourceAuthority(provider: unknown): {
     return { label: "discovery", bonus: 20 };
   }
   return { label: "other", bonus: 0 };
-}
-
-function crossSourceKey(row: Record<string, any>): string {
-  const solicitation = String(row.solicitationNumber ?? row.noticeId ?? "")
-    .replace(/[^a-z0-9]/gi, "")
-    .toLowerCase();
-  if (solicitation) {
-    const agency = String(row.agency ?? "")
-      .replace(/[^a-z0-9]/gi, "")
-      .toLowerCase();
-    return `sol:${agency}:${solicitation}`;
-  }
-  const canonicalUrl = canonicalSamOpportunityUrl(row.samUrl);
-  if (canonicalUrl) return `url:${canonicalUrl.toLowerCase()}`;
-  return `id:${row.id}`;
 }
 
 function relevanceView(
@@ -277,7 +291,6 @@ router.get("/opportunities", async (req, res) => {
       );
     }
 
-    const candidateCap = MAX_RANKING_CANDIDATES;
     const prioritizeOpenCandidates = view === "actionable" || view === "all";
     const candidateOrder = prioritizeOpenCandidates
       ? [
@@ -295,89 +308,113 @@ router.get("/opportunities", async (req, res) => {
           sql`${opportunitiesTable.postedDate} DESC NULLS LAST`,
           asc(opportunitiesTable.id),
         ];
+    const where = conditions.length ? and(...conditions) : undefined;
 
-    const candidateRows = await db
-      .select(opportunityListSelection(opportunitiesTable))
-      .from(opportunitiesTable)
-      .where(conditions.length ? and(...conditions) : undefined)
-      .orderBy(...candidateOrder)
-      .limit(candidateCap + 1);
-    const truncated = candidateRows.length > candidateCap;
-    const rows = candidateRows.slice(0, candidateCap);
-
-    const eligibleRows = rows.flatMap((row) => {
-      const quality = classifyOpportunityQuality(row);
-      return qualityMatchesView(quality, view) ? [{ row, quality }] : [];
-    });
-    const context = await contextualAdjustments(
-      eligibleRows.map(({ row }) => row),
-      search || undefined,
-    );
-
-    const best = new Map<
-      string,
-      {
-        item: any;
-        rank: number;
-        authority: ReturnType<typeof sourceAuthority>;
-        contextHash: string;
+    // Scan every matching row in bounded batches with a light projection (description truncated), classify each
+    // once, and keep only a compact ranking entry per canonical notice. Full rows are fetched for the returned page
+    // only. MAX_SCAN_ROWS is a safety ceiling reported through `truncated`, not a silent recall cap.
+    const best = new Map<string, RankedEntry>();
+    const scanCeiling = maxScanRows();
+    let scanned = 0;
+    let truncated = false;
+    for (let offset = 0; ; offset += SCAN_BATCH_SIZE) {
+      const batch = await db
+        .select(rankingScanSelection(opportunitiesTable))
+        .from(opportunitiesTable)
+        .where(where)
+        .orderBy(...candidateOrder)
+        .limit(SCAN_BATCH_SIZE)
+        .offset(offset);
+      scanned += batch.length;
+      const eligible = batch.flatMap((row) => {
+        const quality = classifyOpportunityQuality(row);
+        return qualityMatchesView(quality, view) ? [{ row, quality }] : [];
+      });
+      const context = await contextualAdjustments(
+        eligible.map(({ row }) => row),
+        search || undefined,
+      );
+      for (const { row, quality } of eligible) {
+        const contextual = context.get(String(row.id)) ?? { adjustment: 0, contextHash: "" };
+        const authority = sourceAuthority(row.providerName ?? row.source);
+        const contextualFeedback = Math.max(-5, Math.min(5, contextual.adjustment));
+        const rank = Math.max(0, Math.min(100,
+          calculateOpportunityRank(row, quality).finalRankScore + contextualFeedback));
+        const key = canonicalOpportunityKey(row);
+        const provider = String(row.providerName ?? row.source ?? "unknown");
+        const existing = best.get(key);
+        if (!existing) {
+          best.set(key, {
+            id: String(row.id), title: String(row.title ?? ""), rank, authority,
+            contextualAdjustment: contextual.adjustment, contextualFeedback,
+            contextHash: contextual.contextHash, suppressed: row.userGrade === "spam",
+            sources: [provider],
+          });
+          continue;
+        }
+        if (!existing.sources.includes(provider)) existing.sources.push(provider);
+        const canonicalWins = authority.bonus > existing.authority.bonus ||
+          (authority.bonus === existing.authority.bonus && rank > existing.rank);
+        if (canonicalWins) {
+          Object.assign(existing, {
+            id: String(row.id), title: String(row.title ?? ""), authority,
+            contextualAdjustment: contextual.adjustment, contextualFeedback,
+            contextHash: contextual.contextHash, suppressed: row.userGrade === "spam",
+          });
+        }
+        existing.rank = Math.max(existing.rank, rank);
       }
-    >();
-
-    for (const { row, quality } of eligibleRows) {
-      const contextual = context.get(String(row.id)) ?? {
-        adjustment: 0,
-        context: "",
-        contextHash: "",
-      };
-      const mapped = mapOpportunity(row, contextual.adjustment, quality);
-      const authority = sourceAuthority(row.providerName ?? row.source);
-      const rankBreakdown = calculateOpportunityRank(row, quality);
-      const contextualFeedback = Math.max(-5, Math.min(5, contextual.adjustment));
-      const rank = Math.max(0, Math.min(100,
-        rankBreakdown.finalRankScore + contextualFeedback));
-      const key = crossSourceKey(row);
-      const existing = best.get(key);
-      const canonicalWins = !existing ||
-        authority.bonus > existing.authority.bonus ||
-        (authority.bonus === existing.authority.bonus && rank > existing.rank);
-      if (canonicalWins) {
-        const groupRank = Math.max(rank, existing?.rank ?? 0);
-        best.set(key, {
-          item: {
-            ...mapped,
-            quality,
-            crossSource: {
-              canonicalKey: key,
-              rank: groupRank,
-              rankBreakdown: {
-                ...rankBreakdown,
-                contextualFeedbackAdjustment: contextualFeedback,
-                finalRankScore: groupRank,
-              },
-              authority: authority.label,
-              contextHash: contextual.contextHash,
-              suppressed: row.userGrade === "spam",
-            },
-          },
-          rank: groupRank,
-          authority,
-          contextHash: contextual.contextHash,
-        });
-      } else if (existing && rank > existing.rank) {
-        existing.rank = rank;
-        existing.item.crossSource.rank = rank;
-        existing.item.crossSource.rankBreakdown.finalRankScore = rank;
+      if (batch.length < SCAN_BATCH_SIZE) break;
+      if (scanned >= scanCeiling) {
+        const more = await db
+          .select({ id: opportunitiesTable.id })
+          .from(opportunitiesTable)
+          .where(where)
+          .orderBy(...candidateOrder)
+          .limit(1)
+          .offset(scanned);
+        truncated = more.length > 0;
+        break;
       }
     }
 
     const sorted = Array.from(best.values()).sort((left, right) => {
       if (right.rank !== left.rank) return right.rank - left.rank;
-      return String(left.item.title).localeCompare(String(right.item.title));
+      return left.title.localeCompare(right.title);
     });
     const total = sorted.length;
     const offset = (page - 1) * limit;
-    const data = sorted.slice(offset, offset + limit).map((row) => row.item);
+    const pageEntries = sorted.slice(offset, offset + limit);
+    const pageRows = pageEntries.length
+      ? await db
+          .select(opportunityListSelection(opportunitiesTable))
+          .from(opportunitiesTable)
+          .where(inArray(opportunitiesTable.id, pageEntries.map((entry) => entry.id)))
+      : [];
+    const rowsById = new Map(pageRows.map((row) => [String(row.id), row]));
+    const data = pageEntries.flatMap((entry) => {
+      const row = rowsById.get(entry.id);
+      if (!row) return [];
+      const quality = classifyOpportunityQuality(row);
+      const rankBreakdown = calculateOpportunityRank(row, quality);
+      return [{
+        ...mapOpportunity(row, entry.contextualAdjustment, quality),
+        quality,
+        crossSource: {
+          canonicalKey: canonicalOpportunityKey(row),
+          rank: entry.rank,
+          rankBreakdown: {
+            ...rankBreakdown,
+            contextualFeedbackAdjustment: entry.contextualFeedback,
+            finalRankScore: entry.rank,
+          },
+          authority: entry.authority.label,
+          contextHash: entry.contextHash,
+          suppressed: entry.suppressed,
+          sources: entry.sources,
+        },
+      }];
+    });
 
     return res.json({
       data,
@@ -390,9 +427,11 @@ router.get("/opportunities", async (req, res) => {
         candidateStrategy: prioritizeOpenCandidates
           ? "open-then-fit-v1"
           : "fit-then-recency-v1",
-        candidateCount: rows.length,
-        candidateCap,
+        candidateCount: scanned,
+        candidateCap: scanCeiling,
         truncated,
+        // "exact" when every matching row was ranked; "partial" when the safety ceiling stopped the scan.
+        totalBasis: truncated ? "partial" : "exact",
         canonicalCount: total,
         queryContext: search || null,
       },

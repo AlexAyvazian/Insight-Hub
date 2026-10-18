@@ -349,20 +349,20 @@ export async function contextualAdjustments(
 ): Promise<
   Map<string, { adjustment: number; context: string; contextHash: string }>
 > {
-  const contexts = new Map<string, string>();
-  for (const opportunity of opportunities) {
+  // Derive each opportunity's context once (it runs the classifier) and reuse it for the lookup and the result.
+  const derived = opportunities.map((opportunity) => {
     const context = deriveOpportunityContext(opportunity, explicitContext);
-    contexts.set(contextHash(context), context);
-  }
+    return { opportunity, context, hash: contextHash(context) };
+  });
+  const contexts = new Map<string, string>();
+  for (const { context, hash } of derived) contexts.set(hash, context);
   const states = await loadContexts(contexts);
 
   const result = new Map<
     string,
     { adjustment: number; context: string; contextHash: string }
   >();
-  for (const opportunity of opportunities) {
-    const context = deriveOpportunityContext(opportunity, explicitContext);
-    const hash = contextHash(context);
+  for (const { opportunity, context, hash } of derived) {
     result.set(String(opportunity.id), {
       adjustment: adjustmentFor(
         opportunity,

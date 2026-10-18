@@ -62,22 +62,19 @@ function hasStaleYearOnly(raw: string): boolean {
  * records), which is date/identity validation and not relevance vocabulary.
  */
 function shouldShowOpportunity(opp: any): boolean {
-  const raw = [
-    opp.title,
-    opp.description,
-    opp.agency,
-    opp.providerName,
-    opp.source,
-    opp.solicitationNumber,
-    opp.samUrl,
-  ].filter(Boolean).join(" ");
+  // Notice identity only: an old year in the description ("awarded in 2021", "per the 2019 standard") says nothing
+  // about whether this notice is current.
+  const identity = [opp.title, opp.solicitationNumber, opp.samUrl].filter(Boolean).join(" ");
 
   // Reject untitled / suspiciously short titles
   const title = (opp.title ?? "").trim();
   if (title.length < 10) return false;
 
-  // Reject stale-year-only records (old archived RFPs from past years)
-  if (hasStaleYearOnly(raw)) return false;
+  // Reject stale-year-only records (old archived RFPs from past years), unless the notice has a future deadline.
+  const deadlineInFuture = Boolean(
+    opp.responseDeadline && new Date(opp.responseDeadline).getTime() > Date.now(),
+  );
+  if (!deadlineInFuture && hasStaleYearOnly(identity)) return false;
 
   const result = classifyResult({
     title,

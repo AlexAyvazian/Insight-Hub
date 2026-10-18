@@ -72,6 +72,50 @@ export function primaryOccuMedServiceEvidence(
 ): PrimaryScopeEvidence {
   const base = { profileSource: profile.source, profileVersion: profile.version };
   if (profile.source === "unavailable") return { evidenced: false, path: "none", terms: [], ...base };
+  const terms = scopeTerms(profile);
+  // Normalize the notice text once per call; terms are normalized once per profile.
+  const titleText = ` ${words(title)} `;
+  const has = (text: string, term: NormalizedTerm) => text.includes(` ${term.normalized} `);
+  const titleTerm = terms.titleServiceTerms.find((term) => has(titleText, term));
+  if (titleTerm) return { evidenced: true, path: "title-service-term", terms: [titleTerm.raw], ...base };
+  // Broad title signals are single words by design; whole-token matching keeps "physical" out of "physically"
+  // and "vision" out of "division". Specificity comes from the description phrase, never from the title word.
+  // One broad word plus one phrase is too weak ("Physical Plant ..." with boilerplate), so require independent
+  // corroboration: two distinct broad title signals, or two distinct (non-nested) explicit description phrases.
+  const titleSignals = Array.from(new Set(terms.titleSignals.filter((term) => has(titleText, term)).map((t) => t.raw)));
+  if (titleSignals.length > 0) {
+    const descriptionText = ` ${words(description)} `;
+    const phrases = distinctPhrases(terms.explicit.filter((term) => has(descriptionText, term)).map((t) => t.raw));
+    if (phrases.length > 0 && (titleSignals.length >= 2 || phrases.length >= 2)) {
+      return {
+        evidenced: true,
+        path: "title-signal-and-description-explicit",
+        terms: [...titleSignals, ...phrases],
+        ...base,
+      };
+    }
+  }
+  return { evidenced: false, path: "none", terms: [], ...base };
+}
+
+interface NormalizedTerm {
+  raw: string;
+  normalized: string;
+}
+
+interface ScopeTerms {
+  explicit: NormalizedTerm[];
+  titleServiceTerms: NormalizedTerm[];
+  titleSignals: NormalizedTerm[];
+}
+
+const scopeTermCache = new WeakMap<RelevanceProfile, ScopeTerms>();
+
+/** Profile vocabulary normalized once per profile object (the profile is immutable once published). */
+function scopeTerms(profile: RelevanceProfile): ScopeTerms {
+  const cached = scopeTermCache.get(profile);
+  if (cached) return cached;
+  const normalize = (raw: string): NormalizedTerm => ({ raw, normalized: words(raw) });
   const categories = profile.categories.filter((category) => !category.adjacentOnly);
   const explicit = multiWordTerms([
     ...profile.generalExplicit,
@@ -83,25 +127,13 @@ export function primaryOccuMedServiceEvidence(
     .filter((category) => category.id !== profile.networkCategoryId)
     .flatMap((category) => category.component))
     .filter((term) => !profile.genericTitle.some((generic) => containsCompletePhrase(term, generic)));
-  const titleTerm = [...explicit, ...components].find((term) => containsCompletePhrase(title, term));
-  if (titleTerm) return { evidenced: true, path: "title-service-term", terms: [titleTerm], ...base };
-  // Broad title signals are single words by design; whole-token matching keeps "physical" out of "physically"
-  // and "vision" out of "division". Specificity comes from the description phrase, never from the title word.
-  // One broad word plus one phrase is too weak ("Physical Plant ..." with boilerplate), so require independent
-  // corroboration: two distinct broad title signals, or two distinct (non-nested) explicit description phrases.
-  const titleSignals = Array.from(new Set(profile.titleMedical.filter((term) => containsCompletePhrase(title, term))));
-  if (titleSignals.length > 0) {
-    const phrases = distinctPhrases(explicit.filter((term) => containsCompletePhrase(description, term)));
-    if (phrases.length > 0 && (titleSignals.length >= 2 || phrases.length >= 2)) {
-      return {
-        evidenced: true,
-        path: "title-signal-and-description-explicit",
-        terms: [...titleSignals, ...phrases],
-        ...base,
-      };
-    }
-  }
-  return { evidenced: false, path: "none", terms: [], ...base };
+  const terms: ScopeTerms = {
+    explicit: explicit.map(normalize),
+    titleServiceTerms: [...explicit, ...components].map(normalize),
+    titleSignals: profile.titleMedical.map(normalize).filter((t) => t.normalized.length > 0),
+  };
+  scopeTermCache.set(profile, terms);
+  return terms;
 }
 
 export function hasPrimaryOccuMedServiceEvidence(
