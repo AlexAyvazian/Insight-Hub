@@ -930,7 +930,7 @@ export const REVIEW_QUEUE_TIME_BUDGET_MS = 8 * 60_000;
  * approved come back for staging/promotion; those still unreviewed return to the queue (never dropped).
  */
 async function fetchReviewQueue(options: ProviderRunnerOptions): Promise<ProviderRunResult> {
-  const { claimDueItems, completeItem } = await import("../releaseC/reviewQueue");
+  const { cachedQueueDecisions, claimDueItems, completeItem } = await import("../releaseC/reviewQueue");
   const { opportunityKey } = await import("../releaseC/identity");
   await import("../search/occumedSearchProfile")
     .then((module) => module.getOccuMedSearchProfile())
@@ -942,8 +942,30 @@ async function fetchReviewQueue(options: ProviderRunnerOptions): Promise<Provide
   const { decideStructuredOpportunities } = await import("../search/structuredOpportunityDecision");
   const decided = await decideStructuredOpportunities(
     items.map((item) => item.record),
-    { provider: "reviewQueue", signal: options.signal, timeBudgetMs: options.reviewTimeBudgetMs ?? REVIEW_QUEUE_TIME_BUDGET_MS },
+    {
+      provider: "reviewQueue",
+      signal: options.signal,
+      timeBudgetMs: options.reviewTimeBudgetMs ?? REVIEW_QUEUE_TIME_BUDGET_MS,
+      claimedHashes: new Map(items.map((item) => [item.opportunityKey, item.contentHash])),
+    },
   );
+  // A newer version of an opportunity may have been decided (or queued) by ingestion while this drain reviewed the
+  // claimed snapshot. Its row then carries the newer hash, and this drain's result for the old snapshot is dropped
+  // rather than promoted over the newer decision.
+  const current = await cachedQueueDecisions(items.map((item) => item.opportunityKey)).catch(() => null);
+  const superseded = new Set(
+    current
+      ? items
+          .map((item) => item.opportunityKey)
+          .filter((key) => current.get(key) && current.get(key)!.contentHash !== decided.contentHashes.get(key))
+      : [],
+  );
+  if (superseded.size > 0) {
+    const keep = (record: NormalizedOpportunity) => !superseded.has(opportunityKey(record));
+    decided.approved = decided.approved.filter(keep);
+    decided.rejectedRecords = decided.rejectedRecords.filter(keep);
+    decided.held = decided.held.filter((entry) => keep(entry.record));
+  }
   // Records decided outside the AI path (deterministic approval once documents arrived, or a relevance reject after
   // a profile change) are closed here; AI-path records were settled by the decision itself.
   const closed = new Map<string, Record<string, unknown>>();
@@ -955,7 +977,9 @@ async function fetchReviewQueue(options: ProviderRunnerOptions): Promise<Provide
   for (const record of decided.rejectedRecords) closed.set(opportunityKey(record), { kind: "rejected", code: "structured_relevance_reject" });
   for (const item of items) {
     const decision = closed.get(item.opportunityKey);
-    if (decision) await completeItem(item.id, { status: "decided", decision }).catch(() => undefined);
+    if (decision && !superseded.has(item.opportunityKey)) {
+      await completeItem(item.id, { status: "decided", decision }, decided.contentHashes.get(item.opportunityKey) ?? null).catch(() => undefined);
+    }
   }
   console.info(
     JSON.stringify({

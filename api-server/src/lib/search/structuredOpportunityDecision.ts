@@ -25,6 +25,7 @@ import {
 } from "../providerBudget";
 import { releaseCFlags } from "../releaseC/flags";
 import { judgmentContentHash, opportunityKey, providerModelFamily } from "../releaseC/identity";
+import { isCurrentlyExtracted } from "../documents/types";
 import { cachedQueueDecisions, closeQueuedByKeys, enqueueForReview, reviewPriority, settleByKey, type CachedQueueDecision } from "../releaseC/reviewQueue";
 import {
   classifyWithDocumentEvidence,
@@ -77,6 +78,8 @@ export interface StructuredOpportunityDecisionResult {
   reviewHeld: number;
   reviewer: string | null;
   diagnostics: string[];
+  /** Content hash each decided opportunity was judged on (by opportunity key). */
+  contentHashes: Map<string, string>;
   /** Adaptive review accounting for this call. */
   review: {
     candidates: number;
@@ -387,6 +390,16 @@ type Outcome =
   | { kind: "approved"; method: DecisionMethod; score: number; reason: string; reviewers: string[]; families: string[] }
   | { kind: "held"; code: StructuredHoldCode; reason: string; decided: boolean; retryAt?: Date | null; votes?: FamilyVote[] };
 
+function isReusableOutcome(value: unknown): value is Outcome {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (v.kind === "approved") {
+    return (v.method === "panel-ai-review" || v.method === "single-ai-review") && typeof v.score === "number" &&
+      typeof v.reason === "string" && Array.isArray(v.reviewers) && Array.isArray(v.families);
+  }
+  return v.kind === "held" && typeof v.code === "string" && typeof v.reason === "string" && v.decided === true;
+}
+
 interface PanelRun {
   outcomes: Map<number, Outcome>;
   reviewers: string[];
@@ -570,6 +583,11 @@ export interface DecideStructuredOptions {
   /** Injected reviewers (tests). */
   reviewProviders?: ReviewProvider[];
   now?: number;
+  /**
+   * Content hash each opportunity had when the review-queue drain claimed it. Queue writes for an opportunity whose
+   * row has since moved to another version are skipped, so a newer decision is never overwritten.
+   */
+  claimedHashes?: Map<string, string>;
 }
 
 export async function decideStructuredOpportunities(
@@ -644,14 +662,14 @@ export async function decideStructuredOpportunities(
     const reason = relevance.reasons.join("; ");
     const excluded = Boolean(ledger && ledger.assessment.exclusions.status === "fail" && ledger.assessment.scopeFit.supported === 0);
     const documentsIncomplete =
-      flags.requireDocumentEvidence && (!documents || documents.documents.length === 0 || documents.documents.some((d) => d.extractionStatus !== "extracted"));
+      flags.requireDocumentEvidence && (!documents || documents.documents.length === 0 || documents.documents.some((d) => !isCurrentlyExtracted(d)));
 
     if (ledger && persist && storageAvailable(persist)) {
       await saveLedger(key, hash, ledger).catch((error) => storageFailed(diagnostics, error));
     }
 
     if (documentsIncomplete) {
-      const pending = documents?.documents.filter((d) => d.extractionStatus !== "extracted").length ?? 0;
+      const pending = documents?.documents.filter((d) => !isCurrentlyExtracted(d)).length ?? 0;
       candidates.push({ record: withLedger, key, hash, score: relevance.score, reason, priority, injectionSignals: 0, verdict, ledger });
       held.push({
         record: withLedger,
@@ -698,12 +716,15 @@ export async function decideStructuredOpportunities(
   for (const candidate of reviewable) {
     const hit = cache.get(candidate.key);
     const stored = hit?.decision as { kind?: string; votes?: unknown } | null | undefined;
-    const decision = stored?.kind === "pending_votes" ? null : (stored as (Outcome & { kind?: string }) | null | undefined);
+    // Only a complete AI-review outcome is reused; partial records (pending votes, or the markers written when a
+    // record was settled outside review) are cache misses. An approval is reused only while its deadline is open.
+    const reusable: unknown = stored;
+    const decision = isReusableOutcome(reusable) && (reusable.kind !== "approved" || hasFutureDeadline(candidate.record, now)) ? reusable : null;
     if (hit && hit.contentHash === candidate.hash && stored?.kind === "pending_votes" && Array.isArray(stored.votes)) {
       candidate.priorVotes = (stored.votes as FamilyVote[]).filter((row) => row && typeof row.family === "string" && row.vote);
     }
-    if (hit && hit.contentHash === candidate.hash && (hit.status === "decided" || hit.status === "held") && decision?.kind) {
-      outcomes.set(candidate.key, decision as Outcome);
+    if (hit && hit.contentHash === candidate.hash && (hit.status === "decided" || hit.status === "held") && decision) {
+      outcomes.set(candidate.key, decision);
       cached += 1;
     } else if (candidate.injectionSignals > 0) {
       outcomes.set(candidate.key, {
@@ -820,6 +841,7 @@ export async function decideStructuredOpportunities(
             priority: candidate.priority,
             holdCode: outcome?.kind === "held" ? outcome.code : documentPending.has(candidate.key) ? "structured_document_pending" : "approved",
             reason: outcome?.kind === "held" ? outcome.reason : outcome?.kind === "approved" ? outcome.reason : candidate.reason,
+            expectedHash: options.claimedHashes?.get(candidate.key),
           };
         }),
       );
@@ -853,10 +875,13 @@ export async function decideStructuredOpportunities(
 
   if (storageAvailable(persist) && settledOutsideReview.size > 0) {
     try {
-      const groups = new Map<string, { entries: Array<{ opportunityKey: string; contentHash: string }>; decision: Record<string, unknown>; reason: string }>();
+      const groups = new Map<
+        string,
+        { entries: Array<{ opportunityKey: string; contentHash: string; expectedHash: string | null }>; decision: Record<string, unknown>; reason: string }
+      >();
       for (const [key, settled] of settledOutsideReview) {
         const group = groups.get(settled.reason) ?? { entries: [], decision: settled.decision, reason: settled.reason };
-        group.entries.push({ opportunityKey: key, contentHash: settled.hash });
+        group.entries.push({ opportunityKey: key, contentHash: settled.hash, expectedHash: options.claimedHashes?.get(key) ?? null });
         groups.set(settled.reason, group);
       }
       for (const group of groups.values()) await closeQueuedByKeys(group.entries, group.decision, group.reason);
@@ -875,6 +900,10 @@ export async function decideStructuredOpportunities(
     reviewHeld: held.length,
     reviewer: reviewers.size > 0 ? [...reviewers].join(",") : null,
     diagnostics: Array.from(new Set(diagnostics)).slice(0, 12),
+    contentHashes: new Map([
+      ...[...settledOutsideReview].map(([key, settled]) => [key, settled.hash] as [string, string]),
+      ...candidates.map((candidate) => [candidate.key, candidate.hash] as [string, string]),
+    ]),
     review: {
       candidates: reviewable.length,
       reviewed,

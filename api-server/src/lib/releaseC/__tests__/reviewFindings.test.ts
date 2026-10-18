@@ -126,3 +126,29 @@ describe("Linkup balance probe", () => {
     }
   });
 });
+
+describe("success accounting", () => {
+  it("returns a successful provider result even when recording its usage fails, without retrying", async () => {
+    process.env.RC_ACCT_KEY_1 = "acct-key-one-0000000";
+    process.env.RC_ACCT_KEY_2 = "acct-key-two-0000000";
+    class FailingLedger extends AccountLedger {
+      override async recordUsage(...args: Parameters<AccountLedger["recordUsage"]>): ReturnType<AccountLedger["recordUsage"]> {
+        if (args[2] === "success") throw new Error("connect ECONNRESET while saving usage");
+        return super.recordUsage(...args);
+      }
+    }
+    const ledger = new FailingLedger(new MemoryLedgerStore());
+    const pool = new FreeTierCredentialPool("rc-acct", [{ envKey: "RC_ACCT_KEY_1" }, { envKey: "RC_ACCT_KEY_2" }], {
+      accounts: { ledger, policyFor: (slot) => ({ ...policy, pool: "rc-acct", slot, periodLimit: 100 }) },
+    });
+    let calls = 0;
+    const value = await pool.run(async () => {
+      calls += 1;
+      return "charged-result";
+    });
+    assert.equal(value, "charged-result");
+    assert.equal(calls, 1, "the billable call is not repeated on another account");
+    delete process.env.RC_ACCT_KEY_1;
+    delete process.env.RC_ACCT_KEY_2;
+  });
+});

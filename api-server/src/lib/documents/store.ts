@@ -90,15 +90,24 @@ export async function registerAttachments(
     );
     let documentId = existing.rows[0]?.id as string | undefined;
     if (!documentId) {
-      // An attachment that was withdrawn and is listed again is restored rather than duplicated.
+      // An attachment that was withdrawn and is listed again is restored rather than duplicated. Its content may
+      // have changed while it was withdrawn, so its earlier text stops counting as evidence until it is re-checked.
       const restored = await (await rcPool()).query(
-        `UPDATE opportunity_documents SET superseded_by = NULL, updated_at = now()
+        `UPDATE opportunity_documents SET superseded_by = NULL, retrieval_status = 'recheck', updated_at = now()
           WHERE id = (SELECT id FROM opportunity_documents WHERE opportunity_key = $1 AND source_url = $2 AND superseded_by = $3
                       ORDER BY first_seen_at DESC LIMIT 1)
           RETURNING id`,
         [opportunityKey, attachment.url, WITHDRAWN],
       );
       documentId = restored.rows[0]?.id as string | undefined;
+      if (documentId) {
+        // Re-check now, whatever the freshness window of its earlier job (an unchanged hash costs only a fetch).
+        await (await rcPool()).query(
+          `UPDATE document_extraction_jobs SET status = 'queued', next_attempt_at = now(), updated_at = now()
+            WHERE document_id = $1 AND status <> 'running'`,
+          [documentId],
+        );
+      }
     }
     if (!documentId) {
       documentId = randomUUID();
@@ -241,27 +250,47 @@ export async function recordDocumentVersion(
   return { documentId: id, changed: true };
 }
 
-export async function replaceSections(documentId: string, opportunityKey: string, sections: DocumentSection[]): Promise<void> {
-  await (await rcPool()).query(`DELETE FROM opportunity_document_sections WHERE document_id = $1`, [documentId]);
-  for (const section of sections) {
-    await (await rcPool()).query(
-      `INSERT INTO opportunity_document_sections (id, document_id, opportunity_key, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [randomUUID(), documentId, opportunityKey, section.ordinal, section.pageStart, section.pageEnd, section.heading, section.kind, section.text, section.text.length, sha256Hex(section.text)],
-    );
+/** Runs work in one transaction on one client, so a failed write leaves the earlier sections in place. */
+async function inTransaction<T>(work: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount: number | null }> }) => Promise<T>): Promise<T> {
+  const client = await (await rcPool()).connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
   }
+}
+
+export async function replaceSections(documentId: string, opportunityKey: string, sections: DocumentSection[]): Promise<void> {
+  await inTransaction(async (client) => {
+    await client.query(`DELETE FROM opportunity_document_sections WHERE document_id = $1`, [documentId]);
+    for (const section of sections) {
+      await client.query(
+        `INSERT INTO opportunity_document_sections (id, document_id, opportunity_key, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [randomUUID(), documentId, opportunityKey, section.ordinal, section.pageStart, section.pageEnd, section.heading, section.kind, section.text, section.text.length, sha256Hex(section.text)],
+      );
+    }
+  });
 }
 
 export async function copySections(fromDocumentId: string, toDocumentId: string, opportunityKey: string): Promise<number> {
   // Replaces, never appends, so a reactivated row does not end up with duplicate sections.
-  await (await rcPool()).query(`DELETE FROM opportunity_document_sections WHERE document_id = $1`, [toDocumentId]);
-  const result = await (await rcPool()).query(
-    `INSERT INTO opportunity_document_sections (id, document_id, opportunity_key, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256)
-     SELECT gen_random_uuid()::text, $2, $3, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256
-     FROM opportunity_document_sections WHERE document_id = $1`,
-    [fromDocumentId, toDocumentId, opportunityKey],
-  );
-  return result.rowCount ?? 0;
+  return inTransaction(async (client) => {
+    await client.query(`DELETE FROM opportunity_document_sections WHERE document_id = $1`, [toDocumentId]);
+    const result = await client.query(
+      `INSERT INTO opportunity_document_sections (id, document_id, opportunity_key, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256)
+       SELECT gen_random_uuid()::text, $2, $3, ordinal, page_start, page_end, heading, section_kind, text, char_count, sha256
+       FROM opportunity_document_sections WHERE document_id = $1`,
+      [fromDocumentId, toDocumentId, opportunityKey],
+    );
+    return result.rowCount ?? 0;
+  });
 }
 
 export async function documentsFor(opportunityKey: string): Promise<StoredDocument[]> {
@@ -278,7 +307,8 @@ export async function sectionsFor(opportunityKey: string): Promise<StoredSection
   const result = await (await rcPool()).query(
     `SELECT s.*, d.title AS document_title, d.source_url FROM opportunity_document_sections s
      JOIN opportunity_documents d ON d.id = s.document_id
-     WHERE s.opportunity_key = $1 AND d.superseded_by IS NULL ORDER BY d.first_seen_at, s.ordinal`,
+     WHERE s.opportunity_key = $1 AND d.superseded_by IS NULL AND d.retrieval_status <> 'recheck'
+     ORDER BY d.first_seen_at, s.ordinal`,
     [opportunityKey],
   );
   return result.rows.map((row) => ({

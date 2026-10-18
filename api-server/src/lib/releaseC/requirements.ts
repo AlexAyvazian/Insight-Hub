@@ -14,7 +14,7 @@ import { rcPool } from "./db";
 import type { NormalizedOpportunity } from "../providers/types";
 import { classifyResult } from "../search/relevance";
 import { getRelevanceProfile } from "../search/relevanceProfile";
-import type { SectionKind } from "../documents/types";
+import { isCurrentlyExtracted, type SectionKind } from "../documents/types";
 import { ensureReleaseCSchema } from "./schema";
 
 export type RequirementCategory = "scope" | "exclusion" | "eligibility" | "deadline" | "location" | "pricing" | "evaluation";
@@ -229,7 +229,7 @@ export function buildAssessment(record: NormalizedOpportunity, requirements: Req
   const eligibilityReqs = requirements.filter((r) => r.category === "eligibility").length;
 
   const docs = context.documents;
-  const extracted = docs.filter((d) => d.extractionStatus === "extracted").length;
+  const extracted = docs.filter(isCurrentlyExtracted).length;
   const pendingOrFailed = docs.length - extracted;
   const completeness: AssessmentAxis["status"] = !context.documentPipelineEnabled
     ? "unknown"

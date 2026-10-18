@@ -49,6 +49,12 @@ export interface AttachmentRef {
   amendedAt: Date | null;
 }
 
-export type RetrievalStatus = "pending" | "fetched" | "failed" | "blocked" | "unsupported" | "too_large";
+/** "recheck": a withdrawn attachment listed again; its earlier text is not evidence until the content is re-checked. */
+export type RetrievalStatus = "pending" | "fetched" | "failed" | "blocked" | "unsupported" | "too_large" | "recheck";
+
+/** Whether a document's extracted text is current evidence (fully extracted and not awaiting a re-check). */
+export function isCurrentlyExtracted(document: { extractionStatus: string; retrievalStatus: string }): boolean {
+  return document.extractionStatus === "extracted" && document.retrievalStatus !== "recheck";
+}
 
 export type ExtractionStatus = "pending" | "extracted" | "partial" | "failed" | "needs_ocr" | "quota_wait" | "unsupported";

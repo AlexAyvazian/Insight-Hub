@@ -144,6 +144,10 @@ async function persistDurableCooldown(
   }
 }
 
+function logAccountingFailure(poolId: string, slot: string, error: unknown): void {
+  console.warn(JSON.stringify({ event: "account_usage_record_failed", pool: poolId, slot, error: error instanceof Error ? error.message : String(error) }));
+}
+
 async function clearDurableCooldown(poolId: string, slot: string): Promise<void> {
   try {
     await rfpDb
@@ -436,10 +440,9 @@ export class FreeTierCredentialPool {
     };
     const ledger = this.accounts ? (this.accounts.ledger ?? sharedAccountLedger()) : null;
     const policy = this.accounts?.policyFor(slot);
+    let value: T;
     try {
-      const value = await operation(credential.value, slot, context);
-      if (ledger && policy && reportedUnits > 0) await ledger.recordUsage(policy, reportedUnits, "success", reportedQuality);
-      return value;
+      value = await operation(credential.value, slot, context);
     } catch (error) {
       if (ledger && policy) {
         if (reportedUnits > 0) await ledger.recordUsage(policy, reportedUnits, "failure", reportedQuality).catch(() => undefined);
@@ -449,6 +452,11 @@ export class FreeTierCredentialPool {
       }
       throw error;
     }
+    // The provider call succeeded (and was charged); a bookkeeping failure must never turn it into a retry.
+    if (ledger && policy && reportedUnits > 0) {
+      await ledger.recordUsage(policy, reportedUnits, "success", reportedQuality).catch((error) => logAccountingFailure(this.id, slot, error));
+    }
+    return value;
   }
 
   async run<T>(
@@ -513,8 +521,13 @@ export class FreeTierCredentialPool {
         if (this.accounts) {
           const ledger = this.accounts.ledger ?? sharedAccountLedger();
           const policy = this.accounts.policyFor(candidate.slot);
-          await ledger.recordUsage(policy, reportedUnits ?? plannedUnits, "success", reportedQuality);
-          if (reportedSnapshot) await ledger.recordSnapshot(policy, reportedSnapshot);
+          // The provider call succeeded (and was charged); a bookkeeping failure must never turn it into a retry.
+          try {
+            await ledger.recordUsage(policy, reportedUnits ?? plannedUnits, "success", reportedQuality);
+            if (reportedSnapshot) await ledger.recordSnapshot(policy, reportedSnapshot);
+          } catch (accountingError) {
+            logAccountingFailure(this.id, candidate.slot, accountingError);
+          }
         }
         release();
         state.successes += 1;

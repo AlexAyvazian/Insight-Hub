@@ -209,5 +209,10 @@ describe("withdrawn attachments", () => {
     await registerAttachments(key, [ref(sow)], 1, { authoritative: true });
     const current = await documentsFor(key);
     assert.deepEqual(current.map((d) => d.sourceUrl), [sow], "the relisted attachment is restored, not duplicated");
+    assert.equal(current[0]!.retrievalStatus, "recheck", "its earlier text is not evidence until it is re-checked");
+    const { rcPool } = await import("../db");
+    const job = await (await rcPool()).query(`SELECT status, next_attempt_at <= now() AS due FROM document_extraction_jobs WHERE document_id = $1`, [current[0]!.id]);
+    assert.equal(job.rows[0]?.status, "queued");
+    assert.equal(job.rows[0]?.due, true, "the re-check is due now");
   });
 });

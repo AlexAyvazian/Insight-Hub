@@ -17,6 +17,7 @@ import type { RelevanceResult } from "../search/relevance";
 import { decideRelevance, type RelevanceVerdict } from "../search/relevanceDecision";
 import { discoverAttachments, hasAuthoritativeAttachmentList } from "../documents/attachments";
 import { documentsFor, registerAttachments, sectionsFor, type StoredDocument } from "../documents/store";
+import { isCurrentlyExtracted } from "../documents/types";
 import { countInjectionSignals } from "../security/untrustedContent";
 import type { ReleaseCFlags } from "./flags";
 import { evidenceExcerpts, type EvidenceSection } from "./requirements";
@@ -66,9 +67,10 @@ export async function loadDocumentContext(
     const excerpt = evidenceExcerpts(sections, DOCUMENT_EVIDENCE_CHARS);
     // Every current document counts, including ones not fetched yet, so a newly listed attachment changes the
     // judgment hash at once and a decision made before it was read is not reused.
-    const identities = documents.map((d) => d.sha256 ?? `pending:${d.sourceUrl}`);
+    // A restored attachment awaiting its re-check counts as pending too, so an earlier decision is not reused.
+    const identities = documents.map((d) => (d.sha256 && d.retrievalStatus !== "recheck" ? d.sha256 : `pending:${d.sourceUrl}`));
     const hashes = documents.map((d) => d.sha256).filter((h): h is string => Boolean(h));
-    const extracted = documents.filter((d) => d.extractionStatus === "extracted").length;
+    const extracted = documents.filter(isCurrentlyExtracted).length;
     return {
       available: true,
       sections,

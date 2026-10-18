@@ -116,8 +116,12 @@ async function withRoutedSlot(work) {
 }
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length', 'upgrade', 'proxy-connection']);
 
-/** One request from Node, connected only to a validated address. */
-function pinnedRequest(target, addresses, { method, headers, body }) {
+/**
+ * One request from Node, connected only to a validated address. The socket timeout only fires when the connection
+ * is idle, so a wall-clock deadline (TIMEOUT_MS, or the caller's absolute deadlineAt if sooner) also bounds a
+ * response that trickles in slowly.
+ */
+function pinnedRequest(target, addresses, { method, headers, body, deadlineAt }) {
   const pinned = addresses[0];
   const client = target.protocol === 'https:' ? https : http;
   const outgoing = { ...headers, 'accept-encoding': 'identity' };
@@ -125,9 +129,11 @@ function pinnedRequest(target, addresses, { method, headers, body }) {
   return new Promise((resolve, reject) => {
     let size = 0;
     let settled = false;
+    let deadline = null;
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       releaseBytes(size);
       req.destroy(error);
       reject(error);
@@ -162,6 +168,7 @@ function pinnedRequest(target, addresses, { method, headers, body }) {
           }
           if (settled) return;
           settled = true;
+          clearTimeout(deadline);
           // The caller releases the body's bytes (releaseBytes) once it has handed the body on.
           resolve({ status: res.statusCode || 502, headers: outHeaders, body: Buffer.concat(chunks) });
         });
@@ -171,6 +178,8 @@ function pinnedRequest(target, addresses, { method, headers, body }) {
     );
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.on('error', fail);
+    const budget = Math.min(TIMEOUT_MS, deadlineAt ? deadlineAt - Date.now() : TIMEOUT_MS);
+    deadline = setTimeout(() => fail(new Error('request deadline exceeded')), Math.max(0, budget));
     if (body) req.write(body);
     req.end();
   });
@@ -185,7 +194,8 @@ const MAX_REDIRECTS = 5;
  */
 async function pinnedFetch(rawUrl, init) {
   let target = new URL(rawUrl);
-  let request = { ...init };
+  // Every hop shares one absolute deadline, so redirects cannot each take a fresh full timeout.
+  let request = { ...init, deadlineAt: init.deadlineAt ?? Date.now() + TIMEOUT_MS };
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     if (!['http:', 'https:'].includes(target.protocol)) throw new Error('blocked protocol');
     if (target.username || target.password) throw new Error('credentials in URL');
@@ -323,7 +333,7 @@ async function crawlUrl(url, options = {}) {
     url = await assertCrawlableUrl(url);
     // Resolve redirects first (pinned and re-validated per hop) so the page loads at its final URL and relative
     // links resolve correctly.
-    const resolved = await pinnedFetch(url, { method: 'GET', headers: { 'user-agent': USER_AGENT }, body: null });
+    const resolved = await pinnedFetch(url, { method: 'GET', headers: { 'user-agent': USER_AGENT }, body: null, deadlineAt: startTime + timeout });
     releaseBytes(resolved.body.length);
     url = resolved.url;
     page = await getPage();

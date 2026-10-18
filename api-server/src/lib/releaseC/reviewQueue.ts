@@ -87,6 +87,11 @@ export interface EnqueueInput {
   priority: number;
   holdCode: string;
   reason: string;
+  /**
+   * The content hash the caller started from (the review-queue drain passes the hash it claimed). When the row has
+   * meanwhile moved to a different version, this write is stale and is skipped.
+   */
+  expectedHash?: string;
 }
 
 /**
@@ -113,6 +118,11 @@ export async function enqueueForReview(items: EnqueueInput[]): Promise<{ queued:
         [randomUUID(), item.opportunityKey, item.provider, JSON.stringify(item.record), item.contentHash, item.profileVersion, item.priority, item.holdCode, item.reason.slice(0, 500), item.record.responseDeadline ?? null],
       );
       queued += 1;
+      continue;
+    }
+    if (item.expectedHash && row.content_hash !== item.expectedHash && row.content_hash !== item.contentHash) {
+      // A newer version reached the queue while this one was being reviewed; it is never overwritten.
+      unchanged += 1;
       continue;
     }
     if (row.content_hash === item.contentHash) {
@@ -169,22 +179,27 @@ export async function claimDueItems(limit: number): Promise<QueueItem[]> {
 export async function completeItem(
   id: string,
   outcome: { status: "decided" | "held" | "queued"; decision?: Record<string, unknown> | null; holdCode?: string | null; reason?: string; retryAt?: Date | null },
+  contentHash: string | null = null,
 ): Promise<void> {
+  // With a content hash, a row that has moved on to a newer version is left alone.
   await (await rcPool()).query(
     `UPDATE opportunity_review_queue SET status = $2, decision = coalesce($3, decision), hold_code = coalesce($4, hold_code),
        reason = coalesce($5, reason), next_attempt_at = coalesce($6, next_attempt_at),
        decided_at = CASE WHEN $2 = 'decided' THEN now() ELSE decided_at END, updated_at = now()
-     WHERE id = $1`,
-    [id, outcome.status, outcome.decision ? JSON.stringify(outcome.decision) : null, outcome.holdCode ?? null, outcome.reason?.slice(0, 500) ?? null, outcome.retryAt ?? null],
+     WHERE id = $1 AND ($7::text IS NULL OR content_hash = $7)`,
+    [id, outcome.status, outcome.decision ? JSON.stringify(outcome.decision) : null, outcome.holdCode ?? null, outcome.reason?.slice(0, 500) ?? null, outcome.retryAt ?? null, contentHash],
   );
 }
 
 /**
- * Closes waiting queue rows for opportunities whose current version was decided outside AI review (deterministic
- * approval or a relevance reject), so a later drain never reviews or promotes the stale queued snapshot.
+ * Closes queue rows for opportunities whose current version was decided outside AI review (deterministic approval
+ * or a relevance reject), so a later drain never reviews or promotes the stale snapshot. Rows a drain is reviewing
+ * right now (in_review) are closed too: they take the new version's hash, so the drain's result for the old
+ * version no longer matches the row and is discarded (see settleByKey, completeItem and the drain's hash check).
+ * With expectedHash (the drain's own call), a row that has moved on to another version is left alone.
  */
 export async function closeQueuedByKeys(
-  entries: Array<{ opportunityKey: string; contentHash: string }>,
+  entries: Array<{ opportunityKey: string; contentHash: string; expectedHash?: string | null }>,
   decision: Record<string, unknown>,
   reason: string,
 ): Promise<void> {
@@ -193,9 +208,16 @@ export async function closeQueuedByKeys(
   await (await rcPool()).query(
     `UPDATE opportunity_review_queue q SET status = 'decided', content_hash = v.hash, decision = $3, reason = $4,
        decided_at = now(), updated_at = now()
-     FROM unnest($1::text[], $2::text[]) AS v(key, hash)
-     WHERE q.opportunity_key = v.key AND q.status IN ('queued','held')`,
-    [entries.map((e) => e.opportunityKey), entries.map((e) => e.contentHash), JSON.stringify(decision), reason.slice(0, 500)],
+     FROM unnest($1::text[], $2::text[], $5::text[]) AS v(key, hash, expected)
+     WHERE q.opportunity_key = v.key AND q.status IN ('queued','held','in_review')
+       AND (v.expected IS NULL OR q.content_hash IN (v.expected, v.hash))`,
+    [
+      entries.map((e) => e.opportunityKey),
+      entries.map((e) => e.contentHash),
+      JSON.stringify(decision),
+      reason.slice(0, 500),
+      entries.map((e) => e.expectedHash ?? null),
+    ],
   );
 }
 

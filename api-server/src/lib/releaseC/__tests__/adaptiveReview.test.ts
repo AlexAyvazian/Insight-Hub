@@ -155,6 +155,62 @@ describe("review queue persistence", () => {
     assert.equal(row?.status, "decided");
     assert.equal((row?.decision as { method?: string } | null)?.method, "deterministic");
   });
+
+  it("never lets an in-flight review of an older version overwrite a newer decision", async () => {
+    const { cachedQueueDecisions } = await import("../reviewQueue");
+    const { opportunityKey } = await import("../identity");
+    const { rcPool } = await import("../db");
+    const record = ambiguous(Date.now() + 2);
+    const failing = judge("mistral-small-latest", () => true, { fail: true });
+    await decideStructuredOpportunities([record], { persist: true, reviewProviders: [failing], timeBudgetMs: 60_000 });
+    const key = opportunityKey(record);
+    const claimedHash = (await cachedQueueDecisions([key])).get(key)!.contentHash;
+    // A drain claims the old version...
+    await (await rcPool()).query(`UPDATE opportunity_review_queue SET status = 'in_review' WHERE opportunity_key = $1`, [key]);
+
+    // ...while ingestion approves the amended version deterministically.
+    const amended = { ...record, responseDeadline: new Date(Date.now() + 20 * DAY_MS) } as NormalizedOpportunity;
+    await decideStructuredOpportunities([amended], { persist: true, reviewProviders: [], timeBudgetMs: 60_000 });
+    const newer = (await cachedQueueDecisions([key])).get(key)!;
+    assert.equal(newer.status, "decided");
+    assert.notEqual(newer.contentHash, claimedHash);
+
+    // The drain's AI approval of the old snapshot finishes afterwards.
+    const a = judge("mistral-small-latest", () => true);
+    const b = judge("deepseek-chat", () => true);
+    const drained = await decideStructuredOpportunities([record], {
+      persist: true,
+      provider: "reviewQueue",
+      reviewProviders: [a, b],
+      timeBudgetMs: 60_000,
+      claimedHashes: new Map([[key, claimedHash]]),
+    });
+    const after = (await cachedQueueDecisions([key])).get(key)!;
+    assert.equal(after.contentHash, newer.contentHash, "the newer version's row is kept");
+    assert.equal((after.decision as { method?: string } | null)?.method, "deterministic");
+    assert.notEqual(drained.contentHashes.get(key), after.contentHash, "so the drain drops its stale result");
+  });
+
+  it("reuses only complete AI-review outcomes from the queue", async () => {
+    const { cachedQueueDecisions } = await import("../reviewQueue");
+    const { opportunityKey } = await import("../identity");
+    const { rcPool } = await import("../db");
+    const record = ambiguous(Date.now() + 3);
+    const failing = judge("mistral-small-latest", () => true, { fail: true });
+    await decideStructuredOpportunities([record], { persist: true, reviewProviders: [failing], timeBudgetMs: 60_000 });
+    const key = opportunityKey(record);
+    // A settled-outside-review marker for the same content hash is not a reusable approval.
+    await (await rcPool()).query(
+      `UPDATE opportunity_review_queue SET status = 'decided', decision = $2 WHERE opportunity_key = $1`,
+      [key, JSON.stringify({ kind: "approved", method: "deterministic" })],
+    );
+    assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "decided");
+    const a = judge("mistral-small-latest", () => false);
+    const b = judge("deepseek-chat", () => false);
+    const result = await decideStructuredOpportunities([record], { persist: true, reviewProviders: [a, b], timeBudgetMs: 60_000 });
+    assert.ok(a.calls.length + b.calls.length > 0, "the record was reviewed instead of reusing the marker");
+    assert.equal(result.approved.length, 0);
+  });
 });
 
 describe("review priority", () => {
