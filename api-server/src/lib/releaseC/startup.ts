@@ -18,6 +18,12 @@ type Log = { info: (obj: object, msg?: string) => void; warn: (obj: object, msg?
 
 let child: ChildProcess | null = null;
 let stopped = false;
+const workerState = { starts: 0, exits: 0, lastStartAt: null as string | null, lastExit: null as Record<string, unknown> | null };
+
+/** Document worker child status for the Release C status endpoint. */
+export function documentWorkerState() {
+  return { running: Boolean(child && child.exitCode === null && !child.killed), pid: child?.pid ?? null, ...workerState };
+}
 const timers: Array<ReturnType<typeof setInterval>> = [];
 
 function workerEntry(): string | null {
@@ -37,6 +43,8 @@ function startWorkerChild(log: Log, attempt = 0): void {
   const heapMb = Math.max(64, Math.min(256, Number(process.env.DOCUMENT_WORKER_HEAP_MB ?? 128)));
   const spawned = spawn(process.execPath, [`--max-old-space-size=${heapMb}`, entry], { env: process.env, stdio: ["ignore", "inherit", "inherit"] });
   child = spawned;
+  workerState.starts += 1;
+  workerState.lastStartAt = new Date().toISOString();
   log.info({ event: "document_worker_started", pid: spawned.pid, heapMb }, "Document extraction worker started");
   // A spawn failure emits "error" (possibly followed by "exit"); restart is scheduled once either way, and the
   // error never reaches the web process as an unhandled event.
@@ -45,6 +53,8 @@ function startWorkerChild(log: Log, attempt = 0): void {
     if (child === spawned) child = null;
     if (stopped || restartScheduled) return;
     restartScheduled = true;
+    workerState.exits += 1;
+    workerState.lastExit = { ...details, at: new Date().toISOString() };
     const delay = Math.min(30 * 60_000, 30_000 * 2 ** Math.min(attempt, 6));
     log.warn({ event: "document_worker_exited", ...details, restartInMs: delay }, "Document extraction worker exited");
     setTimeout(() => startWorkerChild(log, attempt + 1), delay).unref();
