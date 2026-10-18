@@ -34,7 +34,24 @@ export const QUALITY_REJECTION_CODES = {
   insufficientCombination: "insufficient_evidence_combination",
   manualQueryMismatch: "manual_query_mismatch",
   unknownPostedDate: "unknown_posted_date",
+  structuredReviewHeld: "structured_review_held",
 } as const;
+
+/** Set by the structured-provider decision on records it did not approve (see providerRunner). */
+export interface StructuredDecisionMarker {
+  status: "held" | "rejected";
+  code: string;
+  reason: string;
+}
+
+function structuredDecisionMarker(record: NormalizedOpportunity): StructuredDecisionMarker | null {
+  const marker = (record.rawData as Record<string, unknown> | undefined)?.structuredDecision as
+    | Partial<StructuredDecisionMarker>
+    | undefined;
+  return marker && (marker.status === "held" || marker.status === "rejected") && typeof marker.reason === "string"
+    ? (marker as StructuredDecisionMarker)
+    : null;
+}
 
 function encodedQualityReason(code: string, detail: string): string {
   const legacy = "Record failed the configured Occu-Med opportunity relevance filter.";
@@ -291,6 +308,25 @@ export function decideOpportunityQuality(
     return {
       status: "rejected",
       reason: relevanceRejectionReason(relevance),
+      completenessScore,
+      sourceConfidence,
+    };
+  }
+  // A structured-provider record that was held (AI budget, decline or failure) or rejected upstream is staged for
+  // audit/review but never promoted, whatever the classifier says here.
+  const structured = structuredDecisionMarker(record);
+  if (structured?.status === "rejected") {
+    return {
+      status: "rejected",
+      reason: encodedQualityReason(QUALITY_REJECTION_CODES.hardReject, `${structured.code}: ${structured.reason}`),
+      completenessScore,
+      sourceConfidence,
+    };
+  }
+  if (structured?.status === "held") {
+    return {
+      status: "quarantined",
+      reason: encodedQualityReason(QUALITY_REJECTION_CODES.structuredReviewHeld, `${structured.code}: ${structured.reason}`),
       completenessScore,
       sourceConfidence,
     };

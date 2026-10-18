@@ -1,3 +1,4 @@
+import type { StructuredDecisionMarker } from "./opportunityIdentity";
 import type {
   NormalizedOpportunity,
   ProviderProgressEvent,
@@ -86,6 +87,8 @@ type DiscoveryProvider = (typeof DISCOVERY_PROVIDER_ORDER)[number];
 
 export interface ProviderRunResult {
   records: NormalizedOpportunity[];
+  /** Records approved for promotion; `records` may also carry held/rejected records staged for audit only. */
+  approvedCount?: number;
   errors: string[];
   expiredSkipped?: number;
   diagnostics?: Record<string, unknown>;
@@ -166,7 +169,19 @@ function applyProviderGuards(
   };
 }
 
-async function applyStructuredFederalDecision(
+function withStructuredDecision(
+  record: NormalizedOpportunity,
+  decision: StructuredDecisionMarker,
+): NormalizedOpportunity {
+  return { ...record, rawData: { ...(record.rawData ?? {}), structuredDecision: decision } };
+}
+
+/** Approved records in a provider result (held/rejected audit records excluded). */
+export function approvedRecordCount(result: ProviderRunResult): number {
+  return result.approvedCount ?? result.records.length;
+}
+
+export async function applyStructuredFederalDecision(
   provider: string,
   records: NormalizedOpportunity[],
   errors: string[],
@@ -212,8 +227,17 @@ async function applyStructuredFederalDecision(
       reviewer: decided.reviewer,
     }),
   );
+  // Held and rejected records are returned (flagged) so ingestion stages them in raw/staging with a non-accepted
+  // quality status: they stay auditable and reviewable, and decideOpportunityQuality never promotes them.
+  const audited = [
+    ...decided.held.map(({ record, code, reason }) =>
+      withStructuredDecision(record, { status: "held", code, reason })),
+    ...decided.rejectedRecords.map((record) =>
+      withStructuredDecision(record, { status: "rejected", code: "structured_relevance_reject", reason: "Canonical relevance decision rejected the record." })),
+  ];
   return {
-    records: decided.approved,
+    records: [...decided.approved, ...audited],
+    approvedCount: decided.approved.length,
     errors: guarded.errors,
     expiredSkipped: guarded.expiredSkipped,
     diagnostics: {
@@ -367,13 +391,13 @@ async function fetchSamGovPublicSearchFallback(
     options,
     diagnostics,
   );
-  await recordProviderSuccess("samGov", guarded.records.length);
+  await recordProviderSuccess("samGov", approvedRecordCount(guarded));
   recordIngestionProviderTelemetry(options.runId, {
     provider: "samGov",
     status: "warning",
     queryCount: 1,
     queries: [samSearch],
-    accepted: guarded.records.length,
+    accepted: approvedRecordCount(guarded),
     aiScorers: result.stats.aiScorers,
     spent: true,
     note: "Structured SAM API recovered through official SAM.gov public pages",
@@ -381,7 +405,7 @@ async function fetchSamGovPublicSearchFallback(
   console.warn(
     JSON.stringify({
       event: "sam_gov_public_search_recovered",
-      records: guarded.records.length,
+      records: approvedRecordCount(guarded),
       structuredError:
         structuredError instanceof Error
           ? structuredError.message
@@ -440,7 +464,7 @@ async function fetchStructuredFederalProvider(
         provider,
         result.records.length,
         upstreamErrors,
-        decided.records.length,
+        approvedRecordCount(decided),
       );
       recordIngestionProviderTelemetry(options.runId, {
         provider,
@@ -448,7 +472,7 @@ async function fetchStructuredFederalProvider(
         queryCount: numericDiagnostic(result.diagnostics, "queryCount"),
         queries: stringArrayDiagnostic(result.diagnostics, "queries"),
         candidates: result.records.length,
-        accepted: decided.records.length,
+        accepted: approvedRecordCount(decided),
         spent: true,
         note: result.diagnostics?.recoveryUsed
           ? "SAM structured search used official-page recovery"
@@ -476,13 +500,13 @@ async function fetchStructuredFederalProvider(
       provider,
       result.records.length,
       upstreamErrors,
-      decided.records.length,
+      approvedRecordCount(decided),
     );
     recordIngestionProviderTelemetry(options.runId, {
       provider,
       status: upstreamErrors.length > 0 ? "warning" : "used",
       candidates: result.records.length,
-      accepted: decided.records.length,
+      accepted: approvedRecordCount(decided),
       spent: true,
       note: "Independent structured federal source",
     });
