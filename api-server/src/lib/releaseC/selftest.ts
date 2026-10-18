@@ -106,6 +106,16 @@ async function waitForDocument(key: string, url: string, settled: (doc: Awaited<
   return null;
 }
 
+/** OCR output may space or break the digits ("4 7 2 1"), so the marker is matched with whitespace removed. */
+export function hasMarker(text: string): boolean {
+  return text.replace(/\s+/g, "").includes(SELFTEST_OCR_MARKER);
+}
+
+/** A short sample of synthetic fixture text, so a failed check shows what the extractor actually returned. */
+function sample(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
 async function step(run: SelftestRun, name: SelftestStep["name"], work: () => Promise<Omit<SelftestStep, "name">>): Promise<void> {
   try {
     run.steps.push({ name, ...(await work()) });
@@ -128,11 +138,11 @@ async function execute(run: SelftestRun, base: string): Promise<void> {
     const done = await waitForDocument(keyA, scannedUrl, (doc) => doc.extractionStatus !== "pending");
     if (!done) return { ok: false, detail: "worker did not finish the scanned page in time" };
     const text = (await sectionsFor(keyA)).filter((s) => s.documentId === done.doc.id).map((s) => s.text).join(" ");
-    const ok = done.doc.extractionStatus === "extracted" && text.includes(SELFTEST_OCR_MARKER);
+    const ok = done.doc.extractionStatus === "extracted" && hasMarker(text);
     return {
       ok,
-      detail: ok ? `scanned page read by ${done.doc.extractionProvider}` : `status ${done.doc.extractionStatus}; marker ${text.includes(SELFTEST_OCR_MARKER) ? "found" : "missing"}`,
-      evidence: { status: done.doc.extractionStatus, method: done.doc.extractionMethod, provider: done.doc.extractionProvider, pages: `${done.doc.extractedPageCount}/${done.doc.pageCount}`, job: done.job.status, jobError: done.job.lastError },
+      detail: ok ? `scanned page read by ${done.doc.extractionProvider}` : `status ${done.doc.extractionStatus}; marker ${hasMarker(text) ? "found" : "missing"}`,
+      evidence: { status: done.doc.extractionStatus, method: done.doc.extractionMethod, provider: done.doc.extractionProvider, pages: `${done.doc.extractedPageCount}/${done.doc.pageCount}`, job: done.job.status, jobError: done.job.lastError, chars: text.length, sample: sample(text) },
     };
   });
 
@@ -179,8 +189,8 @@ async function execute(run: SelftestRun, base: string): Promise<void> {
       scanned: true,
     });
     const text = result.pages.map((p) => p.text).join(" ");
-    const ok = text.includes(SELFTEST_OCR_MARKER);
-    return { ok, detail: ok ? `Nutrient read the scanned page (${result.unitsUsed} credits)` : "Nutrient returned text without the marker", evidence: { account: result.account, unitsUsed: result.unitsUsed, chars: text.length } };
+    const ok = hasMarker(text);
+    return { ok, detail: ok ? `Nutrient read the scanned page (${result.unitsUsed} credits)` : "Nutrient returned text without the marker", evidence: { account: result.account, unitsUsed: result.unitsUsed, chars: text.length, sample: sample(text) } };
   });
 }
 

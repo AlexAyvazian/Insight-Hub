@@ -23,6 +23,7 @@ import {
   recordDocumentVersion,
   replaceSections,
   requeueNewlyAllowedContentTypes,
+  requeueRateLimitedFetches,
   sha256Hex,
   updateDocument,
   type ClaimedJob,
@@ -140,9 +141,10 @@ export async function processJob(job: ClaimedJob, reopen: ReopenOpportunity): Pr
 
   if (fetched.status >= 400) {
     const detail = `HTTP ${fetched.status}`;
-    const retry = fetched.status >= 500 && job.attempts < MAX_ATTEMPTS;
+    // A rate limit (SAM.gov's API returns 429 once its quota is spent) is temporary, like a server error.
+    const retry = (fetched.status >= 500 || fetched.status === 429) && job.attempts < MAX_ATTEMPTS;
     await updateDocument(doc.id, { retrieval_status: retry ? "pending" : "failed", retrieval_error: detail, last_checked_at: new Date() });
-    await finishJob(job.jobId, retry ? "queued" : "failed", detail, new Date(Date.now() + 2 ** job.attempts * 10 * 60_000));
+    await finishJob(job.jobId, retry ? "queued" : "failed", detail, new Date(Date.now() + retryDelayMs(fetched.status, job.attempts, fetched.headers.get("retry-after"))));
     if (!retry) await reopen(job.opportunityKey, "document unavailable");
     return { jobId: job.jobId, status: retry ? "queued" : "failed", detail, changed: false };
   }
@@ -273,6 +275,19 @@ export function isAllowedContentType(contentType: string): boolean {
   return ALLOWED_TYPES.some((allowed) => contentType.startsWith(allowed));
 }
 
+/**
+ * Backoff before re-fetching. A 429 waits longer (30 minutes doubling, or the server's Retry-After if later), so the
+ * retries spread across the provider's quota window instead of spending every attempt inside it.
+ */
+export function retryDelayMs(status: number, attempts: number, retryAfter: string | null): number {
+  if (status !== 429) return 2 ** attempts * 10 * 60_000;
+  const backoff = 2 ** Math.max(0, attempts - 1) * 30 * 60_000;
+  const seconds = retryAfter && /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter.trim()) : NaN;
+  const dated = retryAfter && Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : NaN;
+  const hinted = Number.isFinite(seconds) ? seconds * 1000 : Number.isFinite(dated) ? dated : 0;
+  return Math.min(Math.max(backoff, hinted), 24 * 3_600_000);
+}
+
 let allowListRecoveryDone = false;
 
 export interface WorkerRunSummary {
@@ -294,8 +309,10 @@ export async function runDocumentWorker(options: {
   if (!allowListRecoveryDone) {
     try {
       const requeued = await requeueNewlyAllowedContentTypes(isAllowedContentType);
+      const rateLimited = await requeueRateLimitedFetches();
       allowListRecoveryDone = true;
       if (requeued > 0) console.info(JSON.stringify({ event: "document_jobs_requeued_after_allow_list_change", requeued }));
+      if (rateLimited > 0) console.info(JSON.stringify({ event: "document_jobs_requeued_after_rate_limit", requeued: rateLimited }));
     } catch (error) {
       // Retried on the next batch.
       console.warn(JSON.stringify({ event: "document_allow_list_recovery_failed", error: error instanceof Error ? error.message.slice(0, 200) : String(error) }));
