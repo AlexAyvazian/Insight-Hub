@@ -137,6 +137,37 @@ export async function registerAttachments(
   return { registered, queued, withdrawn };
 }
 
+/**
+ * Re-queues documents that failed only because their content type was not on the download allow-list, when that
+ * type is allowed now (for example SAM.gov notice descriptions served as HAL JSON). Returns how many were re-queued.
+ */
+export async function requeueNewlyAllowedContentTypes(isAllowed: (contentType: string) => boolean): Promise<number> {
+  await ensureReleaseCSchema();
+  const pool = await rcPool();
+  const failed = await pool.query(
+    `SELECT d.id, d.retrieval_error FROM opportunity_documents d JOIN document_extraction_jobs j ON j.document_id = d.id
+      WHERE d.superseded_by IS NULL AND d.retrieval_status = 'unsupported' AND j.status = 'failed'
+        AND d.retrieval_error LIKE 'Content type % is not allowed'`,
+  );
+  const ids = failed.rows
+    .filter((row) => {
+      const type = /^Content type (\S+) is not allowed/.exec(String(row.retrieval_error ?? ""))?.[1];
+      return Boolean(type && isAllowed(type));
+    })
+    .map((row) => String(row.id));
+  if (ids.length === 0) return 0;
+  await pool.query(
+    `UPDATE opportunity_documents SET retrieval_status = 'pending', updated_at = now() WHERE id = ANY($1::text[])`,
+    [ids],
+  );
+  const result = await pool.query(
+    `UPDATE document_extraction_jobs SET status = 'queued', attempts = 0, next_attempt_at = now(), last_error = NULL, updated_at = now()
+      WHERE document_id = ANY($1::text[]) AND status = 'failed'`,
+    [ids],
+  );
+  return result.rowCount ?? 0;
+}
+
 export interface ClaimedJob {
   jobId: string;
   documentId: string;

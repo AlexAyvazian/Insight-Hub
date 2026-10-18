@@ -179,7 +179,7 @@ export const nvidiaProvider = new OpenAiCompatibleProvider({
   modelEnvKey: "NVIDIA_MODEL",
   displayName: "NVIDIA NIM",
   baseUrl: "https://integrate.api.nvidia.com/v1",
-  // meta/llama-3.1-8b-instruct reached end of life on 2026-08-26 (410). GLM is also a model family no other judge
-  // serves, so NVIDIA adds an independent vote instead of a second Llama one.
-  defaultModel: "z-ai/glm-5.3-flash",
+  // meta/llama-3.1-8b-instruct reached end of life on 2026-08-26 (410), and z-ai/glm-5.3-flash timed out at 30 s in
+  // production. Nemotron 70B is a non-reasoning model that answers well inside the timeout. Override with NVIDIA_MODEL.
+  defaultModel: "nvidia/llama-3.1-nemotron-70b-instruct",
 });

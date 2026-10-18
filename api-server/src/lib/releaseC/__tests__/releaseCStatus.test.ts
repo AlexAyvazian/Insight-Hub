@@ -125,3 +125,69 @@ describe("Release C status endpoints", () => {
     assert.equal(calls.length, before);
   });
 });
+
+describe("documents rejected only for their content type", () => {
+  it("are re-queued once the type is allowed, and other failures are left alone", async () => {
+    const { rcPool } = await import("../db");
+    const { ensureReleaseCSchema } = await import("../schema");
+    const { requeueNewlyAllowedContentTypes } = await import("../../documents/store");
+    const { isAllowedContentType } = await import("../../documents/worker");
+    await ensureReleaseCSchema();
+    const pool = await rcPool();
+    const stamp = Date.now();
+    const rows = [
+      { id: `hal-${stamp}`, error: "Content type application/hal+json is not allowed" },
+      { id: `exe-${stamp}`, error: "Content type application/x-msdownload is not allowed" },
+      { id: `404-${stamp}`, error: "HTTP 404" },
+    ];
+    for (const row of rows) {
+      await pool.query(
+        `INSERT INTO opportunity_documents (id, opportunity_key, source_url, retrieval_status, retrieval_error, extraction_status)
+         VALUES ($1, 'requeue-test', $2, $3, $4, 'failed')`,
+        [row.id, `https://api.sam.gov/prod/opportunities/v1/noticedesc?id=${row.id}`, row.error === "HTTP 404" ? "failed" : "unsupported", row.error],
+      );
+      await pool.query(
+        `INSERT INTO document_extraction_jobs (id, document_id, opportunity_key, status, attempts) VALUES ($1, $2, 'requeue-test', 'failed', 1)`,
+        [`job-${row.id}`, row.id],
+      );
+    }
+    assert.equal(await requeueNewlyAllowedContentTypes(isAllowedContentType), 1);
+    const jobs = await pool.query(`SELECT document_id, status, attempts FROM document_extraction_jobs WHERE opportunity_key = 'requeue-test' ORDER BY document_id`);
+    const byId = Object.fromEntries(jobs.rows.map((r) => [r.document_id, r]));
+    assert.equal(byId[`hal-${stamp}`].status, "queued");
+    assert.equal(byId[`hal-${stamp}`].attempts, 0);
+    assert.equal(byId[`exe-${stamp}`].status, "failed");
+    assert.equal(byId[`404-${stamp}`].status, "failed");
+    assert.equal(await requeueNewlyAllowedContentTypes(isAllowedContentType), 0, "a re-queued job is not re-queued again");
+    await pool.query(`DELETE FROM document_extraction_jobs WHERE opportunity_key = 'requeue-test'`);
+    await pool.query(`DELETE FROM opportunity_documents WHERE opportunity_key = 'requeue-test'`);
+  });
+});
+
+describe("extraction self-test guard rails", () => {
+  it("is off unless enabled, serves fixtures only for its own runs, and runs at most once per cooldown", async () => {
+    const selftest = await import("../selftest");
+    const { SELFTEST_OCR_MARKER } = await import("../selftestFixtures");
+    selftest.resetSelftestState();
+    delete process.env.RELEASE_C_SELFTEST_ENABLED;
+    const off = await selftest.startSelftest();
+    assert.ok("refused" in off && off.status === 403);
+    assert.equal(selftest.selftestFixture("unknown", "scanned.pdf"), null);
+
+    // The scanned fixture has no text layer, so a native parse must hand it to remote OCR.
+    const { parseDocumentNatively } = await import("../../documents/parsers");
+    const { SELFTEST_SCANNED_PDF_BASE64 } = await import("../selftestFixtures");
+    const parsed = await parseDocumentNatively(new Uint8Array(Buffer.from(SELFTEST_SCANNED_PDF_BASE64, "base64")), "application/pdf", "x.pdf");
+    assert.equal(parsed.format, "pdf");
+    assert.ok(parsed.pages.every((page) => page.needsOcr && !page.text.includes(SELFTEST_OCR_MARKER)));
+
+    process.env.RELEASE_C_SELFTEST_ENABLED = "true";
+    process.env.RELEASE_C_SELFTEST_BASE_URL = "";
+    delete process.env.RENDER_EXTERNAL_URL;
+    const noBase = await selftest.startSelftest();
+    assert.ok("refused" in noBase && noBase.status === 503);
+    delete process.env.RELEASE_C_SELFTEST_ENABLED;
+    selftest.resetSelftestState();
+  });
+});
+

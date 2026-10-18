@@ -67,7 +67,12 @@ export class MinimaxProvider implements DataSourceProvider {
 
     const json = await res.json() as {
       choices?: Array<{ message?: { content?: string } }>;
+      base_resp?: { status_code?: number; status_msg?: string };
     };
+    // MiniMax reports account errors (balance, auth, rate limit) as HTTP 200 with a non-zero base_resp code and no
+    // choices. Surface them so the caller's budget tracking can cool the provider down instead of retrying blindly.
+    const code = Number(json.base_resp?.status_code ?? 0);
+    if (code !== 0) throw new Error(`Minimax error ${code}: ${String(json.base_resp?.status_msg ?? "").slice(0, 200)}`);
     return (json.choices?.[0]?.message?.content ?? "").trim();
   }
 
