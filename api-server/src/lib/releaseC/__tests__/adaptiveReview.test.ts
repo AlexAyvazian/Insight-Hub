@@ -324,6 +324,10 @@ describe("judge response handling", () => {
     });
     assert.equal(await new GeminiProvider().complete("x", 700), '{"results":[]}');
     assert.ok(sentMax >= 700 + 1_000, "thinking tokens no longer eat the answer's budget");
+    process.env.GEMINI_THINKING_HEADROOM_TOKENS = " ";
+    await new GeminiProvider().complete("x", 700);
+    assert.ok(sentMax >= 700 + 1_000, "an empty override keeps the default");
+    delete process.env.GEMINI_THINKING_HEADROOM_TOKENS;
     t.mock.method(globalThis, "fetch", async () => Response.json({ candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [] } }] }));
     await assert.rejects(new GeminiProvider().complete("x", 700), /output token limit/);
     delete process.env.GEMINI_API_KEY;

@@ -80,8 +80,9 @@ function geminiTimeoutMs(): number {
  * production). Override with GEMINI_THINKING_HEADROOM_TOKENS.
  */
 function geminiThinkingHeadroom(): number {
-  const value = Number(process.env.GEMINI_THINKING_HEADROOM_TOKENS);
-  return Number.isFinite(value) && value >= 0 ? value : 2_048;
+  const raw = (process.env.GEMINI_THINKING_HEADROOM_TOKENS ?? "").trim();
+  const value = Number(raw);
+  return raw && Number.isFinite(value) && value >= 0 ? value : 2_048;
 }
 
 async function callGemini(
