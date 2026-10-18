@@ -50,7 +50,18 @@ interface Line {
 
 interface Draft {
   heading: string | null;
+  page: number;
   lines: Line[];
+}
+
+/**
+ * Keeps a finished draft. A heading-like line with nothing under it (a closing "Proposals Due October 30" or
+ * "Verification code 4721") is kept as its own text instead of being dropped with its empty section.
+ */
+function flush(drafts: Draft[], draft: Draft | null): void {
+  if (!draft) return;
+  if (draft.lines.some((entry) => entry.text)) drafts.push(draft);
+  else if (draft.heading) drafts.push({ ...draft, lines: [{ text: draft.heading, page: draft.page }] });
 }
 
 export function buildSections(pages: ExtractedPage[]): DocumentSection[] {
@@ -65,15 +76,15 @@ export function buildSections(pages: ExtractedPage[]): DocumentSection[] {
         continue;
       }
       if (isHeading(line)) {
-        if (current && current.lines.some((entry) => entry.text)) drafts.push(current);
-        current = { heading: line.slice(0, 160), lines: [{ text: "", page: page.page }] };
+        flush(drafts, current);
+        current = { heading: line.slice(0, 160), page: page.page, lines: [{ text: "", page: page.page }] };
         continue;
       }
-      if (!current) current = { heading: null, lines: [] };
+      if (!current) current = { heading: null, page: page.page, lines: [] };
       current.lines.push({ text: line, page: page.page });
     }
   }
-  if (current && current.lines.some((entry) => entry.text)) drafts.push(current);
+  flush(drafts, current);
 
   const sections: DocumentSection[] = [];
   for (const draft of drafts) {
