@@ -8,6 +8,7 @@ import {
   isWebDiscoverySource,
   ownNoticeText,
 } from "../search/procurementAuthenticity";
+import { applyPrimaryPurchasedScope, assessPrimaryPurchasedScope } from "../search/primaryPurchasedScope";
 
 const GENERIC_QUERY_TERMS = new Set([
   "a",
@@ -111,7 +112,8 @@ export function isOccuMedProfileQuery(query?: string): boolean {
 
 /**
  * Relevance of a provider record: the profile classifier on the notice's own text, then the procurement-authenticity
- * check (is the page an actual procurement notice?), which can only downgrade. See procurementAuthenticity.ts.
+ * check (is the page an actual procurement notice?) and the primary-purchased-scope check, which can only downgrade.
+ * See procurementAuthenticity.ts and primaryPurchasedScope.ts.
  */
 export function classifyProviderRecordRelevance(
   record: NormalizedOpportunity,
@@ -147,7 +149,9 @@ export function classifyProviderRecordRelevance(
     pscCode: record.pscCode ?? (typeof record.rawData?.classificationCode === "string" ? record.rawData.classificationCode : undefined),
     responseDeadline: record.responseDeadline ?? null,
   });
-  return applyProcurementAuthenticity(relevance, authenticity);
+  const authentic = applyProcurementAuthenticity(relevance, authenticity);
+  // Then the primary purchased scope (component-only or supply-only evidence); also downgrade-only.
+  return applyPrimaryPurchasedScope(authentic, assessPrimaryPurchasedScope(authentic, { title: record.title, description }));
 }
 
 function recordSearchText(record: NormalizedOpportunity): string {
