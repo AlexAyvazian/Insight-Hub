@@ -212,7 +212,9 @@ export function assessProcurementAuthenticity(input: AuthenticityInput): Authent
       : result("commercial_page", "reject", "Not a procurement notice: commercial marketing or service page");
   }
   if (AWARD_TITLE_RE.test(title)) {
-    return result("award_or_closed", "reject", "Not an open procurement: award notice or bid results");
+    return official || hasMetadata
+      ? result("award_or_closed", "review", "Title reads as an award notice or bid results; held for review")
+      : result("award_or_closed", "reject", "Not an open procurement: award notice or bid results");
   }
   if (CLOSED_TITLE_RE.test(title)) {
     return result("award_or_closed", "review", "Notice is marked closed, cancelled or archived; held for review");

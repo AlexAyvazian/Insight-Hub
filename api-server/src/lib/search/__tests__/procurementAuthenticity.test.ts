@@ -210,7 +210,9 @@ describe("authenticity classification", () => {
     assert.equal(page("How to Write an RFP for Occupational Health Services", "https://acmeoccmed.com/blog/rfp").action, "reject");
     assert.equal(page("Chapter 59A-3 Florida Administrative Code: Hospital Licensure", "https://flrules.org/59A-3").action, "reject");
     assert.equal(page("Our Services - Acme Occupational Health", "https://acmeoccmed.com/our-services").action, "reject");
-    assert.equal(page("Notice of Intent to Award: Occupational Health Services", "https://example.gov/award").action, "reject");
+    assert.equal(page("Contract Awarded to Acme Occupational Health", "https://industry-news.example.com/acme").action, "reject");
+    // On an official host the award notice is uncertain evidence (it may point to a recompete), so it is held.
+    assert.equal(page("Notice of Intent to Award: Occupational Health Services", "https://example.gov/award").action, "review");
   });
 
   it("holds ambiguous pages for review instead of rejecting them", () => {
