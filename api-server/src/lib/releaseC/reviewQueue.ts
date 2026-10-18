@@ -155,6 +155,19 @@ export async function enqueueForReview(items: EnqueueInput[]): Promise<{ queued:
   return { queued, reopened, unchanged };
 }
 
+/**
+ * Returns items left in_review by a run that died (a redeploy or crash mid-review) to the queue after 30 minutes.
+ * The scheduler calls this before deciding whether anything is due, so such items never wait on other work arriving.
+ */
+export async function releaseStaleClaims(): Promise<number> {
+  await ensureReleaseCSchema();
+  const result = await (await rcPool()).query(
+    `UPDATE opportunity_review_queue SET status = 'queued', updated_at = now()
+     WHERE status = 'in_review' AND updated_at < now() - interval '30 minutes'`,
+  );
+  return result.rowCount ?? 0;
+}
+
 /** Claims due items in priority order. Expired records are retired first so they never consume capacity. */
 export async function claimDueItems(limit: number): Promise<QueueItem[]> {
   if (limit <= 0) return [];
@@ -163,11 +176,7 @@ export async function claimDueItems(limit: number): Promise<QueueItem[]> {
     `UPDATE opportunity_review_queue SET status = 'expired', updated_at = now()
      WHERE status IN ('queued','held') AND response_deadline IS NOT NULL AND response_deadline < now()`,
   );
-  // Items stuck in_review by a crashed run are released after 30 minutes.
-  await (await rcPool()).query(
-    `UPDATE opportunity_review_queue SET status = 'queued', updated_at = now()
-     WHERE status = 'in_review' AND updated_at < now() - interval '30 minutes'`,
-  );
+  await releaseStaleClaims();
   const result = await (await rcPool()).query(
     `UPDATE opportunity_review_queue SET status = 'in_review', attempts = attempts + 1, updated_at = now()
      WHERE id IN (
