@@ -117,5 +117,11 @@ describe("Release C status endpoints", () => {
     assert.equal(body.linkup.length, 2);
     assert.ok(body.linkup.every((slot: { ok: boolean }) => slot.ok === true));
     assert.ok(calls.every((call) => call.method === "GET"), "probes must not submit work");
+
+    // A forced refresh right after a probe, and concurrent refreshes, never start another probe round.
+    const before = calls.length;
+    const again = await Promise.all([1, 2, 3].map(() => realFetch(`${base}/release-c/credentials?refresh=1`).then((r) => r.json())));
+    assert.ok(again.every((r: { cached: boolean }) => r.cached === true));
+    assert.equal(calls.length, before);
   });
 });

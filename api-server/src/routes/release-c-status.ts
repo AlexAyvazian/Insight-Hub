@@ -17,7 +17,10 @@ import { redactSensitiveText } from "../lib/security/logRedaction";
 const router = Router();
 
 const PROBE_CACHE_MS = 5 * 60_000;
+/** Even `?refresh=1` reuses a result younger than this, and concurrent requests share one probe round. */
+const PROBE_MIN_INTERVAL_MS = 60_000;
 let probeCache: { at: number; value: unknown } | null = null;
+let probeInFlight: Promise<unknown> | null = null;
 
 /** Host and path only: attachment URLs can carry query-string credentials (for example SAM.gov api_key). */
 function safeLocation(url: unknown): string | null {
@@ -114,9 +117,21 @@ router.get("/release-c/status", async (req, res) => {
 
 router.get("/release-c/credentials", async (req, res) => {
   if (!adminReadAllowed(req)) return res.status(401).json({ error: "Administrative read authorization is required." });
-  if (probeCache && Date.now() - probeCache.at < PROBE_CACHE_MS && req.query.refresh !== "1") {
+  const age = probeCache ? Date.now() - probeCache.at : Number.POSITIVE_INFINITY;
+  if (probeCache && (age < PROBE_MIN_INTERVAL_MS || (age < PROBE_CACHE_MS && req.query.refresh !== "1"))) {
     return res.json({ cached: true, ...(probeCache.value as object) });
   }
+  probeInFlight ??= probeCredentials().finally(() => {
+    probeInFlight = null;
+  });
+  try {
+    return res.json({ cached: false, ...((await probeInFlight) as object) });
+  } catch (error) {
+    return res.status(503).json({ error: safeError(error instanceof Error ? error.message : String(error)) });
+  }
+});
+
+async function probeCredentials(): Promise<unknown> {
   const { extractionCredentialPools, nutrientAccountInfo } = await import("../lib/documents/remoteExtractors");
   const { linkupCredentialPool } = await import("../lib/providers/linkup");
   const pools = extractionCredentialPools();
@@ -137,7 +152,7 @@ router.get("/release-c/credentials", async (req, res) => {
     linkup,
   };
   probeCache = { at: Date.now(), value };
-  return res.json({ cached: false, ...value });
-});
+  return value;
+}
 
 export default router;
