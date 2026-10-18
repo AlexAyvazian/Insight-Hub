@@ -1,4 +1,5 @@
 import type { DataSourceProvider, FetchOptions, ProviderFetchResult, ProviderStatus } from "./types";
+import { isObviouslyUnsafeUrl } from "../security/safeUrl";
 import { resolveCredential } from "../config/providerConfig";
 
 export interface WorkerExtractResult {
@@ -46,6 +47,7 @@ export class CloudflareWorkerProvider implements DataSourceProvider {
     maxLength = 8000,
     signal?: AbortSignal,
   ): Promise<string | null> {
+    if (isObviouslyUnsafeUrl(url)) return null;
     const endpoint = await this.getEndpoint();
     if (!endpoint) return null;
 

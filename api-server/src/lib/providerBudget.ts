@@ -30,6 +30,11 @@ export interface ProviderBudgetState {
   failures: number;
   cooldownUntil: number;
   credentialFingerprint?: string;
+  /** Real token usage (AI providers), when the caller reports it. Request counts alone undercount large prompts. */
+  tokensToday?: number;
+  tokensThisMonth?: number;
+  /** Where the current cooldown came from: a provider-stated reset/retry hint, or the fixed fallback. */
+  cooldownSource?: "provider" | "fallback";
   lastOutcome?: ProviderBudgetOutcome;
   lastError?: string;
   lastAttemptAt?: string;
@@ -97,6 +102,8 @@ function normalizeWindow(
     requestsToday: state.dayKey === dayKey ? state.requestsToday : 0,
     requestsThisMonth:
       state.monthKey === monthKey ? state.requestsThisMonth : 0,
+    tokensToday: state.dayKey === dayKey ? (state.tokensToday ?? 0) : 0,
+    tokensThisMonth: state.monthKey === monthKey ? (state.tokensThisMonth ?? 0) : 0,
   };
 }
 
@@ -184,6 +191,14 @@ export function providerBudgetPolicy(provider: string): ProviderBudgetPolicy {
       0,
   );
   return { dailyLimit, monthlyLimit, reserve };
+}
+
+/**
+ * Optional daily token allowance for an AI provider (INSIGHT_BUDGET_<PROVIDER>_DAILY_TOKENS, e.g.
+ * INSIGHT_BUDGET_JUDGE_GROQ_DAILY_TOKENS=400000). Unset means only provider-stated rate limits apply.
+ */
+export function providerDailyTokenLimit(provider: string): number | null {
+  return nonNegativeInteger(process.env[`INSIGHT_BUDGET_${envToken(provider)}_DAILY_TOKENS`]);
 }
 
 export async function getProviderBudget(provider: string): Promise<ProviderBudgetState> {
@@ -289,7 +304,57 @@ function explicitSamCooldownMs(message: string): number | null {
   return reset - Date.now();
 }
 
-function classifyFailure(error: unknown): {
+/**
+ * Provider-stated retry hints, when present, replace the fixed fallback cooldowns: a ProviderQuotaError carrying
+ * a reset time, "retry after N seconds", Groq's "try again in 2m3.5s", Google's "retryDelay": "34s", or an
+ * ISO reset timestamp. Returns null when the message carries no usable hint.
+ */
+export function providerStatedCooldownMs(error: unknown, now = Date.now()): number | null {
+  const reset = (error as { resetAt?: unknown } | null)?.resetAt;
+  if (reset instanceof Date && reset.getTime() > now) return reset.getTime() - now;
+  const message = error instanceof Error ? error.message : String(error);
+  const tryAgain = message.match(/try again in\s+(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:(\d+(?:\.\d+)?)s)?/i);
+  if (tryAgain && (tryAgain[1] || tryAgain[2] || tryAgain[3])) {
+    const ms = (Number(tryAgain[1] ?? 0) * 3_600 + Number(tryAgain[2] ?? 0) * 60 + Number(tryAgain[3] ?? 0)) * 1_000;
+    if (ms > 0) return Math.ceil(ms);
+  }
+  const retryAfter = message.match(/retry[- ]?after[:\s"]+(\d+(?:\.\d+)?)\s*(s|sec|seconds|ms)?/i) ?? message.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)(s)"/i);
+  if (retryAfter) {
+    const value = Number(retryAfter[1]);
+    if (Number.isFinite(value) && value > 0) return Math.ceil(retryAfter[2] === "ms" ? value : value * 1_000);
+  }
+  const iso = message.match(/(?:reset|resets|available)(?:\s+at)?[:\s]+(\d{4}-\d{2}-\d{2}T[\d:.]+Z)/i);
+  if (iso) {
+    const at = Date.parse(iso[1]!);
+    if (Number.isFinite(at) && at > now) return at - now;
+  }
+  return null;
+}
+
+/**
+ * Reset-aware cooldowns apply to Opportunities AI review budgets ("judge:*") and to adapters that throw a typed
+ * ProviderQuotaError. Every other caller (Forecasts, Recompete Watch, news) keeps the fixed cooldowns unchanged.
+ */
+function resetAwareFor(provider: string, error: unknown): boolean {
+  return provider.startsWith("judge:") || (error as { name?: string } | null)?.name === "ProviderQuotaError";
+}
+
+function classifyFailure(provider: string, error: unknown): {
+  outcome: ProviderBudgetOutcome;
+  cooldownMs: number;
+  message: string;
+  source?: "provider" | "fallback";
+} {
+  const fixed = classifyFixedFailure(error);
+  const stated = resetAwareFor(provider, error) ? providerStatedCooldownMs(error) : null;
+  if (stated != null && (fixed.outcome === "rate_limited" || fixed.outcome === "quota" || fixed.outcome === "budget_exhausted")) {
+    // Bounded: a hint never shortens a cooldown below 5 s or stretches it beyond 31 days.
+    return { ...fixed, cooldownMs: Math.min(31 * 24 * HOUR, Math.max(5_000, stated)), source: "provider" };
+  }
+  return { ...fixed, source: "fallback" };
+}
+
+function classifyFixedFailure(error: unknown): {
   outcome: ProviderBudgetOutcome;
   cooldownMs: number;
   message: string;
@@ -385,11 +450,15 @@ async function synchronizeSamCredentialFingerprint(): Promise<void> {
 export async function recordProviderSuccess(
   provider: string,
   usefulResults: number,
+  usage: { tokens?: number } = {},
 ): Promise<void> {
+  const tokens = Math.max(0, Math.round(usage.tokens ?? 0));
   await recordBudgetMutation(provider, (state, now) => ({
     ...state,
     requestsToday: state.requestsToday + 1,
     requestsThisMonth: state.requestsThisMonth + 1,
+    tokensToday: (state.tokensToday ?? 0) + tokens,
+    tokensThisMonth: (state.tokensThisMonth ?? 0) + tokens,
     successes: state.successes + 1,
     usefulResults: state.usefulResults + Math.max(0, usefulResults),
     emptyResults: state.emptyResults + (usefulResults > 0 ? 0 : 1),
@@ -407,16 +476,17 @@ export async function recordProviderFailure(
 ): Promise<void> {
   if (isOrchestrationCancellation(error)) return;
 
-  const failure = classifyFailure(error);
+  const failure = classifyFailure(provider, error);
   await recordBudgetMutation(provider, (state, now) => ({
     ...state,
     requestsToday: state.requestsToday + 1,
     requestsThisMonth: state.requestsThisMonth + 1,
     failures: state.failures + 1,
-    cooldownUntil: Math.max(
-      state.cooldownUntil,
-      now.getTime() + failure.cooldownMs,
-    ),
+    cooldownUntil:
+      failure.source === "provider"
+        ? now.getTime() + failure.cooldownMs
+        : Math.max(state.cooldownUntil, now.getTime() + failure.cooldownMs),
+    cooldownSource: failure.source,
     lastOutcome: failure.outcome,
     lastError: sanitizeProviderErrorMessage(failure.message),
     lastAttemptAt: now.toISOString(),

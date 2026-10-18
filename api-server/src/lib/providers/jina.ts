@@ -6,6 +6,7 @@
  * and is used only to raise Reader limits and to enable the embeddings API.
  */
 
+import { isObviouslyUnsafeUrl } from "../security/safeUrl";
 import type {
   DataSourceProvider,
   FetchOptions,
@@ -56,6 +57,7 @@ export class JinaProvider implements DataSourceProvider {
     maxLength = 8000,
     signal?: AbortSignal,
   ): Promise<string | null> {
+    if (isObviouslyUnsafeUrl(url)) return null;
     const apiKey = await this.getApiKey();
 
     try {

@@ -1,4 +1,5 @@
 import pino from "pino";
+import { redactSensitiveText } from "./security/logRedaction";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -9,6 +10,14 @@ export const logger = pino({
     "req.headers.cookie",
     "res.headers['set-cookie']",
   ],
+  hooks: {
+    logMethod(args, method) {
+      method.apply(
+        this,
+        args.map((arg) => (typeof arg === "string" ? redactSensitiveText(arg) : arg)) as Parameters<typeof method>,
+      );
+    },
+  },
   ...(isProduction
     ? {}
     : {

@@ -1,6 +1,13 @@
 import { eq } from "drizzle-orm";
 import { rfpDb, settingsTable } from "@workspace/db";
 import { resolveCredential } from "../config/providerConfig";
+import {
+  ProviderQuotaError,
+  sharedAccountLedger,
+  type AccountLedger,
+  type AccountPolicy,
+  type QuotaSnapshot,
+} from "./accountLedger";
 
 export interface CredentialSlot {
   dbKey?: string;
@@ -14,6 +21,32 @@ export interface FreeTierCredentialPoolOptions {
    * then fail over to the next account and stay there.
    */
   rotateOnSuccess?: boolean;
+  /**
+   * Opt-in per-account quota accounting (Release C). Pools without it behave exactly as before.
+   * Each slot gets its own allowance kind, unit, usage, reset time and exhaustion state; exhausted accounts are
+   * skipped until a probe (when provided) or the documented reset confirms capacity.
+   */
+  accounts?: PoolAccountAccounting;
+}
+
+export interface PoolAccountAccounting {
+  policyFor(slot: string): AccountPolicy;
+  /** Free capacity probe (usage/balance endpoint). Must not consume billable units. */
+  probe?: (apiKey: string, slot: string) => Promise<QuotaSnapshot | null>;
+  /** Units a call consumes when the operation does not report its own usage (default 1). */
+  unitsPerCall?: number;
+  /** Refresh capacity with the free probe before every call (for allowances shared with other users of the key). */
+  probeBeforeEachRun?: boolean;
+  ledger?: AccountLedger;
+}
+
+export interface CredentialRunContext {
+  /** Report the real units this call consumed (pages, credits, tokens) instead of the default per-call estimate. */
+  reportUsage(units: number, quality?: "good" | "poor"): void;
+  /** Report provider-stated capacity seen in the response. */
+  reportSnapshot(snapshot: QuotaSnapshot): void;
+  /** Planned units for this call (lets the pool refuse a call that would exceed a free allowance). */
+  plannedUnits: number;
 }
 
 export type CredentialSlotOutcome =
@@ -170,6 +203,9 @@ function explicitCooldownUntilMs(error: unknown): number | null {
 }
 
 function cooldownMs(error: unknown): number {
+  if (error instanceof ProviderQuotaError && error.resetAt && error.resetAt.getTime() > Date.now()) {
+    return error.resetAt.getTime() - Date.now();
+  }
   const outcome = failureOutcome(error);
   if (outcome === "auth") return 6 * 60 * 60 * 1_000;
   if (outcome === "quota") return 24 * 60 * 60 * 1_000;
@@ -179,6 +215,7 @@ function cooldownMs(error: unknown): number {
 }
 
 function isCredentialRetryable(error: unknown): boolean {
+  if (error instanceof ProviderQuotaError) return true;
   const message = error instanceof Error ? error.message : String(error);
   if (/\b(400|404|405|413|422)\b/.test(message)) return false;
   return /\b(401|403|408|409|429|5\d\d)\b|quota|rate.?limit|credit|balance|budget|exceed|exhaust|timeout|ECONN|fetch failed/i.test(
@@ -218,6 +255,7 @@ function resetHeader(headers: Headers): string | null {
 
 export class FreeTierCredentialPool {
   private readonly rotateOnSuccess: boolean;
+  private readonly accounts: PoolAccountAccounting | undefined;
 
   constructor(
     private readonly id: string,
@@ -225,6 +263,7 @@ export class FreeTierCredentialPool {
     options: FreeTierCredentialPoolOptions = {},
   ) {
     this.rotateOnSuccess = options.rotateOnSuccess ?? true;
+    this.accounts = options.accounts;
     poolInstances.set(id, this);
   }
 
@@ -321,8 +360,44 @@ export class FreeTierCredentialPool {
     };
   }
 
+  /** Per-account ledger states for telemetry (empty when accounting is not enabled for this pool). */
+  async accountStates() {
+    if (!this.accounts) return [];
+    const ledger = this.accounts.ledger ?? sharedAccountLedger();
+    return Promise.all(this.slots.map(({ envKey }) => ledger.state(this.accounts!.policyFor(envKey))));
+  }
+
+  private async accountAllows(
+    candidate: { slot: string; value: string },
+    plannedUnits: number,
+    skipped: string[],
+  ): Promise<boolean> {
+    if (!this.accounts) return true;
+    const ledger = this.accounts.ledger ?? sharedAccountLedger();
+    const policy = this.accounts.policyFor(candidate.slot);
+    let decision = await ledger.canSpend(policy, plannedUnits, Boolean(this.accounts.probe));
+    const cooling = !decision.ok && !decision.needsProbe && decision.reason.startsWith("cooling down");
+    // An account whose capacity has never been confirmed is probed (free) before its first request, so an account
+    // that is already empty (e.g. used up elsewhere) never receives a billable call.
+    const unconfirmed = Boolean(this.accounts.probe) && !(await ledger.state(policy)).lastConfirmedAt;
+    if (this.accounts.probe && !cooling && (this.accounts.probeBeforeEachRun || unconfirmed || (!decision.ok && decision.needsProbe))) {
+      try {
+        const snapshot = await this.accounts.probe(candidate.value, candidate.slot);
+        if (snapshot) await ledger.recordSnapshot(policy, snapshot);
+      } catch (error) {
+        await ledger.recordFailure(policy, error);
+      }
+      decision = await ledger.canSpend(policy, plannedUnits, false);
+    }
+    if (!decision.ok) {
+      skipped.push(`${candidate.slot}: ${decision.reason}${decision.retryAt ? ` (retry after ${decision.retryAt})` : ""}`);
+    }
+    return decision.ok;
+  }
+
   async run<T>(
-    operation: (apiKey: string, slot: string) => Promise<T>,
+    operation: (apiKey: string, slot: string, context: CredentialRunContext) => Promise<T>,
+    runOptions: { plannedUnits?: number } = {},
   ): Promise<T> {
     const credentials = await this.credentials();
     if (credentials.length === 0) {
@@ -357,12 +432,33 @@ export class FreeTierCredentialPool {
     }
     const candidates = available;
     const errors: string[] = [];
+    const plannedUnits = runOptions.plannedUnits ?? this.accounts?.unitsPerCall ?? 1;
     for (const candidate of candidates) {
+      if (!(await this.accountAllows(candidate, plannedUnits, errors))) continue;
       const state = slotState(this.id, candidate.slot);
       state.attempts += 1;
       state.lastAttemptAt = new Date().toISOString();
+      let reportedUnits: number | null = null;
+      let reportedQuality: "good" | "poor" | undefined;
+      let reportedSnapshot: QuotaSnapshot | null = null;
+      const context: CredentialRunContext = {
+        plannedUnits,
+        reportUsage(units, quality) {
+          reportedUnits = (reportedUnits ?? 0) + Math.max(0, units);
+          reportedQuality = quality ?? reportedQuality;
+        },
+        reportSnapshot(snapshot) {
+          reportedSnapshot = snapshot;
+        },
+      };
       try {
-        const value = await operation(candidate.value, candidate.slot);
+        const value = await operation(candidate.value, candidate.slot, context);
+        if (this.accounts) {
+          const ledger = this.accounts.ledger ?? sharedAccountLedger();
+          const policy = this.accounts.policyFor(candidate.slot);
+          await ledger.recordUsage(policy, reportedUnits ?? plannedUnits, "success", reportedQuality);
+          if (reportedSnapshot) await ledger.recordSnapshot(policy, reportedSnapshot);
+        }
         state.successes += 1;
         state.lastOutcome = "success";
         state.lastSuccessAt = new Date().toISOString();
@@ -384,6 +480,11 @@ export class FreeTierCredentialPool {
       } catch (error) {
         state.failures += 1;
         state.lastOutcome = failureOutcome(error);
+        if (this.accounts) {
+          await (this.accounts.ledger ?? sharedAccountLedger())
+            .recordFailure(this.accounts.policyFor(candidate.slot), error)
+            .catch(() => undefined);
+        }
         if (!isCredentialRetryable(error)) throw error;
         const explicitReset = explicitCooldownUntilMs(error);
         const cooldownUntil = explicitReset ?? (Date.now() + cooldownMs(error));

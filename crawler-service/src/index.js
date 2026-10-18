@@ -1,6 +1,8 @@
 import express from 'express';
 import { chromium } from 'playwright';
 import TurndownService from 'turndown';
+import { lookup } from 'node:dns/promises';
+import net from 'node:net';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,6 +13,67 @@ const USER_AGENT = process.env.CRAWLER_USER_AGENT || 'Insight-Hub-Crawler/1.0';
 const turndownService = new TurndownService({
   headingStyle: 'atx',
   codeStyle: 'fenced',
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// SSRF protection (Release C). The crawler fetches URLs that come from third-party procurement records, so it must
+// never reach loopback, private, link-local (cloud metadata), CGNAT, multicast or reserved addresses, including via
+// redirects and sub-resources. Optional shared secret: CRAWLER_SERVICE_TOKEN (Authorization: Bearer <token>).
+// ---------------------------------------------------------------------------------------------------------------
+const SERVICE_TOKEN = process.env.CRAWLER_SERVICE_TOKEN || '';
+const BLOCKED_HOSTS = /(^|\.)(localhost|localdomain|internal|local|lan|home|corp|intranet|metadata|metadata\.google\.internal)$/i;
+
+function ipv4Private(ip) {
+  const [a, b] = ip.split('.').map(Number);
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224;
+}
+
+function isPrivateAddress(ip) {
+  if (net.isIPv4(ip)) return ipv4Private(ip);
+  const lower = ip.toLowerCase();
+  const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return ipv4Private(mapped[1]);
+  return lower === '::' || lower === '::1' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || /^ff/.test(lower) || lower.startsWith('64:ff9b:') || lower.startsWith('2002:');
+}
+
+const hostVerdicts = new Map();
+async function hostAllowed(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host || BLOCKED_HOSTS.test(host)) return false;
+  if (net.isIP(host)) return !isPrivateAddress(host);
+  const cached = hostVerdicts.get(host);
+  if (cached && cached.expires > Date.now()) return cached.allowed;
+  let allowed = false;
+  try {
+    const answers = await lookup(host, { all: true, verbatim: true });
+    allowed = answers.length > 0 && answers.every((answer) => !isPrivateAddress(answer.address));
+  } catch {
+    allowed = false;
+  }
+  hostVerdicts.set(host, { allowed, expires: Date.now() + 60_000 });
+  return allowed;
+}
+
+async function assertCrawlableUrl(raw) {
+  let parsed;
+  try {
+    parsed = new URL(String(raw));
+  } catch {
+    throw Object.assign(new Error('Invalid URL'), { status: 400 });
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw Object.assign(new Error('Only http(s) URLs are allowed'), { status: 400 });
+  if (parsed.username || parsed.password) throw Object.assign(new Error('Credentials in URL are not allowed'), { status: 400 });
+  if (parsed.port && !['80', '443', '8080', '8443'].includes(parsed.port)) throw Object.assign(new Error('Port not allowed'), { status: 400 });
+  if (!(await hostAllowed(parsed.hostname))) throw Object.assign(new Error('Destination not allowed'), { status: 400 });
+  return parsed.toString();
+}
+
+app.use((req, res, next) => {
+  if (!SERVICE_TOKEN || req.path === '/health') return next();
+  if (req.headers.authorization === `Bearer ${SERVICE_TOKEN}`) return next();
+  return res.status(401).json({ success: false, error: 'Unauthorized' });
 });
 
 // Browser pool for reuse
@@ -44,6 +107,17 @@ async function getPage() {
     userAgent: USER_AGENT,
     viewport: { width: 1920, height: 1080 },
   });
+  // Every navigation, redirect and sub-resource is re-checked, so a public page cannot pull in internal URLs.
+  await context.route('**/*', async (route) => {
+    try {
+      const target = new URL(route.request().url());
+      if (target.protocol === 'data:' || target.protocol === 'blob:' || target.protocol === 'about:') return route.continue();
+      if (!['http:', 'https:'].includes(target.protocol) || !(await hostAllowed(target.hostname))) return route.abort('blockedbyclient');
+      return route.continue();
+    } catch {
+      return route.abort('blockedbyclient');
+    }
+  });
   return await context.newPage();
 }
 
@@ -69,6 +143,7 @@ async function crawlUrl(url, options = {}) {
   let page = null;
 
   try {
+    url = await assertCrawlableUrl(url);
     page = await getPage();
 
     // Set timeout

@@ -14,6 +14,7 @@
 
 import type { DataSourceProvider, FetchOptions, ProviderFetchResult, ProviderStatus } from "./types";
 import { resolveCredential } from "../config/providerConfig";
+import { isObviouslyUnsafeUrl } from "../security/safeUrl";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_PAGES = 10;
@@ -66,6 +67,8 @@ export class SelfHostedCrawlerProvider implements DataSourceProvider {
   async crawl(url: string, options: CrawlOptions = {}): Promise<CrawlResult | null> {
     const crawlerUrl = await this.getCrawlerUrl();
     if (!crawlerUrl) return null;
+    // Record URLs are third-party data: never ask the crawler to visit an internal or non-http(s) address.
+    if (isObviouslyUnsafeUrl(url)) return null;
 
     const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
 
@@ -74,6 +77,7 @@ export class SelfHostedCrawlerProvider implements DataSourceProvider {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          ...(process.env.CRAWLER_SERVICE_TOKEN ? { Authorization: `Bearer ${process.env.CRAWLER_SERVICE_TOKEN}` } : {}),
         },
         body: JSON.stringify({
           url,
