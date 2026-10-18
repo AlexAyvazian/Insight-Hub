@@ -9,7 +9,7 @@ This runbook separates application deployment from database/data operations. A r
 3. Deploy that revision through the normal Render deployment path.
 4. Confirm `GET /api/healthz` returns the expected deployment revision.
 5. **Product build** runs again on every relevant push to `main`. After it succeeds, **Production acceptance** automatically checks that exact commit against the deployed Render service and retries boundedly while the deployment converges.
-6. The automatic gate uses `https://insight-hub-eyza.onrender.com` as the known Hub 1 production endpoint. A non-secret GitHub repository variable named `INSIGHT_PRODUCTION_URL` may override that hostname if production moves later.
+6. The automatic gate uses `https://insight-hub-952b.onrender.com` as the production endpoint (Render service `Insight-Hub`, which auto-deploys `main`; the older `insight-hub-eyza` service is no longer deployed). A non-secret GitHub repository variable named `INSIGHT_PRODUCTION_URL` may override that hostname if production moves later.
 7. The same Production acceptance workflow remains manually runnable with optional `base_url` and `expected_commit` inputs for explicit release or rollback verification.
 8. Treat the release as accepted only when the workflow passes health, readiness, database status, opportunity read, frontend-shell checks, and—when an expected SHA is supplied—deployed revision identity.
 
