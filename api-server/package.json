@@ -29,7 +29,7 @@
     "drizzle-orm": "catalog:",
     "express": "^5",
     "fflate": "0.8.2",
-    "imapflow": "^1.0.162",
+    "imapflow": "^2.4.3",
     "multer": "^2.3.0",
     "pg": "^8.20.0",
     "pino": "^9",
