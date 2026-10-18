@@ -14,8 +14,13 @@ import {
   scoreGuidance,
 } from "../search/profileText";
 
-const GEMINI_BASE =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+// gemini-2.0-flash was retired (404 "no longer available"); Google's error names gemini-3.8-flash. Override with
+// GEMINI_MODEL.
+const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+function geminiEndpoint(): string {
+  const model = (process.env.GEMINI_MODEL ?? "").trim().replace(/^models\//, "") || DEFAULT_GEMINI_MODEL;
+  return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+}
 const credentials = new FreeTierCredentialPool(
   "gemini-multi-account",
   [
@@ -66,7 +71,7 @@ async function callGemini(
   maxTokens = 512,
   signal?: AbortSignal,
 ): Promise<string> {
-  const response = await fetch(`${GEMINI_BASE}?key=${apiKey}`, {
+  const response = await fetch(`${geminiEndpoint()}?key=${apiKey}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

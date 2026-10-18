@@ -32,7 +32,7 @@ export const DOCUMENT_MAX_BYTES = Number(process.env.DOCUMENT_MAX_BYTES ?? 25 * 
 const FETCH_TIMEOUT_MS = 60_000;
 const MAX_ATTEMPTS = 5;
 
-const ALLOWED_TYPES = [
+export const ALLOWED_TYPES = [
   "application/pdf",
   "application/msword",
   "application/vnd.openxmlformats-officedocument",
@@ -42,6 +42,8 @@ const ALLOWED_TYPES = [
   "application/zip",
   "application/x-zip-compressed",
   "application/json",
+  // SAM.gov's noticedesc endpoint answers with HAL JSON.
+  "application/hal+json",
   "application/rtf",
   "binary/octet-stream",
   "text/",
@@ -83,7 +85,7 @@ function fileNameFor(url: string, contentType: string): string {
 }
 
 /** SAM.gov's noticedesc endpoint returns JSON `{ description: "<html>" }`. */
-function samDescription(bytes: Uint8Array, contentType: string): ParsedDocument | null {
+export function samDescription(bytes: Uint8Array, contentType: string): ParsedDocument | null {
   if (!contentType.includes("json")) return null;
   try {
     const json = JSON.parse(new TextDecoder().decode(bytes)) as { description?: string };

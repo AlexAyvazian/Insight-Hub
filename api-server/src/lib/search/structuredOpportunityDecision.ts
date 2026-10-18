@@ -267,14 +267,46 @@ function shortField(value: string | null | undefined, max = 300): string {
   return neutraliseUntrustedText(String(value ?? "")).text.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-export function buildReviewPrompt(records: NormalizedOpportunity[], profileContext = ""): string {
+/**
+ * Providers whose free tier caps a single request below the full review prompt (Groq's free on-demand tier allows
+ * 8,000 tokens per minute including the requested output). Their prompt is shrunk to fit by trimming each record's
+ * description and document excerpts; the record set and the instructions stay the same.
+ */
+const REVIEW_PROMPT_CHAR_LIMITS: Record<string, number> = { groq: 20_000 };
+const MIN_ITEM_TEXT_CHARS = 600;
+
+export function reviewPromptCharLimit(providerName: string): number | undefined {
+  const override = Number.parseInt(process.env[`${providerName.toUpperCase()}_REVIEW_PROMPT_CHARS`] ?? "", 10);
+  return Number.isFinite(override) && override > 0 ? override : REVIEW_PROMPT_CHAR_LIMITS[providerName];
+}
+
+export function buildReviewPrompt(records: NormalizedOpportunity[], profileContext = "", maxChars?: number): string {
+  const full = renderReviewPrompt(records, profileContext, 1);
+  if (!maxChars || full.length <= maxChars) return full;
+  const overhead = renderReviewPrompt(records, profileContext, 0).length;
+  const fullText = full.length - overhead;
+  let scale = fullText > 0 ? Math.max(0, (maxChars - overhead) / fullText) : 0;
+  let prompt = renderReviewPrompt(records, profileContext, scale);
+  // The per-record minimum can keep the first pass over the limit; tighten a few times if it does.
+  for (let pass = 0; pass < 4 && prompt.length > maxChars && scale > 0; pass += 1) {
+    scale *= Math.max(0, (maxChars - overhead) / Math.max(1, prompt.length - overhead));
+    prompt = renderReviewPrompt(records, profileContext, scale);
+  }
+  return prompt;
+}
+
+function scaled(chars: number, scale: number): number {
+  return scale >= 1 ? chars : Math.max(scale === 0 ? 0 : MIN_ITEM_TEXT_CHARS, Math.floor(chars * scale));
+}
+
+function renderReviewPrompt(records: NormalizedOpportunity[], profileContext: string, scale: number): string {
   const items = records
     .map((record, index) => {
       const documents = documentEvidenceText(record);
-      const description = fenceUntrustedText(
-        opportunityDescriptionContext(record.description, documents ? REVIEW_DESCRIPTION_CHARS_WITH_DOCUMENTS : REVIEW_DESCRIPTION_CHARS),
-        "NOTICE DESCRIPTION",
-      ).block;
+      const descriptionBudget = scaled(documents ? REVIEW_DESCRIPTION_CHARS_WITH_DOCUMENTS : REVIEW_DESCRIPTION_CHARS, scale);
+      const sampled = opportunityDescriptionContext(record.description, descriptionBudget);
+      // Sampling keeps whole evidence windows, which can exceed a small budget; a trimmed prompt is cut to it.
+      const description = fenceUntrustedText(scale < 1 ? sampled.slice(0, descriptionBudget) : sampled, "NOTICE DESCRIPTION").block;
       return [
         `[${index}]`,
         `Title: ${shortField(record.title)}`,
@@ -284,7 +316,7 @@ export function buildReviewPrompt(records: NormalizedOpportunity[], profileConte
         record.responseDeadline ? `Deadline: ${record.responseDeadline.toISOString()}` : "Deadline: unknown",
         `Description:\n${description}`,
         documents
-          ? `Official documents (cited excerpts, document/page/section in brackets):\n${fenceUntrustedText(documents.slice(0, REVIEW_DOCUMENT_CHARS), "SOLICITATION DOCUMENTS").block}`
+          ? `Official documents (cited excerpts, document/page/section in brackets):\n${fenceUntrustedText(documents.slice(0, scaled(REVIEW_DOCUMENT_CHARS, scale)), "SOLICITATION DOCUMENTS").block}`
           : "",
       ]
         .filter(Boolean)
@@ -416,9 +448,11 @@ function estimateTokens(prompt: string, output: string): number {
 
 async function callJudge(
   judge: Judge,
-  prompt: string,
-  count: number,
+  records: NormalizedOpportunity[],
+  profileContext: string,
 ): Promise<{ votes: ReviewVote[] | null; tokens: number; error: string | null }> {
+  const count = records.length;
+  const prompt = buildReviewPrompt(records, profileContext, reviewPromptCharLimit(judge.provider.name));
   try {
     const output = await judge.provider.complete(prompt, REVIEW_OUTPUT_TOKENS);
     const tokens = estimateTokens(prompt, output);
@@ -478,8 +512,8 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   const firstRoundSize = votedFamilies.size > 0 ? 1 : 2;
   while (pending.length > 0 && firstRound.length < firstRoundSize && queue.length > 0) firstRound.push(queue.shift()!);
   const firstIndexes = [...pending];
-  const firstPrompt = buildReviewPrompt(firstIndexes.map((index) => batch[index]!.record), profileContext);
-  const firstResults = await Promise.all(firstRound.map((judge) => callJudge(judge, firstPrompt, firstIndexes.length)));
+  const firstRecords = firstIndexes.map((index) => batch[index]!.record);
+  const firstResults = await Promise.all(firstRound.map((judge) => callJudge(judge, firstRecords, profileContext)));
   firstResults.forEach((result, i) => {
     run.judgeCalls += 1;
     run.tokens += result.tokens;
@@ -492,8 +526,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   while (pending.length > 0 && queue.length > 0 && Date.now() < deadline) {
     const judge = queue.shift()!;
     const subset = pending.map((index) => batch[index]!.record);
-    const prompt = buildReviewPrompt(subset, profileContext);
-    const result = await callJudge(judge, prompt, subset.length);
+    const result = await callJudge(judge, subset, profileContext);
     run.judgeCalls += 1;
     run.tokens += result.tokens;
     if (result.votes) addVotes(judge, pending, result.votes);

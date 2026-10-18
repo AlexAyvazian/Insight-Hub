@@ -26,6 +26,12 @@ import {
 } from "./relevance";
 import { decideRelevance } from "./relevanceDecision";
 import { REASON_CODES } from "./relevanceReasonCodes";
+import {
+  applyProcurementAuthenticity,
+  assessProcurementAuthenticity,
+  ownNoticeText,
+  type AuthenticityAssessment,
+} from "./procurementAuthenticity";
 import { getRelevanceProfile } from "./relevanceProfile";
 import {
   profileBooleanQueries,
@@ -161,21 +167,67 @@ interface Candidate {
 
 export type DiscoveryTriage =
   | { keep: true; band: "accept" | "review" }
-  | { keep: false; reason: "blocked_domain" | "hard_reject" | "no_procurement_signal" | "insufficient_relevance" };
+  | {
+      keep: false;
+      reason: "blocked_domain" | "hard_reject" | "no_procurement_signal" | "not_a_procurement_notice" | "insufficient_relevance";
+    };
 
 /**
  * Pre-enrichment triage of a search hit from its title/snippet alone. Only cheap, safe exclusions happen here
  * (job boards, profile hard rejects, no procurement wording, no service evidence at all). Review-band snippets are
  * kept so the page can be fetched and judged on its full text; a short snippet is not grounds to discard.
  */
-export function triageDiscoveryCandidate(candidate: Pick<Candidate, "title" | "content" | "url">): DiscoveryTriage {
+export function triageDiscoveryCandidate(
+  candidate: Pick<Candidate, "title" | "content" | "url"> & Partial<Pick<Candidate, "sourceProvider">>,
+): DiscoveryTriage {
   if (isBlockedDomainShared(candidate.url)) return { keep: false, reason: "blocked_domain" };
-  const r = classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, allowHistorical: true });
+  const content = ownNoticeText(candidate.content);
+  const r = classifyResult({ title: candidate.title, snippet: content, url: candidate.url, allowHistorical: true });
   if (r.reasonCodes.includes(REASON_CODES.hardReject)) return { keep: false, reason: "hard_reject" };
   if (r.matchedProcurementSignals.length === 0) return { keep: false, reason: "no_procurement_signal" };
-  const verdict = decideRelevance(r).verdict;
+  // Procurement authenticity: clear non-notices (articles, regulations, policy pages) are skipped; listing pages,
+  // addenda and other ambiguous pages stay in the review band so the fetched page is judged on its full text.
+  const authenticity = assessProcurementAuthenticity({
+    title: candidate.title,
+    description: content,
+    url: candidate.url,
+    source: candidate.sourceProvider ?? "websearch",
+  });
+  if (authenticity.action === "reject") return { keep: false, reason: "not_a_procurement_notice" };
+  const verdict = decideRelevance(applyProcurementAuthenticity(r, authenticity)).verdict;
   if (verdict === "reject") return { keep: false, reason: "insufficient_relevance" };
   return { keep: true, band: verdict };
+}
+
+/**
+ * The authenticity check on the fetched page, for the record that will be built from it. Triage only saw the
+ * snippet, and direct web-discovery records do not pass through the structured decision, so a page the check holds
+ * is marked held here and is never promoted.
+ */
+function finalAuthenticity(
+  candidate: Pick<Candidate, "url"> & Partial<Pick<Candidate, "sourceProvider">>,
+  title: string,
+  text: string,
+  responseDeadline?: Date,
+): AuthenticityAssessment {
+  return assessProcurementAuthenticity({
+    title,
+    description: ownNoticeText(text),
+    url: candidate.url,
+    source: candidate.sourceProvider ?? "websearch",
+    responseDeadline: responseDeadline ?? null,
+  });
+}
+
+export function withAuthenticityHold(record: NormalizedOpportunity, assessment: AuthenticityAssessment): NormalizedOpportunity {
+  if (assessment.action !== "review" || !assessment.reason) return record;
+  return {
+    ...record,
+    rawData: {
+      ...(record.rawData ?? {}),
+      structuredDecision: { status: "held", code: "procurement_authenticity_hold", reason: assessment.reason },
+    },
+  };
 }
 
 /** Legacy accept-only gate, kept for callers outside discovery triage. */
@@ -702,7 +754,17 @@ export async function webIntelligenceFetch(options: {
           stats.rejected++;
           return;
         }
-        const cls = classifyResult({
+        const authenticity = finalAuthenticity(
+          candidate,
+          extraction.title ?? candidate.title,
+          [candidate.content, extraction.description].filter(Boolean).join("\n"),
+          validDeadline,
+        );
+        if (authenticity.action === "reject") {
+          stats.rejected++;
+          return;
+        }
+        const cls = applyProcurementAuthenticity(classifyResult({
           title: extraction.title ?? candidate.title,
           snippet: candidate.content,
           description: extraction.description,
@@ -710,12 +772,12 @@ export async function webIntelligenceFetch(options: {
           date: candidate.dateRaw,
           deadlineInFuture: !!validDeadline,
           keywords: options.keywords,
-        });
+        }), authenticity);
         if (decideRelevance(cls).verdict === "reject") {
           stats.rejected++;
           return;
         }
-        opportunities.push(buildWebOpportunity(candidate, {
+        opportunities.push(withAuthenticityHold(buildWebOpportunity(candidate, {
           title: extraction.title ?? candidate.title,
           // Never substitute a service category for an unknown buyer.
           agency: extraction.agency ?? "Unknown Organization",
@@ -728,23 +790,31 @@ export async function webIntelligenceFetch(options: {
           cls,
           fallback: false,
           extra: { winnerScorer: extraction.winnerScorer },
-        }));
+        }), authenticity));
         stats.extracted++;
         return;
       }
 
-      const cls = classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, date: candidate.dateRaw, keywords: options.keywords });
+      const meta = extractMetadataFromText(candidate.content, candidate.title);
+      const authenticity = finalAuthenticity(candidate, candidate.title, candidate.content, meta.deadline);
+      if (authenticity.action === "reject") {
+        stats.rejected++;
+        return;
+      }
+      const cls = applyProcurementAuthenticity(
+        classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, date: candidate.dateRaw, keywords: options.keywords }),
+        authenticity,
+      );
       if (decideRelevance(cls).verdict === "reject") {
         stats.rejected++;
         return;
       }
-      const meta = extractMetadataFromText(candidate.content, candidate.title);
       if (isExpiredDeadline(meta.deadline)) {
         stats.expiredRejected++;
         stats.rejected++;
         return;
       }
-      opportunities.push(buildWebOpportunity(candidate, {
+      opportunities.push(withAuthenticityHold(buildWebOpportunity(candidate, {
         title: candidate.title,
         agency: meta.agencyHint ?? "Unknown Organization",
         // Keep the full fetched text (already capped at 5,000 by enrichment) so scope evidence is not judged on 600.
@@ -755,7 +825,7 @@ export async function webIntelligenceFetch(options: {
         relevanceReason: cls.reasons.join("; "),
         cls,
         fallback: true,
-      }));
+      }), authenticity));
       stats.extracted++;
       stats.heuristicExtracted++;
     });
