@@ -332,6 +332,29 @@ export function evidenceExcerpts(sections: EvidenceSection[], maxChars = 12_000)
   return { text: parts.join("\n\n"), citations };
 }
 
+const INSERT_CHUNK_ROWS = 200;
+
+async function insertRows(
+  client: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  target: string,
+  rows: unknown[][],
+  constantTail?: string,
+): Promise<void> {
+  for (let start = 0; start < rows.length; start += INSERT_CHUNK_ROWS) {
+    const chunk = rows.slice(start, start + INSERT_CHUNK_ROWS);
+    const params: unknown[] = [];
+    const values = chunk.map((row) => {
+      const placeholders = row.map((value) => {
+        params.push(value);
+        return `$${params.length}`;
+      });
+      if (constantTail) placeholders.push(constantTail);
+      return `(${placeholders.join(",")})`;
+    });
+    await client.query(`INSERT INTO ${target} VALUES ${values.join(",")}`, params);
+  }
+}
+
 /** Persists the ledger; the previous one for this opportunity is superseded, not deleted. */
 export async function saveLedger(opportunityKey: string, contentHash: string, ledger: Ledger): Promise<void> {
   await ensureReleaseCSchema();
@@ -353,21 +376,28 @@ export async function saveLedger(opportunityKey: string, contentHash: string, le
       `UPDATE opportunity_assessments SET superseded_at = now(), superseded_reason = 'content_or_profile_changed' WHERE opportunity_key = $1 AND superseded_at IS NULL`,
       [opportunityKey],
     );
+    // One multi-row insert per table (in chunks) instead of a round trip per requirement: the web process shares a
+    // very small connection pool, and holding a transaction across hundreds of round trips starves other queries.
+    const requirementRows: unknown[][] = [];
+    const matchRows: unknown[][] = [];
     for (let i = 0; i < ledger.requirements.length; i += 1) {
       const requirement = ledger.requirements[i]!;
       const match = ledger.matches[i]!;
       const rowId = randomUUID();
-      await client.query(
-        `INSERT INTO opportunity_requirements (id, opportunity_key, requirement_id, document_id, section_id, page, locator, requirement_text, mandatory, category, source_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [rowId, opportunityKey, requirement.requirementId, requirement.documentId, requirement.sectionId, requirement.page, requirement.locator, requirement.text, requirement.mandatory, requirement.category, contentHash],
-      );
-      await client.query(
-        `INSERT INTO opportunity_requirement_matches (id, requirement_row_id, opportunity_key, profile_version, capability_id, status, rationale, evidence, decided_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'deterministic')`,
-        [randomUUID(), rowId, opportunityKey, profileVersion, match.capability, match.status, match.rationale.slice(0, 500), JSON.stringify(match.evidence)],
-      );
+      requirementRows.push([rowId, opportunityKey, requirement.requirementId, requirement.documentId, requirement.sectionId, requirement.page, requirement.locator, requirement.text, requirement.mandatory, requirement.category, contentHash]);
+      matchRows.push([randomUUID(), rowId, opportunityKey, profileVersion, match.capability, match.status, match.rationale.slice(0, 500), JSON.stringify(match.evidence)]);
     }
+    await insertRows(
+      client,
+      "opportunity_requirements (id, opportunity_key, requirement_id, document_id, section_id, page, locator, requirement_text, mandatory, category, source_hash)",
+      requirementRows,
+    );
+    await insertRows(
+      client,
+      "opportunity_requirement_matches (id, requirement_row_id, opportunity_key, profile_version, capability_id, status, rationale, evidence, decided_by)",
+      matchRows,
+      "'deterministic'",
+    );
     await client.query(
       `INSERT INTO opportunity_assessments (id, opportunity_key, content_hash, profile_version, axes, summary) VALUES ($1,$2,$3,$4,$5,$6)`,
       [randomUUID(), opportunityKey, contentHash, profileVersion, JSON.stringify(ledger.assessment), ledger.assessment.summary],

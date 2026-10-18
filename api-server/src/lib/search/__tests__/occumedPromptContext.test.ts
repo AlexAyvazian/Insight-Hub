@@ -8,7 +8,7 @@ import {
   buildProfileBlock,
   renderPromptContext,
 } from "../occumedPromptContext";
-import { buildReviewPrompt } from "../structuredOpportunityDecision";
+import { buildReviewPrompt, reviewPromptCharLimit } from "../structuredOpportunityDecision";
 import { buildPrompt } from "../structuredOpportunityJudge";
 
 const ref = (overrides: Partial<OccuMedReferenceModel> = {}): OccuMedReferenceModel => ({
@@ -97,5 +97,19 @@ describe("Occu-Med prompt context", () => {
   it("states the workers' comp scope rule once in the decision prompt", () => {
     const occurrences = buildReviewPrompt([record]).match(/IMPORTANT: Workers/g) ?? [];
     assert.equal(occurrences.length, 0);
+  });
+  it("fits a size-limited judge's prompt by trimming record text, keeping every record and the instructions", () => {
+    const long = (n: number) => `Statement of work. ${"Occupational health physicals for employees. ".repeat(n)}END-OF-TEXT`;
+    const records = [0, 1, 2].map((i) => ({ ...record, externalId: `x${i}`, title: `Physicals ${i}`, description: long(400) }));
+    const full = buildReviewPrompt(records);
+    const limit = reviewPromptCharLimit("groq")!;
+    assert.ok(full.length > limit, "fixture must exceed the Groq limit");
+    const fitted = buildReviewPrompt(records, "", limit);
+    assert.ok(fitted.length <= limit, `fitted prompt ${fitted.length} > ${limit}`);
+    for (const i of [0, 1, 2]) assert.match(fitted, new RegExp(`\\[${i}\\]\\nTitle: Physicals ${i}`));
+    assert.match(fitted, /Return only JSON/);
+    // Fences carry a random id, so compare sizes: a prompt under the limit is not trimmed.
+    assert.equal(buildReviewPrompt([record], "", limit).length, buildReviewPrompt([record]).length);
+    assert.equal(reviewPromptCharLimit("cerebras"), undefined);
   });
 });
