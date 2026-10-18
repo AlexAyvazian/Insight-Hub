@@ -57,24 +57,90 @@ export function profileExclusionOperators(profile: RelevanceProfile = getRelevan
     .join(" ");
 }
 
-/** One boolean-operator query per service bundle: (service terms) (procurement terms) year exclusions. */
-export function profileBooleanQueries(year: number, profile: RelevanceProfile = getRelevanceProfile()): string[] {
-  return serviceBundles(profile).map((bundle) => {
-    const services = bundle.serviceTerms.slice(0, SERVICE_TERMS_PER_QUERY).map(operand).join(" OR ");
-    const procurement = bundle.procurementTerms.slice(0, PROCUREMENT_TERMS_PER_QUERY).map(operand).join(" OR ");
-    return [`(${services})`, procurement ? `(${procurement})` : "", String(year), profileExclusionOperators(profile, bundle.exclusions)]
-      .filter(Boolean)
-      .join(" ");
+const DAY_MS = 86_400_000;
+
+/**
+ * Deterministic rotation cursor: the UTC day index. Query builders use it to move through every bundle term and
+ * every coverage group over a bounded cycle (a few days) instead of always sending the first 2-3 terms. It needs no
+ * stored state, so a run can be reproduced from its date.
+ */
+export function queryRotationCursor(now: number = Date.now()): number {
+  return Math.floor(now / DAY_MS);
+}
+
+/** `size` items starting at window `cursor`, wrapping; over ceil(len/size) cursors every item appears. */
+export function rotatingWindow<T>(items: readonly T[], size: number, cursor: number): T[] {
+  if (items.length <= size) return [...items];
+  const windows = Math.ceil(items.length / size);
+  const start = (((cursor % windows) + windows) % windows) * size;
+  return Array.from({ length: size }, (_, i) => items[(start + i) % items.length]!);
+}
+
+/** Days needed for every bundle term (and gap group) to be queried at least once. */
+export function queryRotationCycleDays(profile: RelevanceProfile = getRelevanceProfile(), termsPerQuery = SERVICE_TERMS_PER_QUERY): number {
+  const lengths = [
+    ...serviceBundles(profile).map((b) => b.serviceTerms.length),
+    ...coverageGapCategories(profile).map((c) => c.explicit.length),
+  ];
+  return Math.max(1, ...lengths.map((n) => Math.ceil(n / termsPerQuery)));
+}
+
+function normalizedTerm(term: string): string {
+  return plain(term).toLowerCase();
+}
+
+/**
+ * Non-adjacent profile categories that no search bundle represents (no bundle service term mentions any of the
+ * category's explicit/component phrases). Without this they would never be searched directly, however rich the
+ * profile vocabulary. Vocabulary still comes only from the profile; this function only schedules it.
+ */
+export function coverageGapCategories(profile: RelevanceProfile = getRelevanceProfile()) {
+  const bundleTerms = serviceBundles(profile).flatMap((b) => b.serviceTerms.map(normalizedTerm));
+  return profile.categories.filter((category) => {
+    if (category.adjacentOnly || category.id === profile.networkCategoryId || category.explicit.length === 0) return false;
+    const phrases = [...category.explicit, ...category.component].map(normalizedTerm).filter((t) => t.length >= 5);
+    return !phrases.some((phrase) => bundleTerms.some((term) => term.includes(phrase) || phrase.includes(term)));
   });
 }
 
-/** One natural-language query per service bundle, for neural / conversational engines. */
-export function profileNaturalQueries(year: number, profile: RelevanceProfile = getRelevanceProfile()): string[] {
+/** One boolean-operator query per service bundle (plus one per coverage-gap category), rotating through terms. */
+export function profileBooleanQueries(
+  year: number,
+  profile: RelevanceProfile = getRelevanceProfile(),
+  cursor: number = queryRotationCursor(),
+): string[] {
+  const generalProcurement = profileProcurementTerms(profile, PROCUREMENT_TERMS_PER_QUERY);
+  const groups = [
+    ...serviceBundles(profile).map((bundle) => ({
+      services: rotatingWindow(bundle.serviceTerms, SERVICE_TERMS_PER_QUERY, cursor),
+      procurement: bundle.procurementTerms.slice(0, PROCUREMENT_TERMS_PER_QUERY),
+      exclusions: bundle.exclusions,
+    })),
+    ...coverageGapCategories(profile).map((category) => ({
+      services: rotatingWindow(category.explicit, SERVICE_TERMS_PER_QUERY, cursor),
+      procurement: generalProcurement,
+      exclusions: [] as string[],
+    })),
+  ];
+  return groups.map(({ services, procurement, exclusions }) =>
+    [`(${services.map(operand).join(" OR ")})`, procurement.length ? `(${procurement.map(operand).join(" OR ")})` : "", String(year), profileExclusionOperators(profile, exclusions)]
+      .filter(Boolean)
+      .join(" "));
+}
+
+/** One natural-language query per service bundle (plus coverage-gap categories), rotating through terms. */
+export function profileNaturalQueries(
+  year: number,
+  profile: RelevanceProfile = getRelevanceProfile(),
+  cursor: number = queryRotationCursor(),
+): string[] {
   const [lead, second] = profileProcurementTerms(profile, 2);
-  return serviceBundles(profile).map((bundle) => {
-    const services = bundle.serviceTerms.slice(0, 2).map(plain).join(" or ");
-    return [`open`, lead, second, "for", services, String(year)].filter(Boolean).join(" ");
-  });
+  const serviceSets = [
+    ...serviceBundles(profile).map((bundle) => rotatingWindow(bundle.serviceTerms, 2, cursor)),
+    ...coverageGapCategories(profile).map((category) => rotatingWindow(category.explicit, 2, cursor)),
+  ];
+  return serviceSets.map((terms) =>
+    [`open`, lead, second, "for", terms.map(plain).join(" or "), String(year)].filter(Boolean).join(" "));
 }
 
 /** The lead service term of every bundle, unquoted: short phrases that describe Occu-Med's scope in a search string. */
@@ -88,13 +154,17 @@ export function profileScopeOperand(profile: RelevanceProfile = getRelevanceProf
   return leads.length ? `(${leads.map(operand).join(" OR ")})` : "";
 }
 
-/** `n` items spread evenly across the list, so a provider that runs only the first few queries still covers every bundle. */
-export function spreadSample<T>(items: T[], n: number): T[] {
+/**
+ * `n` items spread evenly across the list. With a rotation `cursor` the sample shifts each day, so a provider that
+ * runs only a few queries still reaches every bundle over the cycle instead of always the same subset.
+ */
+export function spreadSample<T>(items: T[], n: number, cursor = 0): T[] {
   if (items.length <= n) return items;
   const picked: T[] = [];
   const seen = new Set<number>();
+  const offset = ((cursor % items.length) + items.length) % items.length;
   for (let i = 0; i < n; i++) {
-    const index = Math.floor((i * items.length) / n);
+    const index = (Math.floor((i * items.length) / n) + offset) % items.length;
     if (!seen.has(index)) {
       seen.add(index);
       picked.push(items[index]!);

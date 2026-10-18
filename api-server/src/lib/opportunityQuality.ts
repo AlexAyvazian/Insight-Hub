@@ -516,20 +516,37 @@ export interface QualityPageResult<T extends OpportunityLike> {
   total: number;
 }
 
-export function opportunityCollapseKey(opp: OpportunityLike): string {
-  const url = canonicalSamOpportunityUrl(
-    opp.samUrl ?? opp.sourceUrl ?? opp.url,
-  );
+/** Solicitation "numbers" that identify nothing and must never merge unrelated notices. */
+const PLACEHOLDER_SOLICITATION_RE = /^(?:na|none|null|nil|tbd|tba|unknown|pending|notapplicable|rfp|rfq|rfi|ifb|itb|bid|solicitation|0+)$/;
+/** Words that differ between sources for the same buyer ("VETERANS AFFAIRS, DEPARTMENT OF" vs "Department of Veterans Affairs"). */
+const AGENCY_FILLER = new Set(["department", "dept", "of", "the", "and", "agency", "office", "us", "u", "s"]);
+
+export function normalizedSolicitationNumber(value: unknown): string | null {
+  const normalized = String(value ?? "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (normalized.length < 3 || PLACEHOLDER_SOLICITATION_RE.test(normalized) || /^(.)\1+$/.test(normalized)) return null;
+  return normalized;
+}
+
+export function normalizedAgencyKey(value: unknown): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token && !AGENCY_FILLER.has(token))
+    .sort()
+    .join("-");
+}
+
+/**
+ * One canonical identity for a notice across sources, used by the list route and the quality page accumulator:
+ * a real solicitation number scoped by normalized buyer, else the canonical notice URL, else the row id.
+ * Placeholder solicitation numbers (N/A, TBD, "RFP", ...) are ignored so they cannot merge unrelated tenders.
+ */
+export function canonicalOpportunityKey(opp: OpportunityLike): string {
+  const solicitation = normalizedSolicitationNumber(opp.solicitationNumber) ?? normalizedSolicitationNumber(opp.noticeId);
+  if (solicitation) return `sol:${normalizedAgencyKey(opp.agency)}:${solicitation}`;
+  const url = canonicalSamOpportunityUrl(opp.samUrl ?? opp.sourceUrl ?? opp.url);
   if (url) return `url:${url.toLowerCase()}`;
-  const sol = String(opp.solicitationNumber ?? opp.noticeId ?? "")
-    .trim()
-    .toLowerCase();
-  if (sol) {
-    const agency = String(opp.agency ?? "")
-      .trim()
-      .toLowerCase();
-    return `sol:${agency}:${sol}`;
-  }
   return `id:${opp.id ?? Math.random()}`;
 }
 
@@ -574,7 +591,7 @@ export class OpportunityQualityPageAccumulator<T extends OpportunityLike> {
     if (this.view !== "all" && ["poor", "spam"].includes(String(row.userGrade))) return;
     const quality = classifyOpportunityQuality(row, this.now);
     if (!qualityMatchesView(quality, this.view)) return;
-    const key = opportunityCollapseKey(row);
+    const key = canonicalOpportunityKey(row);
     const score = calculateOpportunityRank(row, quality, this.now).finalRankScore;
     const previous = this.bestScores.get(key);
     if (previous != null && previous >= score) return;

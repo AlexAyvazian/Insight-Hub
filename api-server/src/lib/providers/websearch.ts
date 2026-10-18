@@ -7,7 +7,7 @@
  * API: https://websearch.io or compatible endpoint
  */
 
-import { profileNaturalQueries, spreadSample } from "../search/profileWebQueries";
+import { profileNaturalQueries, queryRotationCursor, spreadSample } from "../search/profileWebQueries";
 import { getRelevanceProfile } from "../search/relevanceProfile";
 import type { DataSourceProvider, FetchOptions, ProviderFetchResult, ProviderStatus } from "./types";
 import { resolveCredential } from "../config/providerConfig";
@@ -86,7 +86,7 @@ export class WebsearchProvider implements DataSourceProvider {
     const year = new Date().getFullYear();
     return keywords
       ? [`${keywords} RFP bid ${year}`, `${keywords} government contract solicitation ${year}`]
-      : spreadSample(profileNaturalQueries(year), 4);
+      : spreadSample(profileNaturalQueries(year), 4, queryRotationCursor());
   }
 
   async getStatus(): Promise<ProviderStatus> {
