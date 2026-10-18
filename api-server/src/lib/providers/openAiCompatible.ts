@@ -17,6 +17,11 @@ export interface OpenAiCompatibleProviderOptions {
   modelDbKey?: string;
   modelEnvKey?: string;
   extraHeaders?: Record<string, string>;
+  /**
+   * Models tried in order when the configured one answers 404 or 410 (retired, or not enabled for this account). The
+   * first that answers is kept for the rest of the process, so the panel's family identity follows the model in use.
+   */
+  fallbackModels?: string[];
 }
 
 /**
@@ -33,6 +38,8 @@ export class OpenAiCompatibleProvider implements DataSourceProvider {
   private readonly modelDbKey?: string;
   private readonly modelEnvKey?: string;
   private readonly extraHeaders: Record<string, string>;
+  private readonly fallbackModels: string[];
+  private resolvedModel: string | null = null;
 
   constructor(options: OpenAiCompatibleProviderOptions) {
     this.name = options.name;
@@ -44,6 +51,7 @@ export class OpenAiCompatibleProvider implements DataSourceProvider {
     this.modelDbKey = options.modelDbKey;
     this.modelEnvKey = options.modelEnvKey;
     this.extraHeaders = options.extraHeaders ?? {};
+    this.fallbackModels = options.fallbackModels ?? [];
   }
 
   private async getApiKey(): Promise<string | null> {
@@ -51,6 +59,7 @@ export class OpenAiCompatibleProvider implements DataSourceProvider {
   }
 
   private async getModel(): Promise<string> {
+    if (this.resolvedModel) return this.resolvedModel;
     if (!this.modelDbKey && !this.modelEnvKey) return this.defaultModel;
     return (
       (await resolveCredential(
@@ -87,7 +96,28 @@ export class OpenAiCompatibleProvider implements DataSourceProvider {
       modelOverrideOrSignal instanceof AbortSignal
         ? modelOverrideOrSignal
         : signal;
-    const model = modelOverride ?? (await this.getModel());
+    const configured = modelOverride ?? (await this.getModel());
+    const candidates = modelOverride ? [configured] : [configured, ...this.fallbackModels.filter((m) => m !== configured)];
+    let lastMissing = "";
+    for (const model of candidates) {
+      const result = await this.request(apiKey, model, prompt, maxTokens, parentSignal);
+      if ("missing" in result) {
+        lastMissing = result.missing;
+        continue;
+      }
+      if (!modelOverride && model !== configured) this.resolvedModel = model;
+      return result.text;
+    }
+    throw new Error(lastMissing);
+  }
+
+  private async request(
+    apiKey: string,
+    model: string,
+    prompt: string,
+    maxTokens: number,
+    parentSignal: AbortSignal | undefined,
+  ): Promise<{ text: string } | { missing: string }> {
     const body: Record<string, unknown> = {
       model,
       messages: [{ role: "user", content: prompt }],
@@ -126,6 +156,9 @@ export class OpenAiCompatibleProvider implements DataSourceProvider {
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
+      if ((response.status === 404 || response.status === 410) && this.fallbackModels.length > 0) {
+        return { missing: `${this.displayName} error ${response.status} (${model}): ${text.slice(0, 200)}` };
+      }
       throw new Error(
         `${this.displayName} error ${response.status}: ${text.slice(0, 200)}`,
       );
@@ -134,7 +167,7 @@ export class OpenAiCompatibleProvider implements DataSourceProvider {
     const json = (await response.json()) as {
       choices?: { message?: { content?: string } }[];
     };
-    return (json.choices?.[0]?.message?.content ?? "").trim();
+    return { text: (json.choices?.[0]?.message?.content ?? "").trim() };
   }
 }
 
@@ -182,4 +215,6 @@ export const nvidiaProvider = new OpenAiCompatibleProvider({
   // meta/llama-3.1-8b-instruct reached end of life on 2026-08-26 (410), and z-ai/glm-5.3-flash timed out at 30 s in
   // production. Nemotron 70B is a non-reasoning model that answers well inside the timeout. Override with NVIDIA_MODEL.
   defaultModel: "nvidia/llama-3.1-nemotron-70b-instruct",
+  // Nemotron 70B is not enabled on every NIM account (404 "Function not found for account" in production).
+  fallbackModels: ["meta/llama-3.3-70b-instruct", "meta/llama-4-maverick-17b-128e-instruct", "qwen/qwen2.5-72b-instruct"],
 });
