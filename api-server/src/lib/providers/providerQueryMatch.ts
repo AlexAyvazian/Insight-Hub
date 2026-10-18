@@ -170,6 +170,30 @@ function recordSearchText(record: NormalizedOpportunity): string {
   ).join(" ");
 }
 
+/** Light suffix stripping so "examinations" meets "examination" and "testing" meets "test". */
+export function stemTerm(word: string): string {
+  if (word.length <= 4) return word;
+  return word.replace(/(?:ations?|ings?|ions?|ers?|ies|es|ed|al|s)$/, "") || word;
+}
+
+/** Phrases the user put in double quotes: an explicit request for exact matching. */
+function quotedPhrases(query: string): string[] {
+  return Array.from(query.matchAll(/"([^"]+)"/g), (match) => normalizedWords(match[1]!).join(" ")).filter(Boolean);
+}
+
+/** True when the query itself names an Occu-Med service, so the canonical profile decision can widen it. */
+function queryInProfileScope(query: string): boolean {
+  const result = classifyResult({ title: query, snippet: "", deadlineInFuture: true, allowHistorical: true });
+  return result.matchedExplicitPhrases.length > 0 || result.matchedServiceCategories.some((c) => c !== "Occu-Med profile phrase");
+}
+
+/**
+ * Whether a record answers a provider query. Retrieval is a union, not a chain of gates:
+ *  - quoted phrases are strict: every phrase and every term must appear;
+ *  - otherwise a lexical match on stemmed terms (all terms for one- and two-term queries, 60% for longer ones);
+ *  - or, when the query is about an Occu-Med service, the canonical profile decision keeps the record, so a
+ *    notice using different wording for the same service is not lost at the query step.
+ */
 export function recordMatchesProviderQuery(
   record: NormalizedOpportunity,
   query?: string,
@@ -179,10 +203,18 @@ export function recordMatchesProviderQuery(
     return decideRelevance(classifyProviderRecordRelevance(record)).verdict !== "reject";
   }
 
-  const terms = meaningfulProviderQueryTerms(query);
+  const phrases = quotedPhrases(query);
+  const terms = meaningfulProviderQueryTerms(query.replace(/"/g, " "));
   if (terms.length === 0) return true;
   const haystack = recordSearchText(record);
-  return terms.every((term) => haystack.includes(term));
+  if (phrases.length > 0) {
+    return phrases.every((phrase) => haystack.includes(phrase)) && terms.every((term) => haystack.includes(term));
+  }
+  const stems = new Set(haystack.split(" ").map(stemTerm));
+  const hits = terms.filter((term) => haystack.includes(term) || stems.has(stemTerm(term))).length;
+  const needed = terms.length <= 2 ? terms.length : Math.ceil(terms.length * 0.6);
+  if (hits >= needed) return true;
+  return queryInProfileScope(query) && decideRelevance(classifyProviderRecordRelevance(record)).verdict !== "reject";
 }
 
 function mismatchSample(

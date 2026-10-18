@@ -23,6 +23,7 @@ export const RELEASE_C_TABLES = [
   "opportunity_benchmark_results",
   "opportunity_audit_log",
   "remote_extraction_jobs",
+  "source_query_checkpoints",
 ] as const;
 
 export const RELEASE_C_DDL: readonly string[] = [
@@ -254,6 +255,19 @@ export const RELEASE_C_DDL: readonly string[] = [
     remote_id text NOT NULL,
     planned_units numeric NOT NULL DEFAULT 0,
     submitted_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  // Where a source query that did not fit in one run stopped, so the next run resumes it (Opportunities wave 1).
+  `CREATE TABLE IF NOT EXISTS source_query_checkpoints (
+    source text NOT NULL,
+    query_key text NOT NULL,
+    next_offset integer NOT NULL DEFAULT 0,
+    total_records integer,
+    window_from text,
+    window_to text,
+    complete boolean NOT NULL DEFAULT false,
+    last_error text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, query_key)
   )`,
 ];
 

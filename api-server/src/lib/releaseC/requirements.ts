@@ -62,7 +62,15 @@ export interface Assessment {
   eligibility: AssessmentAxis;
   sourceVerification: AssessmentAxis;
   deadlineVerification: AssessmentAxis;
-  documentCompleteness: AssessmentAxis & { documents: number; extracted: number; pendingOrFailed: number };
+  documentCompleteness: AssessmentAxis & {
+    documents: number;
+    extracted: number;
+    pendingOrFailed: number;
+    /** Requirements found but not kept because the ledger hit its safety cap. */
+    requirementsOmitted?: number;
+    /** Attachments the notice lists beyond the registration cap; their content was not read. */
+    attachmentsNotRegistered?: number;
+  };
   summary: string;
 }
 
@@ -74,7 +82,9 @@ const DEADLINE = /\b(due (?:date|by|on)|closing date|no later than|deadline|subm
 const LOCATION = /\b(place of performance|on[- ]site|onsite|located at|location|facility|installation|nationwide|worldwide|statewide)\b/i;
 const PRICING = /\b(price|pricing|clin|unit cost|firm[- ]fixed|time and materials|labor rate|cost proposal)\b/i;
 const EVALUATION = /\b(evaluat|best value|lowest price technically acceptable|lpta|tradeoff|factor \d)\b/i;
-const MAX_REQUIREMENTS = 400;
+// Safety cap on one ledger. Large solicitations exceed the old 400 easily; when this is hit the overflow is counted,
+// material categories are kept first, and the document set is never reported complete.
+export const MAX_REQUIREMENTS = Math.max(100, Number(process.env.OPPORTUNITY_MAX_REQUIREMENTS ?? 1_000) || 1_000);
 const MAX_REQUIREMENT_CHARS = 600;
 
 function categoryFor(text: string, kind: SectionKind): RequirementCategory {
@@ -127,12 +137,66 @@ export function noticeAsSection(record: NormalizedOpportunity): EvidenceSection 
 }
 
 export function extractRequirements(sections: EvidenceSection[]): Requirement[] {
+  return extractRequirementsWithCoverage(sections).requirements;
+}
+
+// Material categories survive the cap first: what is bought, what is excluded, who may bid, then the rest.
+const CATEGORY_PRIORITY: Record<RequirementCategory, number> = {
+  scope: 0,
+  exclusion: 0,
+  eligibility: 1,
+  deadline: 2,
+  location: 2,
+  evaluation: 3,
+  pricing: 3,
+};
+
+/**
+ * Every requirement across the complete document set, in document order. When the set exceeds the cap, mandatory
+ * and material requirements (scope, exclusions, eligibility) from every document are kept ahead of the rest, so a
+ * long first attachment can no longer crowd out an amendment or SOW read later; the overflow is counted.
+ */
+export function extractRequirementsWithCoverage(sections: EvidenceSection[], cap = MAX_REQUIREMENTS): { requirements: Requirement[]; found: number; omitted: number } {
+  const all = extractAllRequirements(sections);
+  if (all.length <= cap) return { requirements: all, found: all.length, omitted: 0 };
+  // Each document (amendments and SOWs included) gets a fair share: documents take turns, and within a document
+  // material and mandatory requirements go first.
+  const byDocument = new Map<string, Array<{ requirement: Requirement; position: number }>>();
+  all.forEach((requirement, position) => {
+    const key = requirement.documentId ?? requirement.sectionId ?? "notice";
+    if (!byDocument.has(key)) byDocument.set(key, []);
+    byDocument.get(key)!.push({ requirement, position });
+  });
+  const queues = [...byDocument.values()].map((rows) =>
+    rows.sort(
+      (a, b) =>
+        CATEGORY_PRIORITY[a.requirement.category] - CATEGORY_PRIORITY[b.requirement.category] ||
+        Number(b.requirement.mandatory) - Number(a.requirement.mandatory) ||
+        a.position - b.position,
+    ),
+  );
+  const chosen: Array<{ requirement: Requirement; position: number }> = [];
+  for (let round = 0; chosen.length < cap; round += 1) {
+    let added = false;
+    for (const queue of queues) {
+      const next = queue[round];
+      if (!next) continue;
+      chosen.push(next);
+      added = true;
+      if (chosen.length >= cap) break;
+    }
+    if (!added) break;
+  }
+  chosen.sort((a, b) => a.position - b.position);
+  return { requirements: chosen.map((entry) => entry.requirement), found: all.length, omitted: all.length - chosen.length };
+}
+
+function extractAllRequirements(sections: EvidenceSection[]): Requirement[] {
   const out: Requirement[] = [];
   const seen = new Set<string>();
   for (const section of sections) {
     let index = 0;
     for (const { statement, page: statementPage } of pagedStatements(section)) {
-      if (out.length >= MAX_REQUIREMENTS) return out;
       if (!REQUIREMENT_HINT.test(statement) && section.kind === "general") continue;
       const text = statement.slice(0, MAX_REQUIREMENT_CHARS);
       const dedupe = text.toLowerCase();
@@ -203,6 +267,10 @@ export interface AssessmentContext {
   documents: Array<{ extractionStatus: string; retrievalStatus: string }>;
   documentPipelineEnabled: boolean;
   now?: number;
+  /** Listed attachments that were not registered (over the registration cap). */
+  attachmentsNotRegistered?: number;
+  /** Requirements dropped by the ledger cap (set by buildLedger). */
+  requirementsOmitted?: number;
 }
 
 const OFFICIAL_HOST = /(^|\.)((sam|usaspending|grants|fbo|gsa|va|dla|nasa|state|army|navy|af|mil)\.(gov|mil)|[a-z0-9-]+\.(gov|mil|gov\.[a-z]{2}|us))$/i;
@@ -231,12 +299,17 @@ export function buildAssessment(record: NormalizedOpportunity, requirements: Req
   const docs = context.documents;
   const extracted = docs.filter(isCurrentlyExtracted).length;
   const pendingOrFailed = docs.length - extracted;
+  const notRegistered = context.attachmentsNotRegistered ?? 0;
+  const omitted = context.requirementsOmitted ?? 0;
+  const capped = notRegistered > 0 || omitted > 0;
   const completeness: AssessmentAxis["status"] = !context.documentPipelineEnabled
     ? "unknown"
     : docs.length === 0
       ? "unknown"
       : pendingOrFailed === 0
-        ? "pass"
+        ? capped
+          ? "partial"
+          : "pass"
         : extracted > 0
           ? "partial"
           : "fail";
@@ -279,10 +352,18 @@ export function buildAssessment(record: NormalizedOpportunity, requirements: Req
       status: completeness,
       detail: !context.documentPipelineEnabled
         ? "Document pipeline not active"
-        : `${extracted} of ${docs.length} documents extracted`,
+        : [
+            `${extracted} of ${docs.length} documents extracted`,
+            notRegistered > 0 ? `${notRegistered} listed attachments not yet registered` : null,
+            omitted > 0 ? `${omitted} requirements over the ledger cap not analysed` : null,
+          ]
+            .filter(Boolean)
+            .join("; "),
       documents: docs.length,
       extracted,
       pendingOrFailed,
+      ...(omitted > 0 ? { requirementsOmitted: omitted } : {}),
+      ...(notRegistered > 0 ? { attachmentsNotRegistered: notRegistered } : {}),
     },
     summary: "",
   };
@@ -304,9 +385,9 @@ export interface Ledger {
 
 export function buildLedger(record: NormalizedOpportunity, sections: EvidenceSection[], context: AssessmentContext): Ledger {
   const source = sections.length > 0 ? sections : [noticeAsSection(record)];
-  const requirements = extractRequirements(source);
+  const { requirements, omitted } = extractRequirementsWithCoverage(source);
   const matches = requirements.map(matchRequirement);
-  return { requirements, matches, assessment: buildAssessment(record, requirements, matches, context) };
+  return { requirements, matches, assessment: buildAssessment(record, requirements, matches, { ...context, requirementsOmitted: omitted }) };
 }
 
 /**

@@ -203,8 +203,10 @@ describe("coordinated AI search intelligence stack", () => {
     );
 
     assert.equal(result.applied, true);
-    assert.equal(result.duplicatesRemoved, 1);
-    assert.equal(result.candidates.length, 2);
+    // Resemblance alone is not identity: the mirror is kept as a potential match, not discarded.
+    assert.equal(result.duplicatesRemoved, 0);
+    assert.equal(result.potentialDuplicates, 1);
+    assert.equal(result.candidates.length, 3);
     assert.ok(
       [
         "Occupational Health Services Request for Proposals",
@@ -212,6 +214,42 @@ describe("coordinated AI search intelligence stack", () => {
       ].includes(result.candidates[0]?.title ?? ""),
     );
     assert.ok((result.candidates[0]?.cloudflareSemanticScore ?? 0) > 95);
+  });
+
+  it("removes a near-identical candidate only when it states the same solicitation number", () => {
+    const result = finalizeSemanticPriority(
+      [
+        {
+          title: "Occupational Health Services Request for Proposals",
+          url: "https://example.gov/rfp/1",
+          content: "Solicitation No. 36C26226Q0042. Open RFP for employee medical surveillance.",
+          sourceProvider: "serper",
+        },
+        {
+          title: "Request for Proposals Occupational Health Services",
+          url: "https://mirror.example.gov/rfp/1",
+          content: "Solicitation No. 36C26226Q0042. Open RFP for employee medical surveillance.",
+          sourceProvider: "exa",
+        },
+        {
+          title: "Request for Proposals Occupational Health Services",
+          url: "https://example.gov/rfp/9",
+          content: "Solicitation No. 36C26226Q0077. Open RFP for employee medical surveillance.",
+          sourceProvider: "exa",
+        },
+      ],
+      [
+        [1, 0],
+        [0.999, 0.001],
+        [0.998, 0.002],
+      ],
+      [1, 0],
+      new Map(),
+      20,
+    );
+    assert.equal(result.duplicatesRemoved, 1);
+    assert.equal(result.candidates.length, 2);
+    assert.ok(result.candidates.some((c) => c.url === "https://example.gov/rfp/9"), "a different solicitation number is a separate procurement");
   });
 
   it("prevents one close-scoring source from monopolizing the AI budget", () => {

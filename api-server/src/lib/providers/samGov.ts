@@ -6,6 +6,8 @@ import { rfpDb as db, rfpPool } from "@workspace/db";
 import { saveSamIntelligenceNotices } from "../intelligence/samNoticeCache";
 import { opportunitiesTable } from "@workspace/db/schema";
 import { eq, sql } from "drizzle-orm";
+import { paginateOffsets, type SourcePage } from "./sourcePagination";
+import { loadQueryCheckpoint, resumePoint, saveQueryCheckpoint } from "../releaseC/queryCheckpoints";
 import {
   buildSamGovAutonomousTitleQueries,
   buildSamGovTitleQueries,
@@ -25,8 +27,10 @@ const SAM_GOV_DEFAULT_BASE = "https://api.sam.gov/opportunities/v2/search";
 // Same request count: also request presolicitations (p), sources sought (r), and award notices (a).
 // Non-bid types go ONLY to the intelligence sidecar; the RFP results remain bid-ready o/k.
 const SAM_GOV_BID_NOTICE_TYPES = ["o", "k", "p", "r", "a"] as const;
-const SAM_GOV_MAX_RESULTS_PER_TITLE = 250;
-const SAM_GOV_MAX_RESULTS_PER_CLASSIFICATION = 75;
+// GSA's documented maximum page size is 1000. Queries page past it with offset; whatever does not fit in a run's
+// page budget is resumed from a persisted checkpoint on the next run instead of being silently dropped.
+const SAM_GOV_PAGE_SIZE = Math.max(1, Math.min(1000, Number(process.env.SAM_GOV_PAGE_SIZE ?? 1000) || 1000));
+const SAM_GOV_MAX_PAGES_PER_QUERY = Math.max(1, Math.min(10, Number(process.env.SAM_GOV_MAX_PAGES_PER_QUERY ?? 2) || 2));
 const SAM_GOV_AUTONOMOUS_QUERY_COUNT = 2;
 // SAM accepts one NAICS/PSC code per request, so rotate through the taxonomy
 // instead of firing the full catalogue on every Fetch Intelligence run.
@@ -106,7 +110,13 @@ export interface SamQueryCoverage {
   query: string;
   family: string;
   returned: number;
+  /** True when the source holds more rows for this query than were read; the remainder resumes next run. */
   truncated: boolean;
+  totalRecords?: number | null;
+  startOffset?: number;
+  nextOffset?: number;
+  pagesFetched?: number;
+  resumed?: boolean;
   error?: string;
 }
 
@@ -130,17 +140,19 @@ export class SamGovProvider implements DataSourceProvider {
     credentialSlot: string,
     baseUrl: string,
     extra: Record<string, string>,
-    fromDate: Date,
+    postedFrom: string,
+    postedTo: string,
     today: Date,
     limit: number,
+    offset: number,
     signal?: AbortSignal,
-  ): Promise<NormalizedOpportunity[]> {
+  ): Promise<SourcePage<NormalizedOpportunity>> {
     const params = new URLSearchParams({
       api_key: apiKey,
-      postedFrom: SamGovProvider.fmtDate(fromDate),
-      postedTo: SamGovProvider.fmtDate(today),
+      postedFrom,
+      postedTo,
       limit: String(limit),
-      offset: "0",
+      offset: String(offset),
       ...extra,
     });
     SAM_GOV_BID_NOTICE_TYPES.forEach((type) => params.append("ptype", type));
@@ -184,9 +196,67 @@ export class SamGovProvider implements DataSourceProvider {
         console.warn(JSON.stringify({ event: "sam_intelligence_cache_unavailable" }));
       });
     }
-    return notices
-      .filter((opportunity) => isBidReadySamOpportunity(opportunity, today))
-      .map((opportunity) => this.normalize(opportunity));
+    return {
+      records: notices
+        .filter((opportunity) => isBidReadySamOpportunity(opportunity, today))
+        .map((opportunity) => this.normalize(opportunity)),
+      rawReturned: notices.length,
+      totalRecords: typeof json.totalRecords === "number" ? json.totalRecords : null,
+    };
+  }
+
+  /**
+   * Runs one query across as many pages as the run's budget allows, resuming from the stored checkpoint (same
+   * offset and date window) when an earlier run stopped part-way. Pages fetched before a failure are kept.
+   */
+  private async runPagedQuery(
+    queryKey: string,
+    family: string,
+    baseUrl: string,
+    extra: Record<string, string>,
+    fromDate: Date,
+    today: Date,
+    signal?: AbortSignal,
+  ): Promise<{ records: NormalizedOpportunity[]; coverage: SamQueryCoverage; error?: Error }> {
+    const resume = resumePoint(await loadQueryCheckpoint("samGov", queryKey));
+    const postedFrom = resume.windowFrom ?? SamGovProvider.fmtDate(fromDate);
+    const postedTo = resume.windowTo ?? SamGovProvider.fmtDate(today);
+    const outcome = await paginateOffsets({
+      pageSize: SAM_GOV_PAGE_SIZE,
+      maxPages: SAM_GOV_MAX_PAGES_PER_QUERY,
+      startOffset: resume.offset,
+      fetchPage: (offset) =>
+        samGovCredentials.run((apiKey, slot) =>
+          this.runQuery(apiKey, slot, baseUrl, extra, postedFrom, postedTo, today, SAM_GOV_PAGE_SIZE, offset, signal),
+        ),
+    });
+    const error = outcome.error === undefined ? undefined : outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
+    await saveQueryCheckpoint({
+      source: "samGov",
+      queryKey,
+      nextOffset: outcome.complete ? 0 : outcome.nextOffset,
+      totalRecords: outcome.totalRecords,
+      windowFrom: outcome.complete ? null : postedFrom,
+      windowTo: outcome.complete ? null : postedTo,
+      complete: outcome.complete,
+      lastError: error?.message ?? null,
+    });
+    return {
+      records: outcome.records,
+      error,
+      coverage: {
+        query: queryKey,
+        family,
+        returned: outcome.records.length,
+        truncated: !outcome.complete,
+        totalRecords: outcome.totalRecords,
+        startOffset: outcome.startOffset,
+        nextOffset: outcome.nextOffset,
+        pagesFetched: outcome.pagesFetched,
+        resumed: resume.resumed,
+        ...(error ? { error: error.message.slice(0, 200) } : {}),
+      },
+    };
   }
 
   private async hydrateDescriptions(
@@ -382,19 +452,16 @@ export class SamGovProvider implements DataSourceProvider {
 
     for (let index = 0; index < queries.length; index += SAM_GOV_CLASSIFICATION_CONCURRENCY) {
       const batch = queries.slice(index, index + SAM_GOV_CLASSIFICATION_CONCURRENCY);
-      const results = await Promise.allSettled(
+      const results = await Promise.all(
         batch.map((query) =>
-          samGovCredentials.run((apiKey, slot) =>
-            this.runQuery(
-              apiKey,
-              slot,
-              baseUrl,
-              { [query.parameter]: query.code },
-              fromDate,
-              today,
-              SAM_GOV_MAX_RESULTS_PER_CLASSIFICATION,
-              signal,
-            ),
+          this.runPagedQuery(
+            `${query.parameter}:${query.code}`,
+            query.title,
+            baseUrl,
+            { [query.parameter]: query.code },
+            fromDate,
+            today,
+            signal,
           ),
         ),
       );
@@ -404,21 +471,15 @@ export class SamGovProvider implements DataSourceProvider {
       for (let offset = 0; offset < results.length; offset += 1) {
         const result = results[offset]!;
         const query = batch[offset]!;
-        if (result.status === "fulfilled") {
+        SamGovProvider.addUnique(records, seen, result.records);
+        queryResults.push(result.coverage);
+        if (!result.error) {
           providerCapacityExhausted = false;
-          SamGovProvider.addUnique(records, seen, result.value);
-          queryResults.push({
-            query: `${query.parameter}:${query.code}`,
-            family: query.title,
-            returned: result.value.length,
-            truncated: result.value.length >= SAM_GOV_MAX_RESULTS_PER_CLASSIFICATION,
-          });
           continue;
         }
-        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
-        queryResults.push({ query: `${query.parameter}:${query.code}`, family: query.title, returned: 0, truncated: false, error: message.slice(0, 200) });
+        const message = result.error.message;
         errors.push(`SAM.gov ${query.parameter}=${query.code} (${query.title}) failed: ${message}`);
-        if (!/credential pool exhausted|quota|rate.?limit|throttl/i.test(message)) {
+        if (!/credential pool exhausted|quota|rate.?limit|throttl/i.test(message) || result.coverage.pagesFetched) {
           providerCapacityExhausted = false;
         }
       }
@@ -440,7 +501,6 @@ export class SamGovProvider implements DataSourceProvider {
     const today = new Date();
     const fromDate = new Date(today);
     fromDate.setDate(today.getDate() - dateRange);
-    const limit = Math.max(1, Math.min(options.limit ?? 100, SAM_GOV_MAX_RESULTS_PER_TITLE));
     const normalized: NormalizedOpportunity[] = [];
     const seen = new Set<string>();
     const titleQueries = this.titleQueriesForRun(options.keywords);
@@ -451,24 +511,11 @@ export class SamGovProvider implements DataSourceProvider {
     let samCapacityExhausted = false;
 
     for (const title of titleQueries) {
-      try {
-        const matches = await samGovCredentials.run((apiKey, slot) =>
-          this.runQuery(
-            apiKey,
-            slot,
-            baseUrl,
-            { title },
-            fromDate,
-            today,
-            limit,
-            options.signal,
-          ),
-        );
-        SamGovProvider.addUnique(normalized, seen, matches);
-        titleCoverage.push({ query: `title:${title}`, family: title, returned: matches.length, truncated: matches.length >= limit });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        titleCoverage.push({ query: `title:${title}`, family: title, returned: 0, truncated: false, error: message.slice(0, 200) });
+      const result = await this.runPagedQuery(`title:${title}`, title, baseUrl, { title }, fromDate, today, options.signal);
+      SamGovProvider.addUnique(normalized, seen, result.records);
+      titleCoverage.push(result.coverage);
+      if (result.error) {
+        const message = result.error.message;
         titleErrors.push(`SAM.gov title="${title}" failed: ${message}`);
         if (/credential pool exhausted|credential pool cooling down|quota|rate.?limit|throttl/i.test(message)) {
           samCapacityExhausted = true;
@@ -507,6 +554,10 @@ export class SamGovProvider implements DataSourceProvider {
       ),
       // Release C coverage: per-query results (a full page may mean more results exist beyond this page).
       queryResults: [...titleCoverage, ...classified.queryResults],
+      pageSize: SAM_GOV_PAGE_SIZE,
+      pagesFetched: [...titleCoverage, ...classified.queryResults].reduce((sum, row) => sum + (row.pagesFetched ?? 0), 0),
+      // Queries with rows left unread; each resumes from its checkpoint next run.
+      incompleteQueries: [...titleCoverage, ...classified.queryResults].filter((row) => row.truncated).map((row) => row.query),
       classificationQueriesSkippedForCapacity: samCapacityExhausted ? classificationQueries.length : 0,
     };
 

@@ -66,7 +66,7 @@ describe("adaptive structured review", () => {
     const records = Array.from({ length: 10 }, (_, i) => ambiguous(i));
     const a = judge("mistral-small-latest", () => true);
     const b = judge("deepseek-chat", () => true);
-    const result = await decideStructuredOpportunities(records, { persist: false, reviewProviders: [a, b], timeBudgetMs: 60_000 });
+    const result = await decideStructuredOpportunities(records, { persist: false, reviewProviders: [a, b], timeBudgetMs: 60_000, reviewMode: "panel" });
     assert.equal(result.review.reviewed, 10);
     assert.equal(result.aiApproved, 10, "previously only 3 (max 5) could be reviewed per run");
     assert.equal(result.held.length, 0);
@@ -103,9 +103,39 @@ describe("adaptive structured review", () => {
     const a = judge("mistral-small-latest", () => true);
     const b = judge("deepseek-chat", (title) => !title.endsWith("31"));
     const c = judge("gpt-oss-120b", () => true);
-    const result = await decideStructuredOpportunities([ambiguous(30), ambiguous(31), ambiguous(32)], { persist: false, reviewProviders: [a, b, c] });
+    const result = await decideStructuredOpportunities([ambiguous(30), ambiguous(31), ambiguous(32)], { persist: false, reviewProviders: [a, b, c], reviewMode: "panel" });
     assert.deepEqual(c.calls, [1], "the tie-breaker sees only the disputed record");
     assert.equal(result.aiApproved, 3);
+  });
+
+  it("single-evaluator mode: one family decides, with no second call when it agrees with the evidence", async () => {
+    const a = judge("mistral-small-latest", () => true);
+    const b = judge("deepseek-chat", () => true);
+    const result = await decideStructuredOpportunities([ambiguous(60), ambiguous(61)], { persist: false, reviewProviders: [a, b], reviewMode: "single" });
+    assert.equal(result.aiApproved, 2);
+    assert.equal(a.calls.length + b.calls.length, 1, "one evaluator call covers the batch");
+    for (const record of result.approved) assert.equal((record.rawData as Record<string, unknown>).opportunityDecisionMethod, "single-ai-review");
+  });
+
+  it("single-evaluator mode: an abstention is held for review, never approved or rejected", async () => {
+    const abstaining = judge("mistral-small-latest", () => true);
+    abstaining.complete = async (prompt: string) => {
+      const count = [...prompt.matchAll(/^\[(\d+)\]\nTitle:/gm)].length;
+      return JSON.stringify({ results: Array.from({ length: count }, (_, index) => ({ index, isOpportunity: null, relevanceScore: 0, reason: "SOW not included" })) });
+    };
+    const result = await decideStructuredOpportunities([ambiguous(62)], { persist: false, reviewProviders: [abstaining], reviewMode: "single" });
+    assert.equal(result.approved.length, 0);
+    assert.equal(result.held[0]?.code, "structured_review_abstained");
+  });
+
+  it("single-evaluator mode: a no on a record the rules accept is escalated to a second family", async () => {
+    const a = judge("mistral-small-latest", () => false);
+    const b = judge("deepseek-chat", () => true);
+    const c = judge("gpt-oss-120b", () => true);
+    const result = await decideStructuredOpportunities([ambiguous(63)], { persist: false, reviewProviders: [a, b, c], reviewMode: "single" });
+    const calls = a.calls.length + b.calls.length + c.calls.length;
+    assert.ok(calls >= 2, "the contradiction gets a second opinion");
+    assert.equal(result.approved.length + result.held.length, 1);
   });
 
   it("holds a record whose text tries to steer the reviewer, without spending AI capacity on it", async () => {

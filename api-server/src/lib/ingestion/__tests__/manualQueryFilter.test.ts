@@ -74,6 +74,24 @@ describe("manual ingestion query boundary", () => {
     assert.equal(recordMatchesManualQuery(mobileMri, "mobile dental services"), false);
   });
 
+  it("matches stemmed terms and keeps quoted phrases strict", () => {
+    const exams = record("Annual Medical Examinations for Firefighters", {
+      description: "Contractor shall perform annual examinations and fitness testing.",
+    });
+    assert.equal(recordMatchesManualQuery(exams, "firefighter medical examination"), true);
+    assert.equal(recordMatchesManualQuery(exams, '"medical examinations for police"'), false);
+    assert.equal(recordMatchesManualQuery(exams, '"medical examinations"'), true);
+  });
+
+  it("keeps a relevant notice whose wording differs from a service query", () => {
+    const differentWording = record("Employee Health Program Support", {
+      description: "Pre-employment physical examinations, DOT drug testing, audiograms, and respirator fit testing for county employees.",
+    });
+    assert.equal(recordMatchesManualQuery(differentWording, "occupational medicine provider statewide"), true);
+    const unrelated = record("Fleet Vehicle Maintenance", { description: "Oil changes and tire rotation for county vehicles." });
+    assert.equal(recordMatchesManualQuery(unrelated, "occupational medicine provider statewide"), false);
+  });
+
   it("recognizes structured RFP type as procurement evidence", () => {
     const directPortalRecord = record("Occupational Health Program", {
       type: "Request for Proposals (RFP)",

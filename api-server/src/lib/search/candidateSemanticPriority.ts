@@ -27,6 +27,8 @@ export interface CandidateSemanticPriorityResult<T extends SemanticPriorityCandi
   embedded: number;
   directReranked: number;
   duplicatesRemoved: number;
+  /** Near-identical candidates kept because no shared identifier proved them the same procurement. */
+  potentialDuplicates?: number;
   errors: string[];
 }
 
@@ -93,33 +95,58 @@ function semanticQuery(focus?: string): string {
     : `${occumedSemanticProfile()} Rank currently open procurement evidence above generic mentions.`;
 }
 
+const IDENTIFIER_LABEL =
+  /\b(?:solicitation|notice|rfp|rfq|rfi|ifb|itb|bid|tender|contract|reference|ref)\s*(?:no\.?|number|#|id)?\s*[:#]?\s*([A-Z0-9][A-Z0-9._/-]{4,40})/gi;
+
+/** Solicitation-style identifiers stated in a candidate's text or URL, upper-cased. */
+export function procurementIdentifiers(candidate: SemanticPriorityCandidate): Set<string> {
+  const ids = new Set<string>();
+  for (const match of `${candidate.title} ${candidate.content.slice(0, 6_000)}`.matchAll(IDENTIFIER_LABEL)) {
+    const id = match[1]!.replace(/[.,;:]+$/, "").toUpperCase();
+    if (/\d/.test(id)) ids.add(id);
+  }
+  return ids;
+}
+
+/**
+ * Near-identical text is a signal, not proof, that two candidates are the same procurement: agencies reuse
+ * titles and templates across separate solicitations. A candidate is removed only when it also shares a stated
+ * solicitation identifier with the kept one (or is the same URL). Similar candidates without shared identity are
+ * kept as potential matches for the identity step after extraction.
+ */
 function deduplicateBySemanticEvidence<T extends SemanticPriorityCandidate>(
   ranked: ScoredCandidate<T>[],
-): { kept: ScoredCandidate<T>[]; removed: number } {
+): { kept: ScoredCandidate<T>[]; removed: number; potentialMatches: number } {
   const kept: ScoredCandidate<T>[] = [];
+  const keptIds: Set<string>[] = [];
   let removed = 0;
+  let potentialMatches = 0;
 
   for (const row of ranked) {
-    const duplicate = kept.some((existing) => {
+    const ids = procurementIdentifiers(row.candidate);
+    let similar = false;
+    const duplicate = kept.some((existing, index) => {
+      if (existing.candidate.url === row.candidate.url) return true;
       if (
         titleTokenJaccard(row.candidate.title, existing.candidate.title) <
-        DUPLICATE_TITLE_JACCARD
+          DUPLICATE_TITLE_JACCARD ||
+        cosineSimilarity(row.vector, existing.vector) < DUPLICATE_COSINE_THRESHOLD
       ) {
         return false;
       }
-      return (
-        cosineSimilarity(row.vector, existing.vector) >=
-        DUPLICATE_COSINE_THRESHOLD
-      );
+      similar = true;
+      return [...ids].some((id) => keptIds[index]!.has(id));
     });
     if (duplicate) {
       removed++;
       continue;
     }
+    if (similar) potentialMatches++;
     kept.push(row);
+    keptIds.push(ids);
   }
 
-  return { kept, removed };
+  return { kept, removed, potentialMatches };
 }
 
 /**
@@ -218,6 +245,7 @@ export function finalizeSemanticPriority<T extends SemanticPriorityCandidate>(
     embedded: candidates.length,
     directReranked: rerankScores.size,
     duplicatesRemoved: deduplicated.removed,
+    potentialDuplicates: deduplicated.potentialMatches,
     errors: [],
   };
 }

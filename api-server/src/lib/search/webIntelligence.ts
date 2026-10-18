@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { SharedWork, canonicalCandidateUrl } from "./sharedWork";
 import { geminiProvider } from "../providers/gemini";
 import { exaProvider } from "../providers/exa";
 import { firecrawlProvider } from "../providers/firecrawl";
@@ -50,6 +51,10 @@ import { buildSignalWeights } from "../learning/feedbackModel";
 import { runLimitedProviderPool } from "../limitedProviderPool";
 
 const ENRICHMENT_MAX_URLS = 10;
+
+type EnrichmentOutcome = { value: string | null; provider: string | null; errors: string[] };
+/** One page fetch per canonical URL across the providers running in parallel (6h reuse). */
+export const sharedPageEnrichment = new SharedWork<EnrichmentOutcome>(6 * 3_600_000, 400, (outcome) => Boolean(outcome.value && outcome.provider));
 const EXA_RESULTS_PER_QUERY = 20;
 const DAY_MS = 86_400_000;
 
@@ -728,12 +733,15 @@ export async function webIntelligenceFetch(options: {
           }]
         : []),
     ];
-    const enriched = await runLimitedProviderPool(
-      "opportunity-page-enrichment",
-      enrichmentAttempts,
-      (value) => typeof value === "string" && value.length > 120,
-      { signal: options.signal },
-    );
+    const enriched = await sharedPageEnrichment.run(canonicalCandidateUrl(candidate.url), async () => {
+      const outcome = await runLimitedProviderPool(
+        "opportunity-page-enrichment",
+        enrichmentAttempts,
+        (value) => typeof value === "string" && value.length > 120,
+        { signal: options.signal },
+      );
+      return { value: outcome.value ?? null, provider: outcome.provider ?? null, errors: outcome.errors };
+    });
     errors.push(...enriched.errors);
     if (!enriched.value || !enriched.provider) continue;
     enrichedCandidates[index] = {
