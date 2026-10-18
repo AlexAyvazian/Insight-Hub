@@ -26,6 +26,7 @@ import {
 } from "./relevance";
 import { decideRelevance } from "./relevanceDecision";
 import { REASON_CODES } from "./relevanceReasonCodes";
+import { applyPrimaryPurchasedScope, assessPrimaryPurchasedScope } from "./primaryPurchasedScope";
 import {
   applyProcurementAuthenticity,
   assessProcurementAuthenticity,
@@ -219,7 +220,7 @@ function finalAuthenticity(
   });
 }
 
-export function withAuthenticityHold(record: NormalizedOpportunity, assessment: AuthenticityAssessment): NormalizedOpportunity {
+export function withAuthenticityHold(record: NormalizedOpportunity, assessment: Pick<AuthenticityAssessment, "action" | "reason">): NormalizedOpportunity {
   if (assessment.action !== "review" || !assessment.reason) return record;
   return {
     ...record,
@@ -228,6 +229,22 @@ export function withAuthenticityHold(record: NormalizedOpportunity, assessment: 
       structuredDecision: { status: "held", code: "procurement_authenticity_hold", reason: assessment.reason },
     },
   };
+}
+
+/**
+ * The primary-purchased-scope check on the final classification (as classifyProviderRecordRelevance applies it),
+ * merged with the authenticity result into the hold the stored record carries.
+ */
+function withPrimaryScope(
+  cls: RelevanceResult,
+  authenticity: AuthenticityAssessment,
+  title: string,
+  description: string,
+): { cls: RelevanceResult; hold: Pick<AuthenticityAssessment, "action" | "reason"> } {
+  const scope = assessPrimaryPurchasedScope(cls, { title, description });
+  const held = applyPrimaryPurchasedScope(cls, scope);
+  if (authenticity.action === "review" && authenticity.reason) return { cls: held, hold: authenticity };
+  return { cls: held, hold: scope.action === "review" ? { action: "review", reason: scope.reason } : { action: "none", reason: null } };
 }
 
 /** Legacy accept-only gate, kept for callers outside discovery triage. */
@@ -764,7 +781,7 @@ export async function webIntelligenceFetch(options: {
           stats.rejected++;
           return;
         }
-        const cls = applyProcurementAuthenticity(classifyResult({
+        const { cls, hold } = withPrimaryScope(applyProcurementAuthenticity(classifyResult({
           title: extraction.title ?? candidate.title,
           snippet: candidate.content,
           description: extraction.description,
@@ -772,7 +789,7 @@ export async function webIntelligenceFetch(options: {
           date: candidate.dateRaw,
           deadlineInFuture: !!validDeadline,
           keywords: options.keywords,
-        }), authenticity);
+        }), authenticity), authenticity, extraction.title ?? candidate.title, [candidate.content, extraction.description].filter(Boolean).join("\n"));
         if (decideRelevance(cls).verdict === "reject") {
           stats.rejected++;
           return;
@@ -790,7 +807,7 @@ export async function webIntelligenceFetch(options: {
           cls,
           fallback: false,
           extra: { winnerScorer: extraction.winnerScorer },
-        }), authenticity));
+        }), hold));
         stats.extracted++;
         return;
       }
@@ -801,9 +818,14 @@ export async function webIntelligenceFetch(options: {
         stats.rejected++;
         return;
       }
-      const cls = applyProcurementAuthenticity(
-        classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, date: candidate.dateRaw, keywords: options.keywords }),
+      const { cls, hold } = withPrimaryScope(
+        applyProcurementAuthenticity(
+          classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, date: candidate.dateRaw, keywords: options.keywords }),
+          authenticity,
+        ),
         authenticity,
+        candidate.title,
+        candidate.content,
       );
       if (decideRelevance(cls).verdict === "reject") {
         stats.rejected++;
@@ -825,7 +847,7 @@ export async function webIntelligenceFetch(options: {
         relevanceReason: cls.reasons.join("; "),
         cls,
         fallback: true,
-      }), authenticity));
+      }), hold));
       stats.extracted++;
       stats.heuristicExtracted++;
     });
