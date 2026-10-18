@@ -22,6 +22,7 @@ export const RELEASE_C_TABLES = [
   "opportunity_benchmark_runs",
   "opportunity_benchmark_results",
   "opportunity_audit_log",
+  "remote_extraction_jobs",
 ] as const;
 
 export const RELEASE_C_DDL: readonly string[] = [
@@ -243,6 +244,17 @@ export const RELEASE_C_DDL: readonly string[] = [
     created_at timestamptz NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS idx_opportunity_audit_log_key ON opportunity_audit_log (opportunity_key, created_at)`,
+
+  // Remote extraction jobs accepted (and charged) by a provider, so a restarted worker resumes them instead of
+  // resubmitting the document.
+  `CREATE TABLE IF NOT EXISTS remote_extraction_jobs (
+    job_key text PRIMARY KEY,
+    provider text NOT NULL,
+    account_slot text NOT NULL,
+    remote_id text NOT NULL,
+    planned_units numeric NOT NULL DEFAULT 0,
+    submitted_at timestamptz NOT NULL DEFAULT now()
+  )`,
 ];
 
 type Runner = (statement: string) => Promise<unknown>;

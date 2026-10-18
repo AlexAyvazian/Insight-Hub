@@ -14,6 +14,8 @@
 import { FreeTierCredentialPool } from "../providers/freeTierCredentialPool";
 import { ProviderQuotaError, resetFromHeaders, type AccountPolicy, type QuotaSnapshot } from "../providers/accountLedger";
 import { createHash } from "node:crypto";
+import { rcPool } from "../releaseC/db";
+import { ensureReleaseCSchema } from "../releaseC/schema";
 import type { ExtractedPage } from "./types";
 
 const WHISPER_BASE = "https://llmwhisperer-api.us-central.unstract.com/api/v2";
@@ -194,14 +196,60 @@ export function clearPendingWhisperJobs(): void {
   pendingWhisperJobs.clear();
 }
 
+// Accepted jobs are also persisted, so a restarted or redeployed worker resumes them instead of resubmitting.
+// Database problems fall back to the in-process map; they never block extraction.
+async function loadPendingWhisperJob(jobKey: string): Promise<PendingWhisperJob | undefined> {
+  const local = pendingWhisperJobs.get(jobKey);
+  if (local) return local;
+  try {
+    await ensureReleaseCSchema();
+    const result = await (await rcPool()).query(
+      `SELECT account_slot, remote_id, submitted_at FROM remote_extraction_jobs WHERE job_key = $1 AND provider = 'llmwhisperer'`,
+      [jobKey],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const job = { slot: String(row.account_slot), hash: String(row.remote_id), submittedAt: new Date(row.submitted_at).getTime() };
+    pendingWhisperJobs.set(jobKey, job);
+    return job;
+  } catch {
+    return undefined;
+  }
+}
+
+async function savePendingWhisperJob(jobKey: string, job: PendingWhisperJob, plannedUnits: number): Promise<void> {
+  pendingWhisperJobs.set(jobKey, job);
+  try {
+    await ensureReleaseCSchema();
+    await (await rcPool()).query(
+      `INSERT INTO remote_extraction_jobs (job_key, provider, account_slot, remote_id, planned_units, submitted_at)
+       VALUES ($1, 'llmwhisperer', $2, $3, $4, $5)
+       ON CONFLICT (job_key) DO UPDATE SET account_slot = EXCLUDED.account_slot, remote_id = EXCLUDED.remote_id,
+         planned_units = EXCLUDED.planned_units, submitted_at = EXCLUDED.submitted_at`,
+      [jobKey, job.slot, job.hash, plannedUnits, new Date(job.submittedAt)],
+    );
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "remote_extraction_job_persist_failed", error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+async function deletePendingWhisperJob(jobKey: string): Promise<void> {
+  pendingWhisperJobs.delete(jobKey);
+  try {
+    await (await rcPool()).query(`DELETE FROM remote_extraction_jobs WHERE job_key = $1`, [jobKey]);
+  } catch {
+    // Expired rows are ignored by the TTL check.
+  }
+}
+
 export async function extractWithLlmWhisperer(request: RemoteExtractionRequest): Promise<RemoteExtraction> {
   const plannedPages = request.pages?.length ?? request.pageCount ?? 1;
   const jobKey = whisperJobKey(request);
   return whisperPool.run(
     async (apiKey, slot, context) => {
-      let pending = pendingWhisperJobs.get(jobKey);
+      let pending = await loadPendingWhisperJob(jobKey);
       if (pending && Date.now() - pending.submittedAt > PENDING_WHISPER_TTL_MS) {
-        pendingWhisperJobs.delete(jobKey);
+        await deletePendingWhisperJob(jobKey);
         pending = undefined;
       }
       if (pending && pending.slot !== slot) {
@@ -226,7 +274,7 @@ export async function extractWithLlmWhisperer(request: RemoteExtractionRequest):
         if (submit.status !== 202 && !submit.ok) quotaFromResponse("LLMWhisperer", submit, submitBody);
         hash = (JSON.parse(submitBody) as { whisper_hash?: string }).whisper_hash;
         if (!hash) throw new Error("LLMWhisperer returned no whisper_hash");
-        pendingWhisperJobs.set(jobKey, { slot, hash, submittedAt: Date.now() });
+        await savePendingWhisperJob(jobKey, { slot, hash, submittedAt: Date.now() }, plannedPages);
         // The accepted job is charged whether or not the result is retrieved, so it is counted now.
         context.reportUsage(plannedPages);
       }
@@ -247,7 +295,7 @@ export async function extractWithLlmWhisperer(request: RemoteExtractionRequest):
           const state = (JSON.parse(statusBody) as { status?: string; message?: string }).status;
           if (state === "processed") break;
           if (state === "error") {
-            pendingWhisperJobs.delete(jobKey);
+            await deletePendingWhisperJob(jobKey);
             throw new Error(`LLMWhisperer processing error: ${statusBody.slice(0, 200)}`);
           }
         }
@@ -257,7 +305,7 @@ export async function extractWithLlmWhisperer(request: RemoteExtractionRequest):
         });
         const text = await retrieve.text();
         if (!retrieve.ok) quotaFromResponse("LLMWhisperer", retrieve, text);
-        pendingWhisperJobs.delete(jobKey);
+        await deletePendingWhisperJob(jobKey);
         let resultText = text;
         try {
           const parsed = JSON.parse(text) as { result_text?: string };

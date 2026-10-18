@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 describe("remote extraction accounting", () => {
-  it("resumes an accepted LLMWhisperer job instead of resubmitting it elsewhere", async () => {
+  it("resumes an accepted LLMWhisperer job (even after a restart) instead of resubmitting it elsewhere", async () => {
     process.env.LLMWHISPERER_API_KEY = "whisper-primary-key-000000";
     process.env.LLMWHISPERER_API_KEY_2 = "whisper-second-key-0000000";
     process.env.NUTRIENT_API_KEY = "nutrient-key-0000000000000";
@@ -41,7 +41,7 @@ describe("remote extraction accounting", () => {
       if (path === "whisper-retrieve") return new Response("Page one text that is long enough to be good quality output.");
       return new Response("unexpected", { status: 500 });
     }) as typeof fetch;
-    const request = { bytes: new Uint8Array([1, 2, 3]), fileName: "a.pdf", pages: [1], pageCount: 1, scanned: true };
+    const request = { bytes: new TextEncoder().encode(`doc-${Date.now()}-${Math.random()}`), fileName: "a.pdf", pages: [1], pageCount: 1, scanned: true };
 
     await assert.rejects(extractRemotely(request), AcceptedJobError);
     assert.equal(calls.filter((c) => c.endsWith(":whisper")).length, 1, "submitted once");
@@ -50,6 +50,7 @@ describe("remote extraction accounting", () => {
 
     statusFails = false;
     calls.length = 0;
+    clearPendingWhisperJobs(); // simulates a worker restart: only the persisted job remains
     const result = await extractRemotely(request);
     assert.equal(result.provider, "llmwhisperer");
     assert.equal(calls.filter((c) => c.endsWith(":whisper")).length, 0, "resumed without resubmitting");
@@ -74,6 +75,23 @@ describe("remote extraction accounting", () => {
     } as unknown as NormalizedOpportunity;
     const urls = discoverAttachments(record).map((a) => a.url);
     assert.ok(urls.some((u) => u.endsWith("sow.pdf")));
+  });
+
+  it("resolves relative document links against the notice URL", () => {
+    const record = {
+      externalId: "y",
+      title: "Exams",
+      agency: "City",
+      type: "Solicitation",
+      status: "active",
+      source: "web",
+      sourceUrl: "https://city.example.gov/bids/42/view",
+      description: '<a href="/documents/specification.pdf">Specification</a> <a href="addendum-1.pdf">Addendum 1</a>',
+      rawData: {},
+    } as unknown as NormalizedOpportunity;
+    const urls = discoverAttachments(record).map((a) => a.url);
+    assert.ok(urls.includes("https://city.example.gov/documents/specification.pdf"), urls.join(" "));
+    assert.ok(urls.includes("https://city.example.gov/bids/42/addendum-1.pdf"), urls.join(" "));
   });
 });
 

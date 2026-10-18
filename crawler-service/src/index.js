@@ -3,6 +3,8 @@ import { chromium } from 'playwright';
 import TurndownService from 'turndown';
 import { lookup } from 'node:dns/promises';
 import net from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,22 +40,110 @@ function isPrivateAddress(ip) {
   return lower === '::' || lower === '::1' || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || /^ff/.test(lower) || lower.startsWith('64:ff9b:') || lower.startsWith('2002:');
 }
 
+// Validated addresses per host. Connections are made to these exact addresses (see pinnedFetch), so a hostname that
+// re-resolves to a private address after validation (DNS rebinding) is never reached.
 const hostVerdicts = new Map();
-async function hostAllowed(hostname) {
+async function resolveAllowed(hostname) {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (!host || BLOCKED_HOSTS.test(host)) return false;
-  if (net.isIP(host)) return !isPrivateAddress(host);
+  if (!host || BLOCKED_HOSTS.test(host)) return null;
+  if (net.isIP(host)) return isPrivateAddress(host) ? null : [{ address: host, family: net.isIPv6(host) ? 6 : 4 }];
   const cached = hostVerdicts.get(host);
-  if (cached && cached.expires > Date.now()) return cached.allowed;
-  let allowed = false;
+  if (cached && cached.expires > Date.now()) return cached.addresses;
+  let addresses = null;
   try {
     const answers = await lookup(host, { all: true, verbatim: true });
-    allowed = answers.length > 0 && answers.every((answer) => !isPrivateAddress(answer.address));
+    if (answers.length > 0 && answers.every((answer) => !isPrivateAddress(answer.address))) addresses = answers;
   } catch {
-    allowed = false;
+    addresses = null;
   }
-  hostVerdicts.set(host, { allowed, expires: Date.now() + 60_000 });
-  return allowed;
+  hostVerdicts.set(host, { addresses, expires: Date.now() + 60_000 });
+  return addresses;
+}
+
+async function hostAllowed(hostname) {
+  return (await resolveAllowed(hostname)) !== null;
+}
+
+const MAX_RESOURCE_BYTES = parseInt(process.env.CRAWLER_MAX_RESOURCE_BYTES || String(15 * 1024 * 1024), 10);
+const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length', 'upgrade', 'proxy-connection']);
+
+/** One request from Node, connected only to a validated address. */
+function pinnedRequest(target, addresses, { method, headers, body }) {
+  const pinned = addresses[0];
+  const client = target.protocol === 'https:' ? https : http;
+  const outgoing = { ...headers, 'accept-encoding': 'identity' };
+  delete outgoing.host;
+  return new Promise((resolve, reject) => {
+    const req = client.request(
+      target,
+      {
+        method,
+        headers: outgoing,
+        servername: net.isIP(target.hostname) ? undefined : target.hostname,
+        lookup: (_host, options, callback) => {
+          if (options && options.all) return callback(null, [pinned]);
+          return callback(null, pinned.address, pinned.family);
+        },
+        timeout: TIMEOUT_MS,
+      },
+      (res) => {
+        const chunks = [];
+        let size = 0;
+        res.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > MAX_RESOURCE_BYTES) {
+            req.destroy(new Error('resource too large'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const outHeaders = {};
+          for (const [key, value] of Object.entries(res.headers)) {
+            if (value === undefined || HOP_BY_HOP.has(key)) continue;
+            outHeaders[key] = Array.isArray(value) ? value.join(', ') : String(value);
+          }
+          resolve({ status: res.statusCode || 502, headers: outHeaders, body: Buffer.concat(chunks) });
+        });
+        res.on('error', reject);
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+const ALLOWED_PORTS = ['80', '443', '8080', '8443'];
+const MAX_REDIRECTS = 5;
+
+/**
+ * Fetches a URL from Node, following redirects here (Chromium does not route redirects of fulfilled responses, so
+ * they must never reach it): every hop is re-validated and connected to its validated address.
+ */
+async function pinnedFetch(rawUrl, init) {
+  let target = new URL(rawUrl);
+  let request = { ...init };
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+    if (!['http:', 'https:'].includes(target.protocol)) throw new Error('blocked protocol');
+    if (target.username || target.password) throw new Error('credentials in URL');
+    if (target.port && !ALLOWED_PORTS.includes(target.port)) throw new Error('blocked port');
+    const addresses = await resolveAllowed(target.hostname);
+    if (!addresses) throw new Error('blocked destination');
+    const response = await pinnedRequest(target, addresses, request);
+    const location = response.headers.location;
+    if (response.status >= 300 && response.status < 400 && location) {
+      target = new URL(location, target);
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && request.method === 'POST')) {
+        request = { ...request, method: 'GET', body: null };
+      }
+      continue;
+    }
+    delete response.headers.location;
+    return { ...response, url: target.toString() };
+  }
+  throw new Error('too many redirects');
 }
 
 async function assertCrawlableUrl(raw) {
@@ -65,7 +155,7 @@ async function assertCrawlableUrl(raw) {
   }
   if (!['http:', 'https:'].includes(parsed.protocol)) throw Object.assign(new Error('Only http(s) URLs are allowed'), { status: 400 });
   if (parsed.username || parsed.password) throw Object.assign(new Error('Credentials in URL are not allowed'), { status: 400 });
-  if (parsed.port && !['80', '443', '8080', '8443'].includes(parsed.port)) throw Object.assign(new Error('Port not allowed'), { status: 400 });
+  if (parsed.port && !ALLOWED_PORTS.includes(parsed.port)) throw Object.assign(new Error('Port not allowed'), { status: 400 });
   if (!(await hostAllowed(parsed.hostname))) throw Object.assign(new Error('Destination not allowed'), { status: 400 });
   return parsed.toString();
 }
@@ -106,14 +196,23 @@ async function getPage() {
   const context = await browser.newContext({
     userAgent: USER_AGENT,
     viewport: { width: 1920, height: 1080 },
+    // Service-worker fetches bypass context.route, so they are not allowed.
+    serviceWorkers: 'block',
   });
   // Every navigation, redirect and sub-resource is re-checked, so a public page cannot pull in internal URLs.
   await context.route('**/*', async (route) => {
     try {
       const target = new URL(route.request().url());
       if (target.protocol === 'data:' || target.protocol === 'blob:' || target.protocol === 'about:') return route.continue();
-      if (!['http:', 'https:'].includes(target.protocol) || !(await hostAllowed(target.hostname))) return route.abort('blockedbyclient');
-      return route.continue();
+      // Fetched from Node against the validated address instead of route.continue(), which would let Chromium
+      // resolve the name again (DNS rebinding).
+      const request = route.request();
+      const { status, headers, body } = await pinnedFetch(target.toString(), {
+        method: request.method(),
+        headers: await request.allHeaders(),
+        body: request.postDataBuffer(),
+      });
+      return route.fulfill({ status, headers, body });
     } catch {
       return route.abort('blockedbyclient');
     }
@@ -144,6 +243,9 @@ async function crawlUrl(url, options = {}) {
 
   try {
     url = await assertCrawlableUrl(url);
+    // Resolve redirects first (pinned and re-validated per hop) so the page loads at its final URL and relative
+    // links resolve correctly.
+    url = (await pinnedFetch(url, { method: 'GET', headers: { 'user-agent': USER_AGENT }, body: null })).url;
     page = await getPage();
 
     // Set timeout

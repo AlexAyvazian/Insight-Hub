@@ -52,7 +52,18 @@ function linksIn(text: string): Array<{ url: string; title: string | null }> {
   return links;
 }
 
+/** Relative links (e.g. "/documents/spec.pdf") are resolved against the notice page; absolute ones pass through. */
+function absoluteUrl(url: string | undefined | null, base: string | null): string | undefined {
+  if (!url || typeof url !== "string") return undefined;
+  try {
+    return new URL(url.trim(), base ?? undefined).toString();
+  } catch {
+    return undefined;
+  }
+}
+
 export function discoverAttachments(record: NormalizedOpportunity): AttachmentRef[] {
+  const base = record.sourceUrl && /^https?:\/\//i.test(record.sourceUrl) ? record.sourceUrl : null;
   const out: AttachmentRef[] = [];
   const seen = new Set<string>();
   const raw = (record.rawData ?? {}) as Record<string, unknown>;
@@ -75,12 +86,12 @@ export function discoverAttachments(record: NormalizedOpportunity): AttachmentRe
     const value = raw[key];
     if (!Array.isArray(value)) continue;
     for (const item of value) {
-      if (typeof item === "string") pushUnique(out, seen, item, null);
+      if (typeof item === "string") pushUnique(out, seen, absoluteUrl(item, base), null);
       else if (item && typeof item === "object") {
         const entry = item as Record<string, unknown>;
         const url = [entry.url, entry.href, entry.link, entry.downloadUrl, entry.fileUrl].find((v) => typeof v === "string") as string | undefined;
         const title = [entry.name, entry.title, entry.fileName, entry.filename].find((v) => typeof v === "string") as string | undefined;
-        pushUnique(out, seen, url, title ?? null);
+        pushUnique(out, seen, absoluteUrl(url, base), title ?? null);
       }
     }
   }
@@ -88,7 +99,7 @@ export function discoverAttachments(record: NormalizedOpportunity): AttachmentRe
   // Document links mentioned in the description or stored notice HTML.
   for (const text of [record.description ?? "", typeof raw.html === "string" ? raw.html : ""]) {
     for (const link of linksIn(text)) {
-      if (DOCUMENT_LINK.test(link.url)) pushUnique(out, seen, link.url, link.title);
+      if (DOCUMENT_LINK.test(link.url)) pushUnique(out, seen, absoluteUrl(link.url, base), link.title);
     }
   }
 

@@ -236,4 +236,13 @@ CREATE TABLE IF NOT EXISTS opportunity_audit_log (
   );
 
 CREATE INDEX IF NOT EXISTS idx_opportunity_audit_log_key ON opportunity_audit_log (opportunity_key, created_at);
+
+CREATE TABLE IF NOT EXISTS remote_extraction_jobs (
+    job_key text PRIMARY KEY,
+    provider text NOT NULL,
+    account_slot text NOT NULL,
+    remote_id text NOT NULL,
+    planned_units numeric NOT NULL DEFAULT 0,
+    submitted_at timestamptz NOT NULL DEFAULT now()
+  );
 COMMIT;
