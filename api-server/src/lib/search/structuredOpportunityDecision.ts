@@ -1,6 +1,7 @@
 import type { NormalizedOpportunity } from "../providers/types";
 import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch";
 import { getOccuMedPromptContext, renderPromptContext } from "./occumedPromptContext";
+import { hasPrimaryOccuMedServiceEvidence } from "../opportunityScopeEvidence";
 import { decideRelevance } from "./relevanceDecision";
 import { getRelevanceProfile } from "./relevanceProfile";
 import { opportunityDescriptionContext } from "./opportunityDescriptionContext";
@@ -134,7 +135,9 @@ export function isDeterministicallyActionable(
     decideRelevance(relevance).verdict === "accept" &&
     hasFutureDeadline(record, now) &&
     (relevance.confidence === "verified_explicit" ||
-      relevance.confidence === "strong_combination")
+      relevance.confidence === "strong_combination") &&
+    // A classifier score alone is not purchased-scope proof; without it the record goes to review, not auto-approval.
+    hasPrimaryOccuMedServiceEvidence(record.title ?? "", record.description ?? "")
   );
 }
 

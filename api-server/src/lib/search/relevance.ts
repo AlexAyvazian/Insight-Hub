@@ -52,14 +52,42 @@ function norm(s: string | null | undefined): string {
 function uniq(a: string[]): string[] {
   return Array.from(new Set(a));
 }
-function matchTerms(h: string, terms: string[]): string[] {
-  return uniq(terms.filter((t) => h.includes(t.toLowerCase())));
+/**
+ * How profile terms are matched against notice text.
+ *  - "token" (default, Opportunities): a term must start on a word boundary, and short terms (<= 5 chars, i.e.
+ *    acronyms such as sts / der / ems / dot / lead) must also end on one (a plural "s" is allowed: RFPs, IDIQs). "sts" no longer matches "costs",
+ *    "der" no longer matches "provider", "vision" no longer matches "division", "tender" no longer matches
+ *    "bartender". Longer terms keep inflections ("examination" still matches "examinations").
+ *  - "substring": the legacy containment match. Kept only for consumers outside Opportunities (Forecasts /
+ *    Recompete ranking, intel feeds) so their behavior is unchanged until they are measured separately.
+ */
+export type RelevanceMatchMode = "token" | "substring";
+const SHORT_TERM_MAX = 5;
+const termRegexCache = new Map<string, RegExp>();
+function termRegex(term: string): RegExp {
+  let re = termRegexCache.get(term);
+  if (!re) {
+    const esc = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const start = /^[\p{L}\p{N}]/u.test(term) ? "(?<![\\p{L}\\p{N}])" : "";
+    const end = term.length <= SHORT_TERM_MAX && /[\p{L}\p{N}]$/u.test(term) ? "s?(?![\\p{L}\\p{N}])" : "";
+    re = new RegExp(start + esc + end, "u");
+    termRegexCache.set(term, re);
+  }
+  return re;
 }
-function firstMatch(h: string, terms: string[]): string | null {
-  return matchTerms(h, terms)[0] ?? null;
+function termMatches(h: string, term: string, mode: RelevanceMatchMode): boolean {
+  const t = term.toLowerCase();
+  if (!t || !h.includes(t)) return false;
+  return mode === "substring" || termRegex(t).test(h);
 }
-function hasAny(h: string, terms: string[]): boolean {
-  return matchTerms(h, terms).length > 0;
+function matchTerms(h: string, terms: string[], mode: RelevanceMatchMode = "token"): string[] {
+  return uniq(terms.filter((t) => termMatches(h, t, mode)));
+}
+function firstMatch(h: string, terms: string[], mode: RelevanceMatchMode = "token"): string | null {
+  return matchTerms(h, terms, mode)[0] ?? null;
+}
+function hasAny(h: string, terms: string[], mode: RelevanceMatchMode = "token"): boolean {
+  return terms.some((t) => termMatches(h, t, mode));
 }
 export function hostFromUrl(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -113,6 +141,8 @@ export interface RelevanceInput {
   deadlineInFuture?: boolean;
   keywords?: string | null;
   allowHistorical?: boolean;
+  /** Term matching semantics; defaults to "token". See RelevanceMatchMode. */
+  matchMode?: RelevanceMatchMode;
 }
 export type RelevanceConfidence =
   | "verified_explicit"
@@ -180,14 +210,12 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
     [input.title, input.snippet, input.description].filter(Boolean).join(" "),
   );
   const titleNorm = norm(input.title);
+  const mode: RelevanceMatchMode = input.matchMode ?? "token";
   const reasons: string[] = [];
   const reasonCodes: string[] = [];
   if (isBlockedDomain(input.url))
     return rejected("Excluded: job board / non-procurement domain", input);
-  const matchedProcurementSignals = matchTerms(
-    haystack,
-    profile.procurementSignals,
-  );
+  const matchedProcurementSignals = matchTerms(haystack, profile.procurementSignals, mode);
   const hasProc = matchedProcurementSignals.length > 0;
   // Every hard reject, scope rule, conditional penalty, soft penalty and program
   // combination below comes from the Neon rules; none is defined in this file.
@@ -203,8 +231,8 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
       [REASON_CODES.hardReject],
       { negativeSignals: [`${rules.hardReject.ruleKey}: ${rules.hardReject.trigger}`] },
     );
-  const matchedWorkforceSignals = matchTerms(haystack, profile.workforceSignals);
-  const matchedRegulatorySignals = matchTerms(haystack, profile.regulatory);
+  const matchedWorkforceSignals = matchTerms(haystack, profile.workforceSignals, mode);
+  const matchedRegulatorySignals = matchTerms(haystack, profile.regulatory, mode);
   const matchedExplicitPhrases: string[] = [];
   const matchedComponentTerms: string[] = [];
   const matchedServiceCategories: string[] = [];
@@ -215,9 +243,9 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
   );
   let adjacentOnly = false;
   for (const c of profile.categories) {
-    const ex = matchTerms(haystack, c.explicit);
-    const comp = matchTerms(haystack, c.component);
-    const reg = matchTerms(haystack, c.regulatory);
+    const ex = matchTerms(haystack, c.explicit, mode);
+    const comp = matchTerms(haystack, c.component, mode);
+    const reg = matchTerms(haystack, c.regulatory, mode);
     if (ex.length || comp.length || reg.length) {
       matchedServiceCategories.push(c.label);
       matchedExplicitPhrases.push(...ex);
@@ -226,7 +254,7 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
       if (c.adjacentOnly) adjacentOnly = true;
     }
   }
-  const profilePhraseHits = matchTerms(haystack, profile.generalExplicit);
+  const profilePhraseHits = matchTerms(haystack, profile.generalExplicit, mode);
   if (profilePhraseHits.length > 0) {
     matchedServiceCategories.push("Occu-Med profile phrase");
     matchedExplicitPhrases.push(...profilePhraseHits);
@@ -250,7 +278,7 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
 
   // Require a medical word in the title for the component-based path, so that
   // general procurement wording cannot carry a notice on its own.
-  const titleHasMedical = hasAny(titleNorm, profile.titleMedical);
+  const titleHasMedical = hasAny(titleNorm, profile.titleMedical, mode);
 
   const pathA = hasProc && explicit;
   const pathC = hasProc && regulatoryProgram;
@@ -260,7 +288,7 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
     hasProc && componentCount >= 2 && hasWorkOrReg && titleHasMedical;
   const pathE =
     hasProc &&
-    hasAny(titleNorm, profile.genericTitle) &&
+    hasAny(titleNorm, profile.genericTitle, mode) &&
     (explicit || pathBStrict || pathC || pathD);
 
   const accepted =
@@ -313,7 +341,7 @@ export function classifyResult(input: RelevanceInput): RelevanceResult {
   if (matchedWorkforceSignals.length) score += 5;
   if (matchedRegulatorySignals.length) score += 5;
   if (input.deadlineInFuture) score += 8;
-  if (hasAny(haystack, profile.prime)) score += 6;
+  if (hasAny(haystack, profile.prime, mode)) score += 6;
   if (adjacentOnly && !explicit && componentCount < 2) score -= 25;
   const host = hostFromUrl(input.url);
   if (
