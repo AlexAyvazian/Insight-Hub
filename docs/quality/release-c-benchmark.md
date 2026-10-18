@@ -24,13 +24,13 @@ A production case is gate-eligible only when both reviewers agreed at high confi
 | --- | --- | --- | --- | --- | --- | --- |
 | Fixtures (158) | 0.872 | 1.000 | 1.000 | 0.987 | 0.999 | 100% |
 | Adversarial (20) | 0.900 | 1.000 | 1.000 | 1.000 | 1.000 | 100% |
-| AI agreed (175) | 0.659 | 0.988 | 0.839 | 0.929 | 0.906 | 90.9% |
+| AI agreed (175) | 0.686 | 0.988 | 0.940 | 0.929 | 0.951 | 96.6% |
 | AI adjudicated (5) | 0 | n/a | 0 | n/a | n/a | 60% |
-| **Gate (218)** | 0.711 | 1.000 | 0.966 | 0.988 | 0.989 | 98.6% |
+| **Gate (218)** | 0.729 | 1.000 | 1.000 | 0.988 | 0.997 | 100% |
 
 "Kept" means accepted or held for review. Missed opportunities in the gate set: none. In the AI-agreed set, one (`rej-008`, Arlington "Annual firefighter health and fitness assessments", rejected because the record has no description).
 
-Wrong high-confidence matches in the gate set: 3, all web-discovery pages that are not procurements and are currently live in production (an employer RFP checklist article, a Florida transplant-centre regulation and a website's terms of service). In the wider AI-agreed set there are 15, mostly the same pattern: aggregator pages, articles, an addendum, medical laboratory testing and a medications supply contract. These are recorded as known pre-existing failures in the baseline; the gate fails on any new one.
+Wrong high-confidence matches in the gate set: none (3 before the procurement-authenticity check: an employer RFP checklist article, a Florida transplant-centre regulation and a website's terms of service, all web-discovery pages that are not procurements). In the wider AI-agreed set: 5 (15 before). The authenticity check (`api-server/src/lib/search/procurementAuthenticity.ts`, applied in `classifyProviderRecordRelevance` and in web-discovery triage) classifies web-discovery pages from their URL host and path, title patterns and procurement metadata. It rejects guidance articles, regulations, terms of service and commentary (5 cases, one of them because only an aggregator's "similar RFPs" section carried the medical wording). It holds listing and search-results pages, addenda and post-award notice types for review (5 cases). No relevant case changed verdict and no new opportunity was missed. The 5 that remain are not web-page authenticity problems, and no out-of-scope rule in the canonical profile covers them: a medications, vaccines and medical-supplies contract (two records), two clinical laboratory testing BPAs and a disease-surveillance research study. The gate fails on any new wrong match.
 
 Source verification: 36.6% of AI-agreed production cases come from an official government host; 50.3% carry a known deadline. Document completeness is not measured here because the document pipeline is staged off in production.
 

@@ -26,6 +26,7 @@ import {
 } from "./relevance";
 import { decideRelevance } from "./relevanceDecision";
 import { REASON_CODES } from "./relevanceReasonCodes";
+import { applyProcurementAuthenticity, assessProcurementAuthenticity, ownNoticeText } from "./procurementAuthenticity";
 import { getRelevanceProfile } from "./relevanceProfile";
 import {
   profileBooleanQueries,
@@ -161,19 +162,34 @@ interface Candidate {
 
 export type DiscoveryTriage =
   | { keep: true; band: "accept" | "review" }
-  | { keep: false; reason: "blocked_domain" | "hard_reject" | "no_procurement_signal" | "insufficient_relevance" };
+  | {
+      keep: false;
+      reason: "blocked_domain" | "hard_reject" | "no_procurement_signal" | "not_a_procurement_notice" | "insufficient_relevance";
+    };
 
 /**
  * Pre-enrichment triage of a search hit from its title/snippet alone. Only cheap, safe exclusions happen here
  * (job boards, profile hard rejects, no procurement wording, no service evidence at all). Review-band snippets are
  * kept so the page can be fetched and judged on its full text; a short snippet is not grounds to discard.
  */
-export function triageDiscoveryCandidate(candidate: Pick<Candidate, "title" | "content" | "url">): DiscoveryTriage {
+export function triageDiscoveryCandidate(
+  candidate: Pick<Candidate, "title" | "content" | "url"> & Partial<Pick<Candidate, "sourceProvider">>,
+): DiscoveryTriage {
   if (isBlockedDomainShared(candidate.url)) return { keep: false, reason: "blocked_domain" };
-  const r = classifyResult({ title: candidate.title, snippet: candidate.content, url: candidate.url, allowHistorical: true });
+  const content = ownNoticeText(candidate.content);
+  const r = classifyResult({ title: candidate.title, snippet: content, url: candidate.url, allowHistorical: true });
   if (r.reasonCodes.includes(REASON_CODES.hardReject)) return { keep: false, reason: "hard_reject" };
   if (r.matchedProcurementSignals.length === 0) return { keep: false, reason: "no_procurement_signal" };
-  const verdict = decideRelevance(r).verdict;
+  // Procurement authenticity: clear non-notices (articles, regulations, policy pages) are skipped; listing pages,
+  // addenda and other ambiguous pages stay in the review band so the fetched page is judged on its full text.
+  const authenticity = assessProcurementAuthenticity({
+    title: candidate.title,
+    description: content,
+    url: candidate.url,
+    source: candidate.sourceProvider ?? "websearch",
+  });
+  if (authenticity.action === "reject") return { keep: false, reason: "not_a_procurement_notice" };
+  const verdict = decideRelevance(applyProcurementAuthenticity(r, authenticity)).verdict;
   if (verdict === "reject") return { keep: false, reason: "insufficient_relevance" };
   return { keep: true, band: verdict };
 }

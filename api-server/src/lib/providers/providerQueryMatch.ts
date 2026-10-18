@@ -2,6 +2,12 @@ import type { NormalizedOpportunity } from "./types";
 import { classifyResult, type RelevanceResult } from "../search/relevance";
 import { decideRelevance } from "../search/relevanceDecision";
 import { getRelevanceProfile } from "../search/relevanceProfile";
+import {
+  applyProcurementAuthenticity,
+  assessProcurementAuthenticity,
+  isWebDiscoverySource,
+  ownNoticeText,
+} from "../search/procurementAuthenticity";
 
 const GENERIC_QUERY_TERMS = new Set([
   "a",
@@ -103,15 +109,22 @@ export function isOccuMedProfileQuery(query?: string): boolean {
   return phrases.some((phrase) => normalizedWords(phrase).join(" ") === wanted);
 }
 
+/**
+ * Relevance of a provider record: the profile classifier on the notice's own text, then the procurement-authenticity
+ * check (is the page an actual procurement notice?), which can only downgrade. See procurementAuthenticity.ts.
+ */
 export function classifyProviderRecordRelevance(
   record: NormalizedOpportunity,
 ): RelevanceResult {
-  return classifyResult({
+  const webDiscovery = isWebDiscoverySource(record.source);
+  // A third-party listing page's "similar RFPs" section describes other notices, not this one.
+  const description = webDiscovery ? ownNoticeText(record.description) : record.description;
+  const relevance = classifyResult({
     title: record.title,
     snippet: [
       record.type,
       record.solicitationNumber,
-      record.description,
+      description,
       record.naicsDescription,
     ]
       .filter(Boolean)
@@ -123,6 +136,18 @@ export function classifyProviderRecordRelevance(
     ),
     allowHistorical: true,
   });
+  const authenticity = assessProcurementAuthenticity({
+    title: record.title,
+    description,
+    url: record.sourceUrl,
+    source: record.source,
+    type: record.type,
+    solicitationNumber: record.solicitationNumber,
+    naicsCode: record.naicsCode,
+    pscCode: record.pscCode ?? (typeof record.rawData?.classificationCode === "string" ? record.rawData.classificationCode : undefined),
+    responseDeadline: record.responseDeadline ?? null,
+  });
+  return applyProcurementAuthenticity(relevance, authenticity);
 }
 
 function recordSearchText(record: NormalizedOpportunity): string {

@@ -1,19 +1,15 @@
 {
  "datasetVersion": "f6a35f22cec67f5a",
- "note": "Recorded Release C baseline. Known gate failures are pre-existing web-discovery acceptances of non-procurement pages; the gate fails on any new failure or any metric drop.",
+ "note": "Recorded Release C baseline. The procurement-authenticity check removed the pre-existing gate failures (web-discovery acceptances of non-procurement pages); the gate fails on any new failure or any metric drop.",
  "gate": {
-  "keptPrecision": 0.711,
+  "keptPrecision": 0.729,
   "keptRecall": 1,
-  "autoAcceptPrecision": 0.966,
+  "autoAcceptPrecision": 1,
   "autoAcceptRecall": 0.988,
-  "expectationPassRate": 0.986,
-  "rankingAuc": 0.989,
+  "expectationPassRate": 1,
+  "rankingAuc": 0.997,
   "precisionAtTopDecile": 1
  },
- "knownGateFailures": [
-  "prod-04b96aaa",
-  "prod-1c313afa",
-  "prod-88a66887"
- ],
+ "knownGateFailures": [],
  "knownMissedOpportunities": []
 }
