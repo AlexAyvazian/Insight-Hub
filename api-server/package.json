@@ -20,7 +20,7 @@
     "test:news": "node --import tsx --test src/routes/__tests__/relevantNews.test.ts src/routes/__tests__/relevantNewsResponseShape.test.ts src/routes/__tests__/apitubeNews.test.ts src/routes/__tests__/companyWatchNews.test.ts src/routes/__tests__/supplementalNews.test.ts src/lib/companyWatch/__tests__/companyWatchAwards.test.ts"
   },
   "dependencies": {
-    "@types/multer": "^2.1.0",
+    "@types/multer": "^2.3.0",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
     "cookie-parser": "^1.4.7",
@@ -28,10 +28,10 @@
     "drizzle-orm": "catalog:",
     "express": "^5",
     "imapflow": "^1.0.162",
-    "multer": "^2.3.0",
+    "multer": "^2.4.0",
     "pino": "^9",
     "pino-http": "^10",
-    "pg": "^8.20.0"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",
