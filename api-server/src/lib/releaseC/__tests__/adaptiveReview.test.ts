@@ -182,6 +182,11 @@ describe("review queue persistence", () => {
     assert.equal(await releaseStaleClaims() >= 0, true);
     assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "in_review", "a fresh claim is left to its run");
     await pool.query(`UPDATE opportunity_review_queue SET updated_at = now() - interval '31 minutes' WHERE opportunity_key = $1`, [key]);
+    // Ingestion seeing the same version again must not make the abandoned claim look fresh.
+    const { enqueueForReview } = await import("../reviewQueue");
+    const hash = (await cachedQueueDecisions([key])).get(key)!.contentHash;
+    await enqueueForReview([{ opportunityKey: key, provider: "samGov", record, contentHash: hash, profileVersion: null, priority: 5, holdCode: "structured_review_queued", reason: "seen again" }]);
+    assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "in_review");
     assert.ok((await releaseStaleClaims()) >= 1);
     assert.equal((await cachedQueueDecisions([key])).get(key)?.status, "queued");
     assert.ok((await reviewQueueStats()).dueNow >= 1, "the released item now counts as due");

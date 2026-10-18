@@ -127,7 +127,8 @@ export async function enqueueForReview(items: EnqueueInput[]): Promise<{ queued:
     }
     if (row.content_hash === item.contentHash) {
       await (await rcPool()).query(
-        `UPDATE opportunity_review_queue SET priority = $2, updated_at = now() WHERE id = $1`,
+        // updated_at on an in_review row is its claim time (see releaseStaleClaims), so a re-sighting leaves it alone.
+        `UPDATE opportunity_review_queue SET priority = $2, updated_at = CASE WHEN status = 'in_review' THEN updated_at ELSE now() END WHERE id = $1`,
         [row.id, item.priority],
       );
       unchanged += 1;
