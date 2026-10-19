@@ -114,6 +114,9 @@ export function expensiveRoutePolicy(
 ): RatePolicy | null {
   const method = req.method.toUpperCase();
   const path = req.path;
+  if (method === "GET" && path === "/company-watch/disclosures") {
+    return { bucket: "company-disclosures", limit: 60, windowMs: 60 * 60_000 };
+  }
   if (method !== "POST" && method !== "PATCH" && method !== "DELETE") return null;
 
   if (method === "POST" && path === "/opportunities/fetch") {

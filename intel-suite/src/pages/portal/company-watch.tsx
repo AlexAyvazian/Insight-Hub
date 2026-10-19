@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
+import { CompanyDisclosures } from "@/components/portal/CompanyDisclosures";
 import { CircleAlert, Clock3, ExternalLink, Loader2, Plus, Search, X } from "lucide-react";
 
 type Company = { name: string };
@@ -428,6 +429,7 @@ export default function CompanyWatchPage() {
           </div>
           <button type="button" onClick={() => mutation.mutate([selected.name])} disabled={restoring || mutation.isPending} className="mt-4 inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-5 text-base font-semibold text-[#09163a] disabled:opacity-50"><Search className="h-5 w-5" />{mutation.isPending ? "Searching…" : "Search this company"}</button>
           {checks[selected.name]?.warnings.map(warning => <p key={warning} role="status" className="mt-3 text-base text-amber-100">{warning}</p>)}
+          <CompanyDisclosures key={selected.name} company={selected.name} />
           <section aria-label="Official contract awards" className="mt-6">
             <div className="mb-3 flex flex-wrap items-center gap-3">
               <h3 className="text-2xl font-bold text-white">Official Contract Awards</h3>
