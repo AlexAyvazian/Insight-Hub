@@ -1,4 +1,5 @@
 import { Router, type IRouter } from "express";
+import { workspaceResult, savedWorkspaceResults } from "../lib/intelligence/workspaceResults";
 import { resolveCredential } from "../lib/config/providerConfig";
 import { keenableProvider } from "../lib/providers/keenable";
 import { apitubeKeys, fetchApitubeNews } from "../lib/news/apitube";
@@ -63,7 +64,6 @@ const NEWS_POOL_TTL_MS = 15 * 60_000;
 const PARTIAL_CACHE_TTL_MS = 60_000;
 const MAX_SEARCH_CACHE_ENTRIES = 150;
 const searchCache = new Map<string, { expiresAt: number; result: CompanySearchResult }>();
-const inFlightSearches = new Map<string, Promise<CompanySearchResult>>();
 let newsPoolCache: { expiresAt: number; value: SharedPool } | null = null;
 let newsPoolInFlight: Promise<SharedPool> | null = null;
 
@@ -212,31 +212,44 @@ router.post('/company-watch/search', async (req, res) => {
   if (!companies.length) return res.status(400).json({ error: 'Add at least one company.' });
 
   const cacheKey = JSON.stringify([companies.map(name => name.toLowerCase()), sources.map(source => source.url)]);
-  const now = Date.now();
   const cached = searchCache.get(cacheKey);
-  if (cached && cached.expiresAt > now) return res.json({ ...cached.result, cached: true });
-  if (cached) searchCache.delete(cacheKey);
-
-  let pending = inFlightSearches.get(cacheKey);
-  if (!pending) {
-    pending = searchCompanies(companies, sources);
-    inFlightSearches.set(cacheKey, pending);
-  }
+  if (cached && cached.expiresAt > Date.now()) return res.json({ ...cached.result, cached: true });
   try {
-    const result = await pending;
-    const ttl = result.warnings.length ? PARTIAL_CACHE_TTL_MS : NEWS_POOL_TTL_MS;
-    searchCache.set(cacheKey, { expiresAt: Date.now() + ttl, result });
-    for (const [key, entry] of searchCache) {
-      if (entry.expiresAt <= Date.now()) searchCache.delete(key);
+    const result = await workspaceResult<CompanySearchResult>("company-news-v1", cacheKey, {
+      ttlMs: NEWS_POOL_TTL_MS,
+      refresh: true,
+      load: async () => {
+        const result = await searchCompanies(companies, sources);
+        if (!result.providers.some(provider => provider.status === "ok")) throw new Error("All company news providers are unavailable.");
+        return result;
+      },
+      usable: result => result.providers.some(provider => provider.status === "ok") && (result.articles.length > 0 || result.warnings.length === 0),
+    });
+    // Short-lived coalescing still protects provider quotas; the database is the durable copy.
+    if (!result.stale) {
+      searchCache.set(cacheKey, { result, expiresAt: Date.now() + (result.warnings.length ? PARTIAL_CACHE_TTL_MS : NEWS_POOL_TTL_MS) });
+      while (searchCache.size > MAX_SEARCH_CACHE_ENTRIES) searchCache.delete(searchCache.keys().next().value!);
     }
-    while (searchCache.size > MAX_SEARCH_CACHE_ENTRIES) {
-      const oldest = searchCache.keys().next().value;
-      if (oldest === undefined) break;
-      searchCache.delete(oldest);
-    }
-    return res.json({ ...result, cached: false });
-  } finally {
-    if (inFlightSearches.get(cacheKey) === pending) inFlightSearches.delete(cacheKey);
+    return res.json({ ...result, cached: Boolean(result.savedResult) });
+  } catch {
+    return res.status(502).json({ error: "Company news providers are unavailable. Previously loaded results are retained." });
+  }
+});
+
+// Restore saved news without rerunning up to 150 company searches on every page load.
+router.post("/company-watch/saved", async (req, res) => {
+  const companies = Array.isArray(req.body?.companies)
+    ? [...new Set<string>(req.body.companies.filter((name: unknown) => typeof name === "string").map((name: string) => name.trim()).filter(Boolean))].slice(0, 150) : [];
+  const sources = cleanSources(req.body?.sources);
+  try {
+    const keys = companies.map(name => JSON.stringify([[name.toLowerCase()], sources.map(source => source.url)]));
+    const saved = await savedWorkspaceResults<CompanySearchResult>("company-news-v1", keys);
+    return res.json({ companies: Object.fromEntries(companies.flatMap((name, index) => {
+      const entry = saved[index];
+      return entry ? [[name, { ...entry.value, articles: entry.value.articles.map(article => annotateArticle(article, [name])), savedAt: new Date(entry.savedAt).toISOString() }]] : [];
+    })) });
+  } catch {
+    return res.status(503).json({ error: "Saved company news is temporarily unavailable. You can still search for current news." });
   }
 });
 /**

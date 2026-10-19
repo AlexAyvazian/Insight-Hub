@@ -84,6 +84,9 @@ jobs:
       - name: News provider and Company Watch regressions
         run: pnpm --filter @workspace/api-server run test:news
 
+      - name: Workspace relevance and saved-result regressions
+        run: pnpm --filter @workspace/api-server run test:workspaces
+
       - name: Hardening regressions
         run: pnpm --filter @workspace/api-server run test:hardening
 

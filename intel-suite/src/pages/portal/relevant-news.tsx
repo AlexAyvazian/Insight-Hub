@@ -1,4 +1,5 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { loadWorkspacePreference, saveWorkspacePreference } from "@/lib/workspace-storage";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   CircleAlert,
@@ -50,6 +51,9 @@ type NewsResponse = {
   deduplicated?: number;
   fetchedAt: string;
   cached?: boolean;
+  savedAt?: string;
+  refreshWarning?: string;
+  persistenceWarning?: string;
   error?: string;
 };
 
@@ -66,8 +70,9 @@ function displayDate(value: string | null): string {
   }).format(parsed);
 }
 
-async function fetchRelevantNews(search: string, sources: MonitoredSource[]): Promise<NewsResponse> {
+async function fetchRelevantNews(search: string, sources: MonitoredSource[], refresh = false): Promise<NewsResponse> {
   const params = new URLSearchParams({ max: "40" });
+  if (refresh) params.set("refresh", "true");
   if (search) params.set("search", search);
   if (sources.length) params.set("sources", sources.map(source => source.domain).join(","));
   const baseUrl = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
@@ -121,18 +126,25 @@ function ArticlePhoto({ article }: { article: NewsArticle }) {
 }
 
 export default function RelevantNewsPage() {
-  const [draftSearch, setDraftSearch] = useState("");
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => loadWorkspacePreference("insight-hub:news:search", "", (value): value is string => typeof value === "string"));
+  const [draftSearch, setDraftSearch] = useState(search);
+  useEffect(() => saveWorkspacePreference("insight-hub:news:search", search), [search]);
+  const forceRefresh = useRef(false);
   const [sources, setSources] = useState<MonitoredSource[]>(() => { try { return JSON.parse(localStorage.getItem(sourceStorageKey) || "null") || DEFAULT_SOURCES; } catch { return DEFAULT_SOURCES; } });
   const [sourceDraft, setSourceDraft] = useState("");
 
-  useEffect(() => localStorage.setItem(sourceStorageKey, JSON.stringify(sources)), [sources]);
+  useEffect(() => saveWorkspacePreference(sourceStorageKey, sources), [sources]);
   const queryKey = useMemo(() => ["relevant-news", search, sources.map(source => source.domain).join(",")], [search, sources]);
   const query = useQuery({
     queryKey,
-    queryFn: () => fetchRelevantNews(search, sources),
+    queryFn: () => fetchRelevantNews(search, sources, forceRefresh.current),
     staleTime: 12 * 60 * 1000,
   });
+
+  const refreshResults = async () => {
+    forceRefresh.current = true;
+    try { await query.refetch(); } finally { forceRefresh.current = false; }
+  };
 
   const submitSearch = (event: FormEvent) => {
     event.preventDefault();
@@ -204,7 +216,7 @@ export default function RelevantNewsPage() {
         </div>
         <button
           type="button"
-          onClick={() => query.refetch()}
+          onClick={() => void refreshResults()}
           disabled={query.isFetching}
           className="inline-flex min-h-11 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs text-white/55 transition-colors hover:text-white disabled:opacity-50"
         >
@@ -219,6 +231,7 @@ export default function RelevantNewsPage() {
         </div>
       )}
 
+      {(query.data?.refreshWarning || query.data?.persistenceWarning) && <p role="status" className="rounded-xl border border-amber-300/25 bg-amber-300/10 p-4 text-amber-100">{query.data.refreshWarning} {query.data.persistenceWarning}{query.data.savedAt && ` Last saved ${displayDate(query.data.savedAt)}.`}</p>}
       {query.isError && (
         <div role="alert" className="flex items-start gap-3 rounded-2xl border border-red-300/20 bg-red-300/10 p-4 text-sm text-red-100/80">
           <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />

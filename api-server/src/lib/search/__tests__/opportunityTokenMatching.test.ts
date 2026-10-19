@@ -88,15 +88,16 @@ describe("Opportunities token matching", () => {
   });
 });
 
-describe("consumers outside Opportunities keep legacy matching", () => {
+describe("Forecasts and Recompete use token matching; other intel feeds are unchanged", () => {
   const qa = HARD_NEGATIVES.find((c) => c.id === "neg-construction-qa")!;
   const legacyVerdict = decideRelevance(
     classifyResult({ title: qa.title, snippet: ["Example Agency", qa.description].join(" "), allowHistorical: true, matchMode: "substring" }),
   ).verdict;
 
-  it("GovCon (Forecasts / Recompete) ranking is unchanged", async () => {
+  it("GovCon (Forecasts / Recompete) no longer accepts inside-word coincidences", async () => {
     const [ranked] = await rankGovConRecords([{ id: qa.id, title: qa.title, agency: "Example Agency", description: qa.description }], "forecast");
-    assert.equal(ranked!.relevance.verdict, legacyVerdict);
+    assert.equal(legacyVerdict, "accept");
+    assert.notEqual(ranked!.relevance.verdict, "accept");
   });
 
   it("intel feed assessment is unchanged", () => {

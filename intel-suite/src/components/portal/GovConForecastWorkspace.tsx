@@ -1,4 +1,5 @@
-import { FormEvent, useMemo, useState } from "react";
+import { loadWorkspacePreference, saveWorkspacePreference } from "@/lib/workspace-storage";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   BadgeCheck,
@@ -88,6 +89,10 @@ type ForecastResponse = {
   semanticProvider: "gemini" | "deterministic";
   fetchedAt: string;
   cached?: boolean;
+  stale?: boolean;
+  savedAt?: string;
+  refreshWarning?: string;
+  persistenceWarning?: string;
   error?: string;
 };
 
@@ -117,6 +122,10 @@ type VerificationResponse = {
   }>;
   verifiedAt: string;
   cached?: boolean;
+  stale?: boolean;
+  savedAt?: string;
+  refreshWarning?: string;
+  persistenceWarning?: string;
   error?: string;
 };
 
@@ -214,7 +223,7 @@ function apiBase(): string {
   return import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
 }
 
-async function fetchForecasts(mode: GovConWorkspaceMode, filters: Filters, fitOnly: boolean): Promise<ForecastResponse> {
+async function fetchForecasts(mode: GovConWorkspaceMode, filters: Filters, fitOnly: boolean, refresh = false): Promise<ForecastResponse> {
   const params = new URLSearchParams({
     limit: String(PAGE_SIZE),
     offset: String(filters.offset),
@@ -223,6 +232,7 @@ async function fetchForecasts(mode: GovConWorkspaceMode, filters: Filters, fitOn
     fitOnly: String(fitOnly),
   });
 
+  if (refresh) params.set("refresh", "true");
   if (filters.naics) params.set("naics", filters.naics);
   if (filters.keywords) {
     params.set("keywords", filters.keywords);
@@ -474,10 +484,14 @@ function ForecastCard({
 
 export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode }) {
   const isRecompete = mode === "recompete";
-  const [draftKeywords, setDraftKeywords] = useState("");
-  const [draftAgency, setDraftAgency] = useState("");
-  const [draftNaics, setDraftNaics] = useState(DEFAULT_NAICS);
-  const [filters, setFilters] = useState<Filters>({ keywords: "", agency: "", naics: DEFAULT_NAICS, offset: 0 });
+  const [initial] = useState(() => loadWorkspacePreference<Filters>(`insight-hub:${mode}:filters:v2`, { keywords: "", agency: "", naics: DEFAULT_NAICS, offset: 0 }, (value): value is Filters => {
+    const item = value as Filters | null;
+    return Boolean(item && typeof item.keywords === "string" && typeof item.agency === "string" && typeof item.naics === "string" && Number.isInteger(item.offset) && item.offset >= 0);
+  }));
+  const [draftKeywords, setDraftKeywords] = useState(initial.keywords);
+  const [draftAgency, setDraftAgency] = useState(initial.agency);
+  const [draftNaics, setDraftNaics] = useState(initial.naics);
+  const [filters, setFilters] = useState<Filters>(initial);
   const [fitOnly, setFitOnly] = useState(true);
   const [hiddenIds, setHiddenIds] = useState<Set<string>>(() => loadHiddenIds(mode));
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
@@ -487,11 +501,18 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
     [mode, filters, fitOnly],
   );
 
+  useEffect(() => saveWorkspacePreference(`insight-hub:${mode}:filters:v2`, filters), [mode, filters]);
+  const forceRefresh = useRef(false);
   const query = useQuery({
     queryKey,
-    queryFn: () => fetchForecasts(mode, filters, fitOnly),
+    queryFn: () => fetchForecasts(mode, filters, fitOnly, forceRefresh.current),
     staleTime: 8 * 60 * 1000,
   });
+
+  const refreshResults = async () => {
+    forceRefresh.current = true;
+    try { await query.refetch(); } finally { forceRefresh.current = false; }
+  };
 
   const submitFilters = (event: FormEvent) => {
     event.preventDefault();
@@ -512,7 +533,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
       return next;
     });
     void saveFeedback(mode, record)
-      .then(() => query.refetch())
+      .then(() => refreshResults())
       .catch((error) => setFeedbackError(error instanceof Error ? error.message : "Feedback could not be saved"));
   };
 
@@ -522,7 +543,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
     setHiddenIds(next);
     setFeedbackError(null);
     void restoreFeedback(mode)
-      .then(() => query.refetch())
+      .then(() => refreshResults())
       .catch((error) => setFeedbackError(error instanceof Error ? error.message : "Hidden records could not be restored"));
   };
 
@@ -623,14 +644,14 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
         <div className="flex flex-wrap items-center gap-2">
           <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm font-medium text-white/75">
             <input type="checkbox" checked={fitOnly} onChange={(event) => setFitOnly(event.target.checked)} className="accent-[hsl(var(--primary))]" />
-            Occu-Med fit only
+            Occu-Med service matches only
           </label>
           {hiddenIds.size > 0 && (
             <button type="button" onClick={restoreHidden} className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm font-medium text-white/75 hover:text-white">
               <RotateCcw className="h-3.5 w-3.5" /> Restore {hiddenIds.size} hidden
             </button>
           )}
-          <button onClick={() => query.refetch()} disabled={query.isFetching} className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm font-medium text-white/75 transition-colors hover:text-white disabled:opacity-50">
+          <button onClick={() => void refreshResults()} disabled={query.isFetching} className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm font-medium text-white/75 transition-colors hover:text-white disabled:opacity-50">
             <RefreshCcw className={`h-3.5 w-3.5 ${query.isFetching ? "animate-spin" : ""}`} /> Refresh
           </button>
         </div>
@@ -717,6 +738,7 @@ export function GovConForecastWorkspace({ mode }: { mode: GovConWorkspaceMode })
         <div className="rounded-xl border border-red-300/20 bg-red-300/10 p-3 text-sm text-red-100/85">{feedbackError}</div>
       )}
 
+      {(query.data?.refreshWarning || query.data?.persistenceWarning) && <p role="status" className="rounded-xl border border-amber-300/25 bg-amber-300/10 p-4 text-amber-100">{query.data.refreshWarning} {query.data.persistenceWarning}{query.data.savedAt && ` Last saved ${displayDate(query.data.savedAt)}.`}</p>}
       {query.isError && (
         <div className="flex items-start gap-3 rounded-2xl border border-red-300/20 bg-red-300/10 p-4 text-sm text-red-100/80">
           <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" />
