@@ -20,7 +20,19 @@ import { mergeWebDiscoveryBatches, consolidatedDuplicateCount, type WebDiscovery
 import { clearPurposeBudgetsForTests, purposeAllows, purposeForPool } from "../../purposeBudget";
 import { clearLimitedProviderPoolState, runLimitedProviderPool } from "../../limitedProviderPool";
 
-const hasDb = Boolean(process.env.RFP_DATABASE_URL);
+// Database-backed cases run only where Postgres is actually reachable (some CI jobs set the URL without a server).
+const hasDb = await (async () => {
+  if (!process.env.RFP_DATABASE_URL) return false;
+  try {
+    await Promise.race([
+      (await rcPool()).query("SELECT 1"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3_000).unref()),
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+})();
 const run = `t${Date.now().toString(36)}`;
 
 async function sql(statement: string, params: unknown[] = []) {
