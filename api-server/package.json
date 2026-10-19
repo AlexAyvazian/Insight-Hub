@@ -22,20 +22,20 @@
     "test:workspaces": "node --import tsx --test src/lib/intelligence/__tests__/workspaceResults.test.ts src/lib/intelligence/__tests__/govconServiceFit.test.ts src/lib/search/__tests__/opportunityTokenMatching.test.ts src/routes/__tests__/govconSemantics.test.ts"
   },
   "dependencies": {
-    "@types/multer": "^2.1.0",
+    "@types/multer": "^2.3.0",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
     "cookie-parser": "^1.4.7",
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
-    "fflate": "0.8.2",
+    "fflate": "0.8.3",
     "imapflow": "^1.0.162",
-    "multer": "^2.3.0",
-    "pg": "^8.20.0",
+    "multer": "^2.4.0",
+    "pg": "^8.23.1",
     "pino": "^9",
     "pino-http": "^10",
-    "unpdf": "1.8.1"
+    "unpdf": "1.9.0"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",
