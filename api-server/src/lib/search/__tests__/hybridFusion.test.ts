@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
+import { qdrantProvider } from "../../providers/qdrant";
+import { pineconeProvider } from "../../providers/pinecone";
+import { clearVectorCooldownForTests, searchVectorIndex } from "../vectorIndex";
 import {
   DEFAULT_RRF_K,
   RetrievalMethodError,
@@ -155,5 +158,25 @@ describe("Hybrid search: selective rerank", () => {
     assert.deepEqual(first.items.map((item) => item.id), second.items.map((item) => item.id));
     // Equal similarity everywhere changes nothing: fused order is the tie-break.
     assert.deepEqual(first.items.map((item) => item.id), fusedItems().map((item) => item.id));
+  });
+});
+
+describe("vector leg cooldown", () => {
+  it("skips the vector store for a cooldown after it fails instead of waiting on it per search", async () => {
+    clearVectorCooldownForTests();
+    const qdrant = mock.method(qdrantProvider, "isConfigured", async () => false);
+    const pinecone = mock.method(pineconeProvider, "isConfigured", async () => false);
+    try {
+      await assert.rejects(searchVectorIndex("occupational health", 10), (error: RetrievalMethodError) => error.code === "vector_index_unavailable");
+      await assert.rejects(searchVectorIndex("occupational health", 10), (error: RetrievalMethodError) => error.code === "vector_index_cooling_down");
+      assert.equal(qdrant.mock.callCount(), 1, "the store is not asked again during the cooldown");
+      clearVectorCooldownForTests();
+      await assert.rejects(searchVectorIndex("occupational health", 10), (error: RetrievalMethodError) => error.code === "vector_index_unavailable");
+      assert.equal(qdrant.mock.callCount(), 2);
+    } finally {
+      qdrant.mock.restore();
+      pinecone.mock.restore();
+      clearVectorCooldownForTests();
+    }
   });
 });
