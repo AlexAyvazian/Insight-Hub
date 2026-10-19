@@ -114,6 +114,7 @@ export const env = {
 
   // Search / ranking feature flags
   ENABLE_SEMANTIC_RERANK: process.env.ENABLE_SEMANTIC_RERANK,
+  ENABLE_HYBRID_VECTOR_SEARCH: process.env.ENABLE_HYBRID_VECTOR_SEARCH,
 
   // Tango Procurement Intelligence
   TANGO_API_KEY: process.env.TANGO_API_KEY,

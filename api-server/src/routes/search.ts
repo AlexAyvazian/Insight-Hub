@@ -1,9 +1,12 @@
 /**
  * POST /api/search
  *
- * Instant local search over already-stored opportunity records.
- * This endpoint queries the PostgreSQL opportunities table directly and
- * ranks results locally. No external APIs, crawlers, scrapers, or LLMs are called.
+ * Instant hybrid search over already-stored opportunity records: PostgreSQL full-text search plus the existing
+ * opportunity vector index, fused with Reciprocal Rank Fusion, with only the fused top-N semantically reranked
+ * (see lib/search/localSearch.ts and hybridFusion.ts). No crawlers, scrapers, or extraction LLMs are called; when
+ * the vector store or reranker is unavailable the search degrades to lexical order and says so in `diagnostics`.
+ *
+ * Optional body fields: `rrfK` (RRF constant, default 60) and `rerankTopN` (default 20, 0 disables rerank).
  *
  * Contrast with:
  *   - POST /opportunities/fetch — ingestion/crawler path that hits live
@@ -19,9 +22,14 @@ import { searchOpportunities } from "../lib/search/localSearch";
 
 const router = Router();
 
+function boundedInteger(value: unknown, minimum: number, maximum: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.min(maximum, Math.max(minimum, Math.floor(value)));
+}
+
 router.post("/search", async (req, res) => {
   try {
-    const { query, limit, filters } = req.body as {
+    const { query, limit, filters, rrfK, rerankTopN } = req.body as {
       query?: string;
       limit?: number;
       filters?: {
@@ -31,6 +39,8 @@ router.post("/search", async (req, res) => {
         dateRange?: number;
         activeOnly?: boolean;
       };
+      rrfK?: number;
+      rerankTopN?: number;
     };
 
     if (!query || typeof query !== "string" || query.trim().length === 0) {
@@ -41,6 +51,7 @@ router.post("/search", async (req, res) => {
       query.trim(),
       typeof limit === "number" && limit > 0 ? Math.min(limit, 100) : 50,
       filters ?? {},
+      { rrfK: boundedInteger(rrfK, 1, 1_000), rerankTopN: boundedInteger(rerankTopN, 0, 100) },
     );
 
     return res.json(result);

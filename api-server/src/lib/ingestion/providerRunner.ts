@@ -195,6 +195,7 @@ function applyProviderGuards(
         returned: partition.rawCount,
         matched: partition.matchedCount,
         rejected: partition.rejectedCount,
+        deferredByReason: partition.deferredByReason,
         rescued,
         stagedAsRejected: partitionExcluded.length,
       }),

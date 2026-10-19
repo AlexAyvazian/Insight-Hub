@@ -50,6 +50,7 @@ const REASON_LABELS: Record<string, string> = {
   missing_occumed_service_evidence: "No Occu-Med service evidence",
   insufficient_evidence_combination: "Insufficient evidence combination",
   manual_query_mismatch: "Did not match the manual query",
+  query_deferred: "Deferred for review: query terms absent or snippet too thin",
   invalid_title: "Invalid title",
   missing_agency: "Missing agency",
   invalid_posted_date: "Invalid posted date",

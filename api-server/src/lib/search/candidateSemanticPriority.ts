@@ -7,6 +7,8 @@ const MAX_SAME_SOURCE_STREAK = 4;
 const FAIRNESS_SCORE_WINDOW = 0.08;
 const DUPLICATE_COSINE_THRESHOLD = 0.965;
 const DUPLICATE_TITLE_JACCARD = 0.82;
+/** Below this much content a candidate's embedding mostly reflects its title; it is flagged, never dropped for it. */
+export const THIN_CANDIDATE_CHARS = 160;
 
 export interface SemanticPriorityCandidate {
   title: string;
@@ -18,6 +20,8 @@ export interface SemanticPriorityCandidate {
 export type PrioritizedCandidate<T extends SemanticPriorityCandidate> = T & {
   cloudflareSemanticScore: number;
   cloudflareSemanticRank: number;
+  /** Set when the candidate's snippet is too thin for its semantic score to mean much; it stays in the list. */
+  semanticPriorityDeferred?: "thin_snippet";
 };
 
 export interface CandidateSemanticPriorityResult<T extends SemanticPriorityCandidate> {
@@ -29,6 +33,8 @@ export interface CandidateSemanticPriorityResult<T extends SemanticPriorityCandi
   duplicatesRemoved: number;
   /** Near-identical candidates kept because no shared identifier proved them the same procurement. */
   potentialDuplicates?: number;
+  /** Thin-snippet candidates kept and flagged with semanticPriorityDeferred (in candidates or overflow). */
+  deferred: number;
   errors: string[];
 }
 
@@ -86,6 +92,41 @@ function candidateText(candidate: SemanticPriorityCandidate): string {
     .filter(Boolean)
     .join(". ")
     .slice(0, 12_000);
+}
+
+export function isThinCandidate(candidate: SemanticPriorityCandidate): boolean {
+  return candidate.content.replace(/\s+/g, " ").trim().length < THIN_CANDIDATE_CHARS;
+}
+
+function withPriority<T extends SemanticPriorityCandidate>(
+  candidate: T,
+  score: number,
+  rank: number,
+): PrioritizedCandidate<T> {
+  return {
+    ...candidate,
+    cloudflareSemanticScore: score,
+    cloudflareSemanticRank: rank,
+    ...(isThinCandidate(candidate) ? { semanticPriorityDeferred: "thin_snippet" as const } : {}),
+  };
+}
+
+/** Every candidate in its original order, unscored. Used whenever semantic prioritization cannot run. */
+function unprioritized<T extends SemanticPriorityCandidate>(
+  candidates: T[],
+  error?: string,
+): CandidateSemanticPriorityResult<T> {
+  const kept = candidates.map((candidate, index) => withPriority(candidate, 0, index + 1));
+  return {
+    candidates: kept,
+    overflow: [],
+    applied: false,
+    embedded: 0,
+    directReranked: 0,
+    duplicatesRemoved: 0,
+    deferred: kept.filter((candidate) => candidate.semanticPriorityDeferred).length,
+    errors: error ? [error] : [],
+  };
 }
 
 function semanticQuery(focus?: string): string {
@@ -197,16 +238,9 @@ export function finalizeSemanticPriority<T extends SemanticPriorityCandidate>(
   rerankScores: Map<number, number> = new Map(),
   maxCandidates = 240,
 ): CandidateSemanticPriorityResult<T> {
+  // An embedding failure is not a reason to lose candidates: keep all of them in their original order.
   if (vectors.length !== candidates.length) {
-    return {
-      candidates: [],
-      overflow: [],
-      applied: false,
-      embedded: 0,
-      directReranked: 0,
-      duplicatesRemoved: 0,
-      errors: ["Cloudflare embedding count did not match candidate count."],
-    };
+    return unprioritized(candidates, "Cloudflare embedding count did not match candidate count.");
   }
 
   const scored = candidates.map((candidate, index) => {
@@ -231,11 +265,9 @@ export function finalizeSemanticPriority<T extends SemanticPriorityCandidate>(
     deduplicated.kept.find((candidate) => candidate.candidate.url === row.candidate.url)!,
   );
 
-  const prioritized = fair.map((row, index) => ({
-    ...row.candidate,
-    cloudflareSemanticScore: Math.round(row.finalScore * 10_000) / 100,
-    cloudflareSemanticRank: index + 1,
-  }));
+  const prioritized = fair.map((row, index) =>
+    withPriority(row.candidate, Math.round(row.finalScore * 10_000) / 100, index + 1),
+  );
   const safeLimit = Math.max(20, Math.min(500, maxCandidates));
 
   return {
@@ -246,6 +278,7 @@ export function finalizeSemanticPriority<T extends SemanticPriorityCandidate>(
     directReranked: rerankScores.size,
     duplicatesRemoved: deduplicated.removed,
     potentialDuplicates: deduplicated.potentialMatches,
+    deferred: prioritized.filter((candidate) => candidate.semanticPriorityDeferred).length,
     errors: [],
   };
 }
@@ -270,19 +303,7 @@ export async function prioritizeCandidatesWithCloudflare<
   focus?: string,
   maxCandidates = 240,
 ): Promise<CandidateSemanticPriorityResult<T>> {
-  const passthrough = (error?: string): CandidateSemanticPriorityResult<T> => ({
-    candidates: candidates.map((candidate, index) => ({
-      ...candidate,
-      cloudflareSemanticScore: 0,
-      cloudflareSemanticRank: index + 1,
-    })),
-    overflow: [],
-    applied: false,
-    embedded: 0,
-    directReranked: 0,
-    duplicatesRemoved: 0,
-    errors: error ? [error] : [],
-  });
+  const passthrough = (error?: string) => unprioritized(candidates, error);
 
   if (candidates.length < 2) return passthrough();
   if (!(await cloudflareWorkersAi.isConfigured())) return passthrough();

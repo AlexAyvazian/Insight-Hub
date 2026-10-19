@@ -83,7 +83,7 @@ describe("deep manual-ingestion boundaries", () => {
     );
   });
 
-  it("admits relevant rows first and retains only bounded mismatch evidence", () => {
+  it("admits relevant rows first and defers every mismatch instead of dropping it", () => {
     const records = [
       opportunity("ut-purchasing", "Professional Engineering Services"),
       opportunity("ut-purchasing", "Janitorial Services Invitation to Bid"),
@@ -109,9 +109,14 @@ describe("deep manual-ingestion boundaries", () => {
         (record) => record.rawData?.manualQueryMismatch === true,
       ),
     );
+    // Every non-match is kept (deferred), not just the bounded sample; none is promoted on missing keywords.
+    assert.equal(partition.deferred.length, 3);
     assert.ok(
-      partition.rejectedSamples.every(
-        (record) => decideOpportunityQuality(record).status === "rejected",
+      partition.deferred.every((record) => record.rawData?.queryMatchDeferred === true),
+    );
+    assert.ok(
+      partition.deferred.every(
+        (record) => decideOpportunityQuality(record).status !== "accepted",
       ),
     );
   });

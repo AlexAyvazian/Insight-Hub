@@ -9,7 +9,6 @@ import {
 
 const DEFAULT_AI_LIMIT = 160;
 const MAX_AI_LIMIT = 300;
-const MISMATCH_DIAGNOSTIC_LIMIT = 3;
 
 type PortalAiCandidate = SemanticPriorityCandidate & {
   record: NormalizedOpportunity;
@@ -77,9 +76,11 @@ function applyAiExtraction(
   const rawData = { ...(record.rawData ?? {}) };
   delete rawData.manualQueryMismatch;
   delete rawData.manualQuery;
+  delete rawData.queryMatchDeferred;
+  delete rawData.queryDeferralReason;
 
   const tags = stringTags(record).filter(
-    (tag) => tag !== "manual-query-mismatch",
+    (tag) => tag !== "manual-query-mismatch" && tag !== "query-deferred",
   );
   const recovered = record.rawData?.manualQueryMismatch === true;
 
@@ -200,7 +201,10 @@ export async function adjudicatePublicPortalResult(
   }
 
   const kept: NormalizedOpportunity[] = [];
-  const mismatchDiagnostics: NormalizedOpportunity[] = [];
+  // Lexical mismatches the AI did not recover. Missing keywords alone never drop a record: these stay flagged
+  // (queryMatchDeferred) behind the kept records and the quality decision holds them for review or rejects them on
+  // the canonical relevance decision.
+  const deferred: NormalizedOpportunity[] = [];
 
   candidates.forEach((candidate, index) => {
     const record = candidate.record;
@@ -222,32 +226,27 @@ export async function adjudicatePublicPortalResult(
       return;
     }
 
-    // Lexical mismatches require affirmative semantic recovery. Otherwise retain
-    // only a globally bounded diagnostic sample for the run UI.
+    // Lexical mismatches need affirmative semantic recovery to be promoted; otherwise they stay deferred.
     if (aiAccepted && extraction) {
       kept.push(applyAiExtraction(candidate, extraction));
       return;
     }
 
-    if (mismatchDiagnostics.length < MISMATCH_DIAGNOSTIC_LIMIT) {
-      mismatchDiagnostics.push(record);
-    }
+    deferred.push(record);
   });
 
   // Cloudflare may have bounded the AI work. Preserve deterministic non-mismatch
-  // records outside that budget and keep mismatch evidence globally bounded.
+  // records outside that budget; mismatches outside it are deferred like the rest.
   for (const candidate of priority.overflow) {
     if (candidate.record.rawData?.manualQueryMismatch === true) {
-      if (mismatchDiagnostics.length < MISMATCH_DIAGNOSTIC_LIMIT) {
-        mismatchDiagnostics.push(candidate.record);
-      }
+      deferred.push(candidate.record);
     } else {
       kept.push(candidate.record);
     }
   }
 
   const seen = new Set<string>();
-  const records = [...kept, ...mismatchDiagnostics].filter((record) => {
+  const records = [...kept, ...deferred].filter((record) => {
     const key = stableKey(record);
     if (seen.has(key)) return false;
     seen.add(key);
@@ -268,7 +267,8 @@ export async function adjudicatePublicPortalResult(
           ...(priority.applied ? ["cloudflare-workers-ai"] : []),
           ...usedScorers,
         ],
-        mismatchDiagnostics: mismatchDiagnostics.length,
+        queryDeferred: deferred.length,
+        thinSnippetDeferred: priority.deferred,
       }),
     );
   }

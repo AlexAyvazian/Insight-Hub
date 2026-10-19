@@ -3,6 +3,7 @@ import type { NormalizedOpportunity } from "../providers/types";
 import { qdrantProvider } from "../providers/qdrant";
 import { pineconeProvider } from "../providers/pinecone";
 import { embedTexts, type EmbeddingProviderName } from "./embeddings";
+import { RetrievalMethodError, type MethodRetrieval } from "./hybridFusion";
 
 export interface VectorIndexStats {
   attempted: number;
@@ -151,6 +152,53 @@ export async function indexOpportunities(opportunities: NormalizedOpportunity[])
       },
     })),
   );
+}
+
+/**
+ * Query the existing opportunity vector index (Qdrant, then Pinecone — the same order indexing uses) for the hybrid
+ * search vector leg. Hits resolve to stored opportunity ids through the `opportunityId` payload written by
+ * opportunityVectorSync.ts; hits without one are counted, not guessed. Throws RetrievalMethodError so the caller can
+ * fall back to lexical-only and record why.
+ */
+export async function searchVectorIndex(
+  query: string,
+  limit: number,
+  options: VectorIndexOptions = {},
+): Promise<MethodRetrieval> {
+  const qdrant = await qdrantProvider.isConfigured();
+  const pinecone = !qdrant && (await pineconeProvider.isConfigured());
+  if (!qdrant && !pinecone) {
+    throw new RetrievalMethodError("vector_index_unavailable", "No vector store (Qdrant or Pinecone) is configured");
+  }
+
+  const embedding = await embedTexts([query], "query");
+  const vector = embedding?.vectors[0];
+  if (!embedding || !vector) {
+    throw new RetrievalMethodError("query_embedding_unavailable", "No embedding provider returned a query vector");
+  }
+
+  const store = qdrant ? "qdrant" : "pinecone";
+  const hits = qdrant
+    ? await qdrantProvider.search(vector, limit, options.qdrantCollection)
+    : await pineconeProvider.search(vector, limit, options.pineconeNamespace);
+  if (!hits) {
+    throw new RetrievalMethodError("vector_index_unavailable", `${store} search failed or returned no response`, {
+      store,
+      embeddingProvider: embedding.provider,
+    });
+  }
+
+  const resolved: MethodRetrieval["hits"] = [];
+  let unresolved = 0;
+  for (const hit of hits) {
+    const opportunityId = hit.payload?.opportunityId;
+    if (typeof opportunityId === "string" && opportunityId) resolved.push({ id: opportunityId, score: hit.score });
+    else unresolved++;
+  }
+  return {
+    hits: resolved,
+    detail: { store, embeddingProvider: embedding.provider, rawHits: hits.length, unresolvedHits: unresolved },
+  };
 }
 
 function stableUuid(value: string): string {

@@ -216,6 +216,28 @@ describe("coordinated AI search intelligence stack", () => {
     assert.ok((result.candidates[0]?.cloudflareSemanticScore ?? 0) > 95);
   });
 
+  it("keeps and flags thin-snippet candidates and never loses candidates on an embedding mismatch", () => {
+    const candidates = [
+      { title: "Medical Services RFP", url: "https://example.gov/thin", content: "See portal.", sourceProvider: "serper" },
+      {
+        title: "Occupational Health Services RFP",
+        url: "https://example.gov/full",
+        content: "Open RFP for employee medical surveillance, pre-employment physicals, drug and alcohol testing, audiograms, respirator fit testing and vaccinations for all county departments.",
+        sourceProvider: "exa",
+      },
+    ];
+    const ranked = finalizeSemanticPriority(candidates, [[0, 1], [1, 0]], [1, 0], new Map(), 20);
+    assert.equal(ranked.candidates.length, 2);
+    assert.equal(ranked.deferred, 1);
+    assert.equal(ranked.candidates.find((c) => c.url.endsWith("/thin"))?.semanticPriorityDeferred, "thin_snippet");
+    assert.equal(ranked.candidates.find((c) => c.url.endsWith("/full"))?.semanticPriorityDeferred, undefined);
+
+    const mismatch = finalizeSemanticPriority(candidates, [[1, 0]], [1, 0]);
+    assert.equal(mismatch.applied, false);
+    assert.deepEqual(mismatch.candidates.map((c) => c.url), candidates.map((c) => c.url), "original order, nothing dropped");
+    assert.equal(mismatch.errors.length, 1);
+  });
+
   it("removes a near-identical candidate only when it states the same solicitation number", () => {
     const result = finalizeSemanticPriority(
       [
