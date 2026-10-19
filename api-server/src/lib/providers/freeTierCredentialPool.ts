@@ -1,9 +1,11 @@
 import { eq } from "drizzle-orm";
 import { rfpDb, settingsTable } from "@workspace/db";
 import { resolveCredential } from "../config/providerConfig";
+import { purposeAllows, recordPurposeCall } from "../purposeBudget";
 import {
   ProviderQuotaError,
   sharedAccountLedger,
+  type SpendPurpose,
   type AccountLedger,
   type AccountPolicy,
   type QuotaSnapshot,
@@ -27,6 +29,12 @@ export interface FreeTierCredentialPoolOptions {
    * skipped until a probe (when provided) or the documented reset confirms capacity.
    */
   accounts?: PoolAccountAccounting;
+  /**
+   * Controlled parallel assignment across independent accounts: at most this many calls run on one account at a
+   * time, and a concurrent call goes to the next account with capacity instead of piling onto the active one. Only
+   * for pools whose accounts are separately permitted and whose free allowances were verified. Unset: unlimited.
+   */
+  maxConcurrentPerAccount?: number;
 }
 
 export interface SlotProbe {
@@ -53,6 +61,8 @@ export interface PoolAccountAccounting {
   /** Refresh capacity with the free probe before every call (for allowances shared with other users of the key). */
   probeBeforeEachRun?: boolean;
   ledger?: AccountLedger;
+  /** The spend purpose this pool's calls count against (see purposeBudget.ts); reservations carry it too. */
+  purpose?: SpendPurpose;
 }
 
 export interface CredentialRunContext {
@@ -115,6 +125,9 @@ const cursors = new Map<string, number>();
 const cooldowns = new Map<string, number>();
 const slotStates = new Map<string, SlotRuntimeState>();
 const poolInstances = new Map<string, FreeTierCredentialPool>();
+/** Calls currently running per account (runtimeKey), for maxConcurrentPerAccount. */
+const inflight = new Map<string, number>();
+const ACCOUNT_WAIT_MS = 30_000;
 
 function runtimeKey(poolId: string, slot: string): string {
   return `${poolId}:${slot}`;
@@ -277,6 +290,7 @@ function resetHeader(headers: Headers): string | null {
 export class FreeTierCredentialPool {
   private readonly rotateOnSuccess: boolean;
   private readonly accounts: PoolAccountAccounting | undefined;
+  private readonly maxConcurrentPerAccount: number | null;
 
   constructor(
     private readonly id: string,
@@ -285,6 +299,7 @@ export class FreeTierCredentialPool {
   ) {
     this.rotateOnSuccess = options.rotateOnSuccess ?? true;
     this.accounts = options.accounts;
+    this.maxConcurrentPerAccount = options.maxConcurrentPerAccount && options.maxConcurrentPerAccount > 0 ? Math.floor(options.maxConcurrentPerAccount) : null;
     poolInstances.set(id, this);
   }
 
@@ -464,7 +479,7 @@ export class FreeTierCredentialPool {
       decision = await ledger.canSpend(policy, plannedUnits, false);
     }
     if (decision.ok) {
-      const reservation = await ledger.reserve(policy, plannedUnits, false);
+      const reservation = await ledger.reserve(policy, plannedUnits, false, { purpose: this.accounts.purpose });
       if (reservation.ok) return reservation.release;
       decision = reservation;
     }
@@ -515,6 +530,20 @@ export class FreeTierCredentialPool {
     return value;
   }
 
+  /**
+   * With a per-account concurrency limit: accounts with a free place first, in the pool's order. When every
+   * account is at its limit, waits (bounded) for a place rather than overloading one account.
+   */
+  private async accountsWithRoom<C extends { slot: string }>(available: C[]): Promise<C[]> {
+    const limit = this.maxConcurrentPerAccount;
+    if (!limit) return available;
+    const free = () => available.filter(({ slot }) => (inflight.get(runtimeKey(this.id, slot)) ?? 0) < limit);
+    const deadline = Date.now() + ACCOUNT_WAIT_MS;
+    while (free().length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    const room = free();
+    return room.length > 0 ? room : available;
+  }
+
   async run<T>(
     operation: (apiKey: string, slot: string, context: CredentialRunContext) => Promise<T>,
     runOptions: { plannedUnits?: number } = {},
@@ -550,12 +579,31 @@ export class FreeTierCredentialPool {
         `${this.id} credential pool exhausted: all configured credentials cooling down${nextReset ? ` until ${new Date(nextReset).toISOString()}` : ""}`,
       );
     }
-    const candidates = available;
+    const candidates = await this.accountsWithRoom(available);
     const errors: string[] = [];
     const plannedUnits = runOptions.plannedUnits ?? this.accounts?.unitsPerCall ?? 1;
+    const purpose = this.accounts?.purpose;
+    if (purpose) {
+      const allowed = await purposeAllows(purpose);
+      if (!allowed.ok) throw new Error(`${this.id} credential pool exhausted: ${allowed.reason}`);
+    }
+    // A call placed on another account only because the active one was busy does not move a sticky pool's cursor.
+    let overflow = candidates.length < available.length;
     for (const candidate of candidates) {
+      const busyKey = runtimeKey(this.id, candidate.slot);
+      if (this.maxConcurrentPerAccount && (inflight.get(busyKey) ?? 0) >= this.maxConcurrentPerAccount) {
+        overflow = true;
+        errors.push(`${candidate.slot}: account busy (${this.maxConcurrentPerAccount} concurrent calls)`);
+        continue;
+      }
       const release = await this.accountAllows(candidate, plannedUnits, errors);
       if (!release) continue;
+      inflight.set(busyKey, (inflight.get(busyKey) ?? 0) + 1);
+      const done = () => {
+        const left = (inflight.get(busyKey) ?? 1) - 1;
+        if (left > 0) inflight.set(busyKey, left);
+        else inflight.delete(busyKey);
+      };
       const state = slotState(this.id, candidate.slot);
       state.attempts += 1;
       state.lastAttemptAt = new Date().toISOString();
@@ -586,16 +634,20 @@ export class FreeTierCredentialPool {
           }
         }
         release();
+        done();
+        if (purpose) recordPurposeCall(purpose, "success");
         state.successes += 1;
         state.lastOutcome = "success";
         state.lastSuccessAt = new Date().toISOString();
         const index = credentials.findIndex(
           ({ slot }) => slot === candidate.slot,
         );
-        cursors.set(
-          this.id,
-          this.rotateOnSuccess ? (index + 1) % credentials.length : index,
-        );
+        if (this.rotateOnSuccess || !overflow) {
+          cursors.set(
+            this.id,
+            this.rotateOnSuccess ? (index + 1) % credentials.length : index,
+          );
+        }
         const configuredReset = state.quotaResetAt
           ? Date.parse(state.quotaResetAt)
           : Number.NaN;
@@ -620,6 +672,8 @@ export class FreeTierCredentialPool {
           }
         }
         release();
+        done();
+        if (purpose) recordPurposeCall(purpose, "failure");
         if (!isCredentialRetryable(error)) throw error;
         const explicitReset = explicitCooldownUntilMs(error);
         const cooldownUntil = explicitReset ?? (Date.now() + cooldownMs(error));
@@ -656,6 +710,7 @@ export async function credentialPoolTelemetry(): Promise<any[]> {
 
 export function clearFreeTierCredentialPoolState(): void {
   cursors.clear();
+  inflight.clear();
   cooldowns.clear();
   slotStates.clear();
 }

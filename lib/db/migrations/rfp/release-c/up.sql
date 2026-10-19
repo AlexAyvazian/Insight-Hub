@@ -258,4 +258,42 @@ CREATE TABLE IF NOT EXISTS source_query_checkpoints (
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (source, query_key)
 );
+CREATE TABLE IF NOT EXISTS shared_work_results (
+    kind text NOT NULL,
+    work_key text NOT NULL,
+    status text NOT NULL DEFAULT 'running',
+    value jsonb,
+    owner text,
+    lease_until timestamptz,
+    expires_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, work_key)
+  );
+CREATE INDEX IF NOT EXISTS shared_work_results_expires_idx ON shared_work_results (expires_at);
+
+CREATE TABLE IF NOT EXISTS provider_account_reservations (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    units numeric NOT NULL,
+    purpose text,
+    owner text,
+    expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  );
+CREATE INDEX IF NOT EXISTS provider_account_reservations_account_idx ON provider_account_reservations (account_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS provider_purpose_usage (
+    purpose text NOT NULL,
+    day_key text NOT NULL,
+    calls integer NOT NULL DEFAULT 0,
+    failures integer NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (purpose, day_key)
+  );
+CREATE TABLE IF NOT EXISTS provider_pool_cooldowns (
+    pool_provider text PRIMARY KEY,
+    cooldown_until timestamptz NOT NULL,
+    reason text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+  );
 COMMIT;

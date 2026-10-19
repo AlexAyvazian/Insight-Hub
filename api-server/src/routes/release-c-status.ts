@@ -11,7 +11,8 @@
  */
 import { Router } from "express";
 import { adminReadAllowed } from "../middleware/api-hardening";
-import { releaseCFlags, reviewMode } from "../lib/releaseC/flags";
+import { accountingFailClosed, durableSharedWorkEnabled, releaseCFlags, reviewMode } from "../lib/releaseC/flags";
+import { purposeBudgetSnapshot } from "../lib/purposeBudget";
 import { documentWorkerState } from "../lib/releaseC/startup";
 import { rcPool } from "../lib/releaseC/db";
 import { ensureReleaseCSchema } from "../lib/releaseC/schema";
@@ -49,7 +50,7 @@ router.get("/release-c/status", async (req, res) => {
   if (!adminReadAllowed(req)) return res.status(401).json({ error: "Administrative read authorization is required." });
   try {
     await ensureReleaseCSchema();
-    const [docsByStatus, retrieval, jobs, recentDocs, sections, versions, queue, queueDue, queueErrors, decisions, usage, coverage, audit, remoteJobs, checkpoints] =
+    const [docsByStatus, retrieval, jobs, recentDocs, sections, versions, queue, queueDue, queueErrors, decisions, usage, coverage, audit, remoteJobs, checkpoints, sharedWork, reservations] =
       await Promise.all([
         rows(`SELECT extraction_status, coalesce(extraction_method, '') AS method, count(*)::int AS documents,
                      coalesce(sum(page_count), 0)::int AS pages, coalesce(sum(extracted_page_count), 0)::int AS extracted_pages
@@ -88,7 +89,13 @@ router.get("/release-c/status", async (req, res) => {
               FROM remote_extraction_jobs GROUP BY 1, 2`),
         rows(`SELECT source, query_key, next_offset, total_records, complete, last_error, updated_at
               FROM source_query_checkpoints ORDER BY updated_at DESC LIMIT 40`),
+        rows(`SELECT kind, status, count(*)::int AS n, count(*) FILTER (WHERE expires_at > now())::int AS live,
+                     max(updated_at) AS last_at
+              FROM shared_work_results GROUP BY 1, 2 ORDER BY 1, 2`),
+        rows(`SELECT account_id, coalesce(purpose, '') AS purpose, count(*)::int AS holds, coalesce(sum(units), 0)::float AS units
+              FROM provider_account_reservations WHERE expires_at > now() GROUP BY 1, 2 ORDER BY 1`),
       ]);
+    const purposeBudgets = await purposeBudgetSnapshot();
     const due = queueDue[0] ?? {};
     return res.json({
       generatedAt: new Date().toISOString(),
@@ -117,6 +124,14 @@ router.get("/release-c/status", async (req, res) => {
       reviewMode: reviewMode(),
       // Per-query paging state: complete queries, and ones resuming from an offset next run.
       sourceCheckpoints: checkpoints.map((c) => ({ ...c, last_error: safeError(c.last_error) })),
+      // Cross-worker coordination: shared page fetches / AI extractions, held reservations, per-purpose budgets.
+      orchestration: {
+        durableSharedWork: durableSharedWorkEnabled(),
+        accountingFailClosed: accountingFailClosed(),
+        sharedWork,
+        reservationsHeld: reservations,
+        purposeBudgets,
+      },
       auditLast7Days: audit,
     });
   } catch (error) {

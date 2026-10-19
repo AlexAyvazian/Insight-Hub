@@ -24,6 +24,10 @@ export const RELEASE_C_TABLES = [
   "opportunity_audit_log",
   "remote_extraction_jobs",
   "source_query_checkpoints",
+  "shared_work_results",
+  "provider_account_reservations",
+  "provider_purpose_usage",
+  "provider_pool_cooldowns",
 ] as const;
 
 export const RELEASE_C_DDL: readonly string[] = [
@@ -268,6 +272,46 @@ export const RELEASE_C_DDL: readonly string[] = [
     last_error text,
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (source, query_key)
+  )`,
+  // Page fetches and AI extractions shared across workers and deploys (Opportunities wave 1).
+  `CREATE TABLE IF NOT EXISTS shared_work_results (
+    kind text NOT NULL,
+    work_key text NOT NULL,
+    status text NOT NULL DEFAULT 'running',
+    value jsonb,
+    owner text,
+    lease_until timestamptz,
+    expires_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, work_key)
+  )`,
+  `CREATE INDEX IF NOT EXISTS shared_work_results_expires_idx ON shared_work_results (expires_at)`,
+  // Units planned by in-flight provider calls, held atomically across workers until usage is recorded.
+  `CREATE TABLE IF NOT EXISTS provider_account_reservations (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    units numeric NOT NULL,
+    purpose text,
+    owner text,
+    expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS provider_account_reservations_account_idx ON provider_account_reservations (account_id, expires_at)`,
+  // Daily provider calls per purpose (search, page extraction, OCR, AI evaluation), budgeted separately.
+  `CREATE TABLE IF NOT EXISTS provider_purpose_usage (
+    purpose text NOT NULL,
+    day_key text NOT NULL,
+    calls integer NOT NULL DEFAULT 0,
+    failures integer NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (purpose, day_key)
+  )`,
+  // Provider cooldowns (quota, rate limit, auth) that must survive a restart or redeploy.
+  `CREATE TABLE IF NOT EXISTS provider_pool_cooldowns (
+    pool_provider text PRIMARY KEY,
+    cooldown_until timestamptz NOT NULL,
+    reason text,
+    updated_at timestamptz NOT NULL DEFAULT now()
   )`,
 ];
 

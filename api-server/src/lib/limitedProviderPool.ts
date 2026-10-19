@@ -1,3 +1,8 @@
+import { purposeAllows, purposeForPool, recordPurposeCall } from "./purposeBudget";
+import { rcPool } from "./releaseC/db";
+import { durableSharedWorkEnabled } from "./releaseC/flags";
+import { ensureReleaseCSchema } from "./releaseC/schema";
+
 export interface LimitedProviderAttempt<T> {
   name: string;
   isConfigured: () => Promise<boolean>;
@@ -106,6 +111,52 @@ function cooldownMs(error: unknown): number {
 
 function poolProviderKey(poolId: string, provider: string): string {
   return `${poolId}:${provider}`;
+}
+
+/**
+ * Cooldowns of five minutes or more (quota, rate limit, auth) survive a restart: they are written to
+ * provider_pool_cooldowns and
+ * read back when a pool is first used in a process (and again every minute), so a redeploy does not re-hit a
+ * provider that just refused. Short network cooldowns stay in memory. Only with durable coordination on.
+ */
+const DURABLE_COOLDOWN_MIN_MS = 5 * MINUTE;
+const durableLoadedAt = new Map<string, number>();
+
+async function loadDurableCooldowns(poolId: string): Promise<void> {
+  if (!durableSharedWorkEnabled()) return;
+  const loaded = durableLoadedAt.get(poolId) ?? 0;
+  if (Date.now() - loaded < MINUTE) return;
+  durableLoadedAt.set(poolId, Date.now());
+  try {
+    await ensureReleaseCSchema();
+    const result = await (await rcPool()).query(
+      `SELECT pool_provider, cooldown_until, reason FROM provider_pool_cooldowns
+        WHERE pool_provider LIKE $1 AND cooldown_until > now()`,
+      [`${poolId.replace(/[\\%_]/g, "\\$&")}:%`],
+    );
+    for (const row of result.rows as Array<{ pool_provider: string; cooldown_until: Date | string; reason: string | null }>) {
+      const until = new Date(row.cooldown_until).getTime();
+      if (Number.isFinite(until) && (cooldowns.get(row.pool_provider)?.until ?? 0) < until) {
+        cooldowns.set(row.pool_provider, { until, reason: row.reason ?? "durable cooldown" });
+      }
+    }
+  } catch {
+    // Memory cooldowns still apply.
+  }
+}
+
+async function persistDurableCooldown(key: string, entry: CooldownEntry): Promise<void> {
+  if (!durableSharedWorkEnabled() || entry.until - Date.now() < DURABLE_COOLDOWN_MIN_MS) return;
+  try {
+    await ensureReleaseCSchema();
+    await (await rcPool()).query(
+      `INSERT INTO provider_pool_cooldowns (pool_provider, cooldown_until, reason, updated_at) VALUES ($1, $2, $3, now())
+       ON CONFLICT (pool_provider) DO UPDATE SET cooldown_until = EXCLUDED.cooldown_until, reason = EXCLUDED.reason, updated_at = now()`,
+      [key, new Date(entry.until).toISOString(), entry.reason.slice(0, 200)],
+    );
+  } catch {
+    // Best effort.
+  }
 }
 
 function rotated<T>(items: T[], start: number): T[] {
@@ -272,6 +323,8 @@ export async function runLimitedProviderPool<T>(
 ): Promise<LimitedProviderPoolResult<T>> {
   pruneRuntimeState();
   throwIfAborted(options.signal);
+  await loadDurableCooldowns(poolId);
+  const purpose = purposeForPool(poolId);
 
   const configured: LimitedProviderAttempt<T>[] = [];
   const encounteredErrors: string[] = [];
@@ -340,6 +393,15 @@ export async function runLimitedProviderPool<T>(
         : remaining;
     }
 
+    if (purpose) {
+      const allowed = await purposeAllows(purpose);
+      if (!allowed.ok) {
+        encounteredErrors.push(allowed.reason);
+        budgetReached = true;
+        break;
+      }
+    }
+
     attempted.push(attempt.name);
     if (window) window.attempts += 1;
 
@@ -351,6 +413,7 @@ export async function runLimitedProviderPool<T>(
         options.signal,
       );
       throwIfAborted(options.signal);
+      if (purpose) recordPurposeCall(purpose, "success");
       if (!isUseful(value)) {
         encounteredErrors.push(`${attempt.name} returned no usable result`);
         continue;
@@ -379,13 +442,13 @@ export async function runLimitedProviderPool<T>(
       };
     } catch (error) {
       if (options.signal?.aborted) throw abortReason(options.signal);
+      if (purpose) recordPurposeCall(purpose, "failure");
       const message = errorText(error);
+      const entry = { until: Date.now() + cooldownMs(error), reason: message };
       cooldowns.delete(key);
-      cooldowns.set(key, {
-        until: Date.now() + cooldownMs(error),
-        reason: message,
-      });
+      cooldowns.set(key, entry);
       trimOldest(cooldowns, MAX_COOLDOWN_ENTRIES);
+      void persistDurableCooldown(key, entry);
       encounteredErrors.push(`${attempt.name}: ${message}`);
     }
   }
@@ -408,6 +471,7 @@ export async function runLimitedProviderPool<T>(
 
 export function clearLimitedProviderPoolState(): void {
   cooldowns.clear();
+  durableLoadedAt.clear();
   cursors.clear();
   poolWindows.clear();
 }
