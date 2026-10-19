@@ -29,6 +29,7 @@ export const RELEASE_C_TABLES = [
   "provider_purpose_usage",
   "provider_pool_cooldowns",
   "opportunity_versions",
+  "opportunity_decisions",
 ] as const;
 
 export const RELEASE_C_DDL: readonly string[] = [
@@ -332,6 +333,36 @@ export const RELEASE_C_DDL: readonly string[] = [
     observed_at timestamptz NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS idx_opportunity_versions_opportunity ON opportunity_versions (opportunity_id, observed_at DESC)`,
+  // One authoritative, versioned decision per opportunity (Opportunities wave 4, see decisionRecord.ts).
+  `CREATE TABLE IF NOT EXISTS opportunity_decisions (
+    opportunity_key text PRIMARY KEY,
+    decision_version integer NOT NULL DEFAULT 1,
+    evaluator_version text NOT NULL,
+    inputs_hash text NOT NULL,
+    pending_inputs_hash text,
+    profile_version text,
+    notice_fingerprint text,
+    state text NOT NULL,
+    outcome text NOT NULL,
+    settled boolean NOT NULL DEFAULT true,
+    method text,
+    hold_code text,
+    score double precision,
+    reason text,
+    primary_scope jsonb,
+    citations jsonb,
+    escalation text,
+    reviewers jsonb NOT NULL DEFAULT '[]'::jsonb,
+    families jsonb NOT NULL DEFAULT '[]'::jsonb,
+    record jsonb,
+    provider text,
+    stale boolean NOT NULL DEFAULT false,
+    stale_reason text,
+    stale_at timestamptz,
+    decided_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_opportunity_decisions_profile ON opportunity_decisions (profile_version) WHERE stale = false`,
 ];
 
 type Runner = (statement: string) => Promise<unknown>;

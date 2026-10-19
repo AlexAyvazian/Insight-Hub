@@ -968,9 +968,13 @@ async function fetchReviewQueue(options: ProviderRunnerOptions): Promise<Provide
   await import("../search/occumedSearchProfile")
     .then((module) => module.getOccuMedSearchProfile())
     .catch(() => undefined);
+  // Decisions made under an earlier OCCU_MED_AWARE version are stale: they re-enter the queue before it is claimed.
+  const { reopenDecisionsForProfile } = await import("../releaseC/decisionRecord");
+  const { getRelevanceProfile } = await import("../search/relevanceProfile");
+  const reopenedForProfile = await reopenDecisionsForProfile(getRelevanceProfile().version).catch(() => 0);
   const items = await claimDueItems(REVIEW_QUEUE_CLAIM_LIMIT);
   if (items.length === 0) {
-    return { records: [], approvedCount: 0, errors: [], diagnostics: { reviewQueueClaimed: 0 } };
+    return { records: [], approvedCount: 0, errors: [], diagnostics: { reviewQueueClaimed: 0, reopenedForProfile } };
   }
   const { decideStructuredOpportunities } = await import("../search/structuredOpportunityDecision");
   const decided = await decideStructuredOpportunities(
@@ -1047,6 +1051,7 @@ async function fetchReviewQueue(options: ProviderRunnerOptions): Promise<Provide
     errors: decided.review.stopReason === "no_reviewer_configured" ? ["No AI reviewer is configured; queued records stay queued."] : [],
     diagnostics: {
       reviewQueueClaimed: items.length,
+      reopenedForProfile,
       structuredApproved: decided.approved.length,
       structuredReviewHeld: decided.reviewHeld,
       structuredReview: decided.review,

@@ -2,6 +2,7 @@ import type { NormalizedOpportunity } from "../providers/types";
 import { classifyProviderRecordRelevance } from "../providers/providerQueryMatch";
 import { getOccuMedPromptContext, renderPromptContext } from "./occumedPromptContext";
 import { hasPrimaryOccuMedServiceEvidence } from "../opportunityScopeEvidence";
+import { primaryPurchasedScopeCitation, type PrimaryScopeCitation } from "./primaryPurchasedScope";
 import { decideRelevance } from "./relevanceDecision";
 import { getRelevanceProfile } from "./relevanceProfile";
 import { opportunityDescriptionContext } from "./opportunityDescriptionContext";
@@ -23,7 +24,7 @@ import {
   recordProviderFailure,
   recordProviderSuccess,
 } from "../providerBudget";
-import { releaseCFlags, reviewMode, type ReviewMode } from "../releaseC/flags";
+import { citationCheckEnforced, releaseCFlags, reviewMode, type ReviewMode } from "../releaseC/flags";
 import { judgmentContentHash, opportunityKey, providerModelFamily } from "../releaseC/identity";
 import { isCurrentlyExtracted } from "../documents/types";
 import { cachedQueueDecisions, closeQueuedByKeys, enqueueForReview, reviewPriority, settleByKey, type CachedQueueDecision } from "../releaseC/reviewQueue";
@@ -34,7 +35,18 @@ import {
   withDocumentEvidence,
   type DocumentContext,
 } from "../releaseC/documentEvidence";
-import { buildLedger, ledgerSummary, saveLedger, type Ledger } from "../releaseC/requirements";
+import { buildLedger, ledgerSummary, saveLedger, type EvidenceSection, type Ledger } from "../releaseC/requirements";
+import {
+  DECISION_EVALUATOR_VERSION,
+  decisionStateFor,
+  noticeFingerprint,
+  saveDecisions,
+  validateCitations,
+  type CitationCheck,
+  type DecisionCitation,
+  type DecisionRecordInput,
+  type DecisionState,
+} from "../releaseC/decisionRecord";
 import { fenceUntrustedText, neutraliseUntrustedText, UNTRUSTED_EVIDENCE_RULE } from "../security/untrustedContent";
 
 export interface ReviewProvider {
@@ -60,7 +72,9 @@ export type StructuredHoldCode =
   /** OPPORTUNITY_REQUIRE_DOCUMENT_EVIDENCE: documents not yet read. */
   | "structured_document_pending"
   /** The evaluator abstained: the evidence given was not enough to decide. Needs a person or more documents. */
-  | "structured_review_abstained";
+  | "structured_review_abstained"
+  /** The approval rested only on citations that do not exist in the notice or the stored document sections. */
+  | "structured_evidence_unverified";
 
 export interface StructuredHeldRecord {
   record: NormalizedOpportunity;
@@ -82,6 +96,8 @@ export interface StructuredOpportunityDecisionResult {
   diagnostics: string[];
   /** Content hash each decided opportunity was judged on (by opportunity key). */
   contentHashes: Map<string, string>;
+  /** The authoritative decision of this call per opportunity key (what is stored in opportunity_decisions). */
+  decisions: Map<string, Omit<DecisionRecordInput, "record">>;
   /** Adaptive review accounting for this call. */
   review: {
     candidates: number;
@@ -102,6 +118,8 @@ export interface ReviewVote {
   reason: string;
   /** The judge declined to decide (insufficient evidence). Never counted as a yes or a no. */
   abstain?: boolean;
+  /** Passages the judge cites for the primary purchased scope; checked against the stored text before they count. */
+  evidence?: DecisionCitation[];
 }
 
 export { reviewMode, type ReviewMode } from "../releaseC/flags";
@@ -165,6 +183,40 @@ function withDecision(
       ),
     },
   };
+}
+
+/** What one decision call settles for one opportunity; decide() turns it into the stored decision record. */
+interface DecisionFields {
+  outcome: "approved" | "held" | "rejected";
+  settled: boolean;
+  method: string | null;
+  holdCode: string | null;
+  score: number | null;
+  reason: string;
+  primaryScope: PrimaryScopeCitation;
+  citations?: CitationCheck;
+  escalation?: EscalationConflict | null;
+  reviewers?: string[];
+  families?: string[];
+  evaluatorRejected?: boolean;
+  documentsPartial?: boolean;
+  /** rules (deterministic) or the AI review mode that produced it. */
+  evaluator: "rules" | ReviewMode;
+}
+
+const RULES_REJECTION = {
+  outcome: "rejected",
+  settled: true,
+  method: "rules",
+  holdCode: "structured_relevance_reject",
+  score: null,
+  evaluator: "rules",
+} as const;
+
+/** The stored reason names the primary purchased scope first, so an approval never rests on an incidental mention. */
+function citeScope(scope: PrimaryScopeCitation, reason: string): string {
+  if (!scope.evidenced || scope.terms.length === 0) return reason;
+  return `Primary purchased scope (${scope.source}): ${scope.terms.slice(0, 4).join(", ")}. ${reason}`.trim();
 }
 
 function hasFutureDeadline(record: NormalizedOpportunity, now = Date.now()): boolean {
@@ -253,7 +305,27 @@ export function parseReviewVotes(text: string): ReviewVote[] | null {
           ? "The purchased scope is an active Occu-Med-compatible procurement."
           : "The record lacks sufficient active Occu-Med procurement evidence.";
     const abstain = object.isOpportunity === null || object.abstain === true || object.decision === "needs_review";
-    return [{ index, isOpportunity: object.isOpportunity === true && !abstain, relevanceScore, reason, ...(abstain ? { abstain: true } : {}) }];
+    const evidence = parseCitations(object.evidence);
+    return [{
+      index,
+      isOpportunity: object.isOpportunity === true && !abstain,
+      relevanceScore,
+      reason,
+      ...(abstain ? { abstain: true } : {}),
+      ...(evidence.length > 0 ? { evidence } : {}),
+    }];
+  });
+}
+
+function parseCitations(value: unknown): DecisionCitation[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 5).flatMap((item) => {
+    if (typeof item === "string") return item.trim() ? [{ section: null, quote: item.trim().slice(0, 600) }] : [];
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    const quote = typeof row.quote === "string" ? row.quote.trim().slice(0, 600) : "";
+    const section = typeof row.section === "string" && row.section.trim() ? row.section.trim().slice(0, 200) : null;
+    return quote ? [{ section, quote }] : [];
   });
 }
 
@@ -345,8 +417,10 @@ ${scoreGuidance()}
 
 If the evidence given is not enough to decide (for example the purchased scope depends on a statement of work that is not included), abstain with "isOpportunity": null and say what is missing. Do not guess, and never treat a requirement as met when the text does not show it.
 
+For an approval, cite in "evidence" up to 3 passages that state the PRIMARY purchased service: each an exact quote (copied word for word, at most 200 characters) with "section" set to the bracketed document citation it comes from, or "notice" for the description. Do not cite incidental mentions, boilerplate or clauses. Citations are checked against the stored text; an approval resting only on citations that are not found there is not accepted.
+
 Judge independently. Do not assume another model will correct you. Return only JSON in this shape and exactly one row per item:
-{"results":[{"index":0,"isOpportunity":true,"relevanceScore":86,"reason":"Core scope purchases ${profileServiceLabels()[0] ?? "a listed service"}; deadline is open."}]}
+{"results":[{"index":0,"isOpportunity":true,"relevanceScore":86,"reason":"Core scope purchases ${profileServiceLabels()[0] ?? "a listed service"}; deadline is open.","evidence":[{"section":"notice","quote":"exact words from the text"}]}]}
 
 ITEMS:
 ${items}`;
@@ -370,15 +444,33 @@ function recordResolved(rows: Array<{ provider: string; vote: ReviewVote }>): bo
   return yes >= PANEL_CONSENSUS || no >= PANEL_CONSENSUS;
 }
 
+export type EscalationConflict =
+  | "evaluator_rejects_rule_accept"
+  | "evaluator_approves_against_documents"
+  | "evaluator_approves_component_or_supply_scope"
+  | "evaluator_approves_without_primary_scope";
+
+/** The deterministic and document evidence a single evaluator's vote is checked against. */
+export interface EscalationEvidence {
+  verdict: "accept" | "review" | "reject";
+  primaryScope: PrimaryScopeCitation;
+  /** Document statements exclude or delete an Occu-Med service (documentEvidence.contradictingStatements). */
+  documentContradiction: boolean;
+}
+
 /**
- * Single-evaluator mode: does this record need a second family's opinion? Only when the one evaluator contradicts
- * the deterministic evidence: it rejects a record the rules accept, or approves one without primary-scope evidence.
+ * Single-evaluator mode: does this vote need a second family's opinion? Only on a genuine conflict with the evidence:
+ * the evaluator rejects a record the rules accept, or approves one the documents contradict, whose primary purchased
+ * scope is component-only / supply-only, or that has no primary-scope evidence at all. An abstention is never a
+ * conflict (it settles as needs_review), and an approval that agrees with the evidence is never escalated.
  */
-function needsSecondOpinion(candidate: Candidate, vote: ReviewVote): boolean {
-  if (vote.abstain) return false;
-  if (!vote.isOpportunity) return candidate.verdict === "accept";
-  const { record } = candidate;
-  return !hasPrimaryOccuMedServiceEvidence(record.title ?? "", `${record.description ?? ""}\n\n${documentEvidenceText(record)}`);
+export function escalationConflict(evidence: EscalationEvidence, vote: ReviewVote): EscalationConflict | null {
+  if (vote.abstain) return null;
+  if (!vote.isOpportunity) return evidence.verdict === "accept" ? "evaluator_rejects_rule_accept" : null;
+  if (evidence.documentContradiction) return "evaluator_approves_against_documents";
+  if (evidence.primaryScope.kind !== "service") return "evaluator_approves_component_or_supply_scope";
+  if (!evidence.primaryScope.evidenced) return "evaluator_approves_without_primary_scope";
+  return null;
 }
 
 function singleResolved(candidate: Candidate, rows: Array<{ provider: string; vote: ReviewVote }>): boolean {
@@ -386,7 +478,24 @@ function singleResolved(candidate: Candidate, rows: Array<{ provider: string; vo
   if (recordResolved(rows)) return true;
   const decisive = rows.filter((row) => !row.vote.abstain);
   if (decisive.length === 0) return true; // abstained: settled as needing review
-  return decisive.length === 1 && !needsSecondOpinion(candidate, decisive[0]!.vote);
+  return decisive.length === 1 && !escalationConflict(candidate, decisive[0]!.vote);
+}
+
+/** A vote's citations checked against the candidate's notice text and stored document sections. */
+function checkVoteCitations(candidate: Candidate, vote: ReviewVote): CitationCheck {
+  return validateCitations(vote.evidence, {
+    sections: candidate.sections,
+    noticeText: `${candidate.record.title ?? ""}\n${candidate.record.description ?? ""}`,
+  });
+}
+
+/** A yes that cited passages, none of which exist in the stored text: it relied only on invalid citations. */
+function unverifiedApproval(check: CitationCheck): boolean {
+  return check.dropped.length > 0 && check.valid.length === 0;
+}
+
+function mergeChecks(checks: CitationCheck[]): CitationCheck {
+  return { valid: checks.flatMap((c) => c.valid), dropped: checks.flatMap((c) => c.dropped) };
 }
 
 interface Judge {
@@ -445,11 +554,25 @@ interface Candidate {
   injectionSignals: number;
   verdict: "accept" | "review" | "reject";
   ledger: Ledger | null;
+  primaryScope: PrimaryScopeCitation;
+  documentContradiction: boolean;
+  /** Stored document sections evaluator citations are checked against. */
+  sections: EvidenceSection[];
+  /** Documents are registered but not all read (or some attachments are not registered yet). */
+  documentsPartial: boolean;
+}
+
+/** Decision provenance carried by an outcome into the stored decision. */
+interface OutcomeEvidence {
+  citations?: CitationCheck;
+  escalation?: EscalationConflict | null;
+  /** The evaluator(s) answered "not an opportunity". */
+  evaluatorRejected?: boolean;
 }
 
 type Outcome =
-  | { kind: "approved"; method: DecisionMethod; score: number; reason: string; reviewers: string[]; families: string[] }
-  | { kind: "held"; code: StructuredHoldCode; reason: string; decided: boolean; retryAt?: Date | null; votes?: FamilyVote[] };
+  | ({ kind: "approved"; method: DecisionMethod; score: number; reason: string; reviewers: string[]; families: string[] } & OutcomeEvidence)
+  | ({ kind: "held"; code: StructuredHoldCode; reason: string; decided: boolean; retryAt?: Date | null; votes?: FamilyVote[] } & OutcomeEvidence);
 
 function isReusableOutcome(value: unknown): value is Outcome {
   if (!value || typeof value !== "object") return false;
@@ -565,6 +688,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
   }
 
   const { acceptMin } = getRelevanceProfile().thresholds;
+  const enforceCitations = citationCheckEnforced();
   batch.forEach((candidate, index) => {
     const rows = votes.get(index) ?? [];
     const byFamily = new Map(rows.map((row) => [row.family, row] as const));
@@ -572,6 +696,20 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
     const distinct = voted.filter((row) => !row.vote.abstain);
     const positive = distinct.filter((row) => row.vote.isOpportunity);
     const negative = distinct.filter((row) => !row.vote.isOpportunity);
+    // Why a second family was (or is to be) asked in single mode: the first evaluator's conflict with the evidence.
+    const escalation = mode === "single" && distinct.length > 0 ? escalationConflict(candidate, distinct[0]!.vote) : null;
+    const checks = new Map(positive.map((row) => [row.family, checkVoteCitations(candidate, row.vote)] as const));
+    // A yes whose every citation is invalid does not count towards an approval.
+    const verified = positive.filter((row) => !(enforceCitations && unverifiedApproval(checks.get(row.family)!)));
+    const citations = mergeChecks([...checks.values()]);
+    const unverifiedHold = (detail: string): Outcome => ({
+      kind: "held",
+      code: "structured_evidence_unverified",
+      reason: `${detail} None of the cited passages exist in the notice or the stored document sections (${citations.dropped.length} dropped); held for review.`.slice(0, 480),
+      decided: true,
+      citations,
+      escalation,
+    });
     if (voted.length === 0) {
       run.outcomes.set(index, { kind: "held", code: "structured_review_failed", reason: `AI review unavailable for this record. ${candidate.reason}`.trim(), decided: false });
       return;
@@ -581,9 +719,13 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
       run.outcomes.set(index, { kind: "held", code: "structured_review_abstained", reason: `The evaluator could not decide from the evidence: ${voted[0]!.vote.reason}`.slice(0, 480), decided: true });
       return;
     }
-    if (mode === "single" && distinct.length === 1 && !needsSecondOpinion(candidate, distinct[0]!.vote)) {
+    if (mode === "single" && distinct.length === 1 && !escalation) {
       const only = distinct[0]!;
       if (only.vote.isOpportunity && only.vote.relevanceScore >= acceptMin) {
+        if (verified.length === 0) {
+          run.outcomes.set(index, unverifiedHold("The evaluator's approval rested on its citations."));
+          return;
+        }
         run.outcomes.set(index, {
           kind: "approved",
           method: "single-ai-review",
@@ -591,6 +733,8 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
           reason: only.vote.reason,
           reviewers: [only.provider],
           families: [only.family],
+          citations,
+          escalation: null,
         });
       } else {
         run.outcomes.set(index, {
@@ -600,6 +744,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
             ? `The evaluator's score ${only.vote.relevanceScore} is below accept_min ${acceptMin}.`
             : `AI review did not confirm purchased scope: ${only.vote.reason}`).slice(0, 480),
           decided: true,
+          evaluatorRejected: !only.vote.isOpportunity,
         });
       }
       return;
@@ -608,6 +753,10 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
       const score = Math.round(positive.reduce((sum, row) => sum + row.vote.relevanceScore, 0) / positive.length);
       // Adjudication: a tie-breaking third family settles a 1-1 split by majority (2-1).
       if (score >= acceptMin && positive.length > negative.length) {
+        if (verified.length < PANEL_CONSENSUS) {
+          run.outcomes.set(index, unverifiedHold("The approving judges' agreement rested on their citations."));
+          return;
+        }
         run.outcomes.set(index, {
           kind: "approved",
           method: "panel-ai-review",
@@ -615,22 +764,28 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
           reason: positive.map((row) => row.vote.reason).slice(0, 2).join(" | "),
           reviewers: positive.map((row) => row.provider),
           families: positive.map((row) => row.family),
+          citations,
+          escalation,
         });
         return;
       }
       if (negative.length >= positive.length) {
-        run.outcomes.set(index, { kind: "held", votes: distinct, code: "structured_review_disputed", reason: `Judges disagree (${positive.length} yes / ${negative.length} no). ${candidate.reason}`.trim(), decided: false });
+        run.outcomes.set(index, { kind: "held", votes: distinct, code: "structured_review_disputed", reason: `Judges disagree (${positive.length} yes / ${negative.length} no). ${candidate.reason}`.trim(), decided: false, escalation });
         return;
       }
-      run.outcomes.set(index, { kind: "held", code: "structured_review_declined", reason: `Judges agree on scope but the consensus score ${score} is below accept_min ${acceptMin}.`, decided: true });
+      run.outcomes.set(index, { kind: "held", code: "structured_review_declined", reason: `Judges agree on scope but the consensus score ${score} is below accept_min ${acceptMin}.`, decided: true, escalation });
       return;
     }
     if (negative.length >= PANEL_CONSENSUS) {
-      run.outcomes.set(index, { kind: "held", code: "structured_review_declined", reason: `AI review did not confirm purchased scope: ${negative[0]!.vote.reason}`.slice(0, 480), decided: true });
+      run.outcomes.set(index, { kind: "held", code: "structured_review_declined", reason: `AI review did not confirm purchased scope: ${negative[0]!.vote.reason}`.slice(0, 480), decided: true, evaluatorRejected: true, escalation });
       return;
     }
     // A single family can only confirm a record the canonical rules already accept, at the accept threshold.
     if (distinct.length === 1 && positive.length === 1 && candidate.verdict === "accept" && positive[0]!.vote.relevanceScore >= acceptMin) {
+      if (verified.length === 0) {
+        run.outcomes.set(index, unverifiedHold("The evaluator's approval rested on its citations."));
+        return;
+      }
       run.outcomes.set(index, {
         kind: "approved",
         method: "single-ai-review",
@@ -638,6 +793,8 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
         reason: positive[0]!.vote.reason,
         reviewers: [positive[0]!.provider],
         families: [positive[0]!.family],
+        citations,
+        escalation,
       });
       return;
     }
@@ -650,6 +807,7 @@ async function reviewBatch(batch: Candidate[], judges: Judge[], profileContext: 
           ? `Judges from different model families disagree; queued for another family. ${candidate.reason}`.trim()
           : `Only one independent model family reviewed this record; queued for a second. ${candidate.reason}`.trim(),
       decided: false,
+      escalation,
     });
   });
   return run;
@@ -703,6 +861,54 @@ export async function decideStructuredOpportunities(
   let deterministicApproved = 0;
   // Opportunities decided outside AI review in this run; any older queue row for them is closed below.
   const settledOutsideReview = new Map<string, { hash: string; decision: Record<string, unknown>; reason: string }>();
+  // The one authoritative decision per opportunity of this call (stored in opportunity_decisions when persisting).
+  const decisions = new Map<string, DecisionRecordInput>();
+  const decide = (record: NormalizedOpportunity, key: string, hash: string, fields: DecisionFields): NormalizedOpportunity => {
+    const state = decisionStateFor({
+      outcome: fields.outcome,
+      holdCode: fields.holdCode,
+      evaluatorRejected: fields.evaluatorRejected,
+      responseDeadline: record.responseDeadline ?? null,
+      documentsPartial: fields.documentsPartial,
+      evidenceBacked: fields.primaryScope.evidenced || (fields.citations?.valid.length ?? 0) > 0,
+      now,
+    });
+    const evaluatorVersion = `${DECISION_EVALUATOR_VERSION}/${fields.evaluator}`;
+    decisions.set(key, {
+      opportunityKey: key,
+      provider: options.provider ?? record.source ?? "structured",
+      inputsHash: hash,
+      profileVersion: profile.version,
+      evaluatorVersion,
+      noticeFingerprint: noticeFingerprint(record.title, record.description),
+      state,
+      outcome: fields.outcome,
+      settled: fields.settled,
+      method: fields.method,
+      holdCode: fields.holdCode,
+      score: fields.score,
+      reason: fields.reason,
+      primaryScope: fields.primaryScope,
+      citations: fields.citations ?? null,
+      escalation: fields.escalation ?? null,
+      reviewers: fields.reviewers ?? [],
+      families: fields.families ?? [],
+      record: fields.outcome === "rejected" ? null : record,
+      expectedHash: options.claimedHashes?.get(key) ?? null,
+    });
+    return {
+      ...record,
+      rawData: {
+        ...(record.rawData ?? {}),
+        opportunityDecisionState: state,
+        opportunityDecisionEvaluator: evaluatorVersion,
+        opportunityDecisionInputsHash: hash,
+        opportunityPrimaryScope: fields.primaryScope,
+        ...(fields.citations?.valid.length ? { opportunityDecisionCitations: fields.citations.valid } : {}),
+        ...(fields.escalation ? { opportunityDecisionEscalation: fields.escalation } : {}),
+      },
+    };
+  };
 
   for (const original of records) {
     const baseRelevance = classifyProviderRecordRelevance(original);
@@ -714,9 +920,15 @@ export async function decideStructuredOpportunities(
       !(baseRelevance.confidence === "rejected" && baseRelevance.negativeSignals.length > 0);
     if (decideRelevance(baseRelevance).verdict === "reject" && !(flags.documentPipeline && thinButSignalled)) {
       rejected += 1;
-      rejectedRecords.push(original);
-      settledOutsideReview.set(opportunityKey(original), {
-        hash: judgmentContentHash(original, { documentHashes: [], profileVersion: profile.version }),
+      const rejectedKey = opportunityKey(original);
+      const rejectedHash = judgmentContentHash(original, { documentHashes: [], profileVersion: profile.version });
+      rejectedRecords.push(decide(original, rejectedKey, rejectedHash, {
+        ...RULES_REJECTION,
+        reason: "Rejected by relevance rules on the current notice.",
+        primaryScope: primaryPurchasedScopeCitation(baseRelevance, { title: original.title, description: original.description }),
+      }));
+      settledOutsideReview.set(rejectedKey, {
+        hash: rejectedHash,
         decision: { kind: "rejected", code: "structured_relevance_reject" },
         reason: "Rejected by relevance rules on the current notice.",
       });
@@ -730,18 +942,33 @@ export async function decideStructuredOpportunities(
       if (documents.error) storageFailed(diagnostics, new Error(documents.error));
     }
     const record = documents ? withDocumentEvidence(original, documents) : original;
-    const { result: relevance } = classifyWithDocumentEvidence(record);
+    const { result: relevance, contradictions } = classifyWithDocumentEvidence(record);
     const verdict = decideRelevance(relevance).verdict;
+    // What is being bought, cited from the primary-scope evidence only (never an incidental mention).
+    const primaryScope = primaryPurchasedScopeCitation(relevance, {
+      title: record.title,
+      description: record.description,
+      documents: documentEvidenceText(record),
+    });
     if (verdict === "reject") {
       rejected += 1;
-      rejectedRecords.push(record);
+      const rejectedHash = judgmentContentHash(original, { documentHashes: documents?.documentHashes ?? [], profileVersion: profile.version });
+      rejectedRecords.push(decide(record, key, rejectedHash, {
+        ...RULES_REJECTION,
+        reason: "Rejected by relevance rules on the current notice and documents.",
+        primaryScope,
+      }));
       settledOutsideReview.set(key, {
-        hash: judgmentContentHash(original, { documentHashes: documents?.documentHashes ?? [], profileVersion: profile.version }),
+        hash: rejectedHash,
         decision: { kind: "rejected", code: "structured_relevance_reject" },
         reason: "Rejected by relevance rules on the current notice and documents.",
       });
       continue;
     }
+    const documentsPartial = Boolean(
+      documents?.available &&
+        (documents.documents.some((d) => !isCurrentlyExtracted(d)) || documents.attachmentsNotRegistered > 0),
+    );
 
     let ledger: Ledger | null = null;
     let withLedger = record;
@@ -764,19 +991,30 @@ export async function decideStructuredOpportunities(
       await saveLedger(key, hash, ledger).catch((error) => storageFailed(diagnostics, error));
     }
 
+    const evidence = { primaryScope, documentContradiction: contradictions.length > 0, sections: documents?.sections ?? [], documentsPartial };
+
     if (documentsIncomplete) {
       const pending = documents?.documents.filter((d) => !isCurrentlyExtracted(d)).length ?? 0;
-      candidates.push({ record: withLedger, key, hash, score: relevance.score, reason, priority, injectionSignals: 0, verdict, ledger });
+      candidates.push({ record: withLedger, key, hash, score: relevance.score, reason, priority, injectionSignals: 0, verdict, ledger, ...evidence });
+      const holdReason = `Held for document verification: ${pending || "no"} official document(s) ${pending ? "still being read" : "found yet"}. ${reason}`.trim();
       held.push({
-        record: withLedger,
+        record: decide(withLedger, key, hash, {
+          outcome: "held", settled: false, method: null, holdCode: "structured_document_pending", score: relevance.score,
+          reason: holdReason, primaryScope, documentsPartial: true, evaluator: mode,
+        }),
         code: "structured_document_pending",
-        reason: `Held for document verification: ${pending || "no"} official document(s) ${pending ? "still being read" : "found yet"}. ${reason}`.trim(),
+        reason: holdReason,
       });
       continue;
     }
 
     if (!excluded && isDeterministicallyActionable(withLedger, now)) {
-      approved.push(withDecision(withLedger, "deterministic", relevance.score, reason || "Explicit Occu-Med service scope with a future response deadline."));
+      const approvedReason = reason || "Explicit Occu-Med service scope with a future response deadline.";
+      const stamped = decide(withLedger, key, hash, {
+        outcome: "approved", settled: true, method: "deterministic", holdCode: null, score: relevance.score,
+        reason: citeScope(primaryScope, approvedReason), primaryScope, documentsPartial, evaluator: "rules",
+      });
+      approved.push(withDecision(stamped, "deterministic", relevance.score, approvedReason));
       deterministicApproved += 1;
       settledOutsideReview.set(key, { hash, decision: { kind: "approved", method: "deterministic" }, reason: "Approved deterministically on the current notice." });
       continue;
@@ -792,6 +1030,7 @@ export async function decideStructuredOpportunities(
       injectionSignals: documentInjectionSignals(withLedger),
       verdict,
       ledger,
+      ...evidence,
     });
   }
 
@@ -913,11 +1152,27 @@ export async function decideStructuredOpportunities(
   for (const candidate of reviewable) {
     const outcome = outcomes.get(candidate.key);
     if (!outcome) continue;
+    const shared = {
+      primaryScope: candidate.primaryScope,
+      documentsPartial: candidate.documentsPartial,
+      citations: outcome.citations,
+      escalation: outcome.escalation ?? null,
+      evaluator: mode,
+    };
     if (outcome.kind === "approved") {
-      approved.push(withDecision(candidate.record, outcome.method, outcome.score, outcome.reason, outcome.reviewers, outcome.families));
+      const stamped = decide(candidate.record, candidate.key, candidate.hash, {
+        ...shared, outcome: "approved", settled: true, method: outcome.method, holdCode: null, score: outcome.score,
+        reason: citeScope(candidate.primaryScope, outcome.reason), reviewers: outcome.reviewers, families: outcome.families,
+      });
+      approved.push(withDecision(stamped, outcome.method, outcome.score, outcome.reason, outcome.reviewers, outcome.families));
       aiApproved += 1;
     } else {
-      held.push({ record: candidate.record, code: outcome.code, reason: outcome.reason });
+      const stamped = decide(candidate.record, candidate.key, candidate.hash, {
+        ...shared, outcome: "held", settled: outcome.decided, method: null, holdCode: outcome.code, score: candidate.score,
+        reason: outcome.reason, evaluatorRejected: outcome.evaluatorRejected,
+        reviewers: outcome.votes?.map((row) => row.provider), families: outcome.votes?.map((row) => row.family),
+      });
+      held.push({ record: stamped, code: outcome.code, reason: outcome.reason });
     }
   }
 
@@ -986,6 +1241,11 @@ export async function decideStructuredOpportunities(
     }
   }
 
+  // The authoritative decision record: one versioned row per opportunity; new inputs supersede or mark it stale.
+  if (storageAvailable(persist) && decisions.size > 0) {
+    await saveDecisions([...decisions.values()]).catch((error) => storageFailed(diagnostics, error));
+  }
+
   return {
     approved,
     held,
@@ -1000,6 +1260,7 @@ export async function decideStructuredOpportunities(
       ...[...settledOutsideReview].map(([key, settled]) => [key, settled.hash] as [string, string]),
       ...candidates.map((candidate) => [candidate.key, candidate.hash] as [string, string]),
     ]),
+    decisions: new Map([...decisions].map(([key, { record: _record, ...decision }]) => [key, decision])),
     review: {
       candidates: reviewable.length,
       reviewed,

@@ -13,6 +13,13 @@ import {
   type OpportunityViewMode,
 } from "../lib/opportunityQuality";
 import { contextualAdjustments } from "../lib/learning/contextualFeedback";
+import type { AuthoritativeDecisionView, StoredDecision } from "../lib/releaseC/decisionRecord";
+import {
+  loadStoredDecisionsForRows,
+  readTimeDecision,
+  verdictForState,
+  type ReadTimeDecision,
+} from "../lib/releaseC/readTimeDecision";
 import {
   opportunityListErrorDetail,
   opportunityListSelection,
@@ -51,11 +58,15 @@ interface RankedEntry {
   suppressed: boolean;
   /** Providers whose records collapsed into this canonical notice (provenance). */
   sources: string[];
+  /** The row's stored decision as applied at read time. */
+  decision: ReadTimeDecision;
 }
 
 function rankingScanSelection(table: typeof opportunitiesTable) {
   return {
     ...opportunityListSelection(table),
+    // With noticeId, maps the row to its stored decision (releaseC/identity.opportunityKeyForRow).
+    providerKey: table.providerKey,
     description: sql<string | null>`left(${table.description}, ${RANKING_DESCRIPTION_CHARS})`,
     descriptionTruncated: sql<boolean>`coalesce(length(${table.description}) > ${RANKING_DESCRIPTION_CHARS}, false)`,
   };
@@ -136,10 +147,21 @@ function sourceAuthority(provider: unknown): {
   return { label: "other", bonus: 0 };
 }
 
+/**
+ * Quality for a stored row with its stored decision applied: the listing-text classification first, then, when a
+ * current stored decision is authoritative, the quality with that decision in place of the text relevance.
+ */
+function qualityWithDecision(row: Record<string, any>, stored: StoredDecision | undefined) {
+  const base = classifyOpportunityQuality(row);
+  const decision = readTimeDecision(row, stored, base.relevanceEligible);
+  return { quality: decision.override ? classifyOpportunityQuality(row, new Date(), decision.override) : base, decision };
+}
+
 function relevanceView(
   opp: Record<string, any>,
   contextualAdjustment = 0,
   quality: OpportunityQualityView = classifyOpportunityQuality(opp),
+  stored: AuthoritativeDecisionView | null = null,
 ) {
   const classification = classifyResult({
     title: opp.title,
@@ -160,13 +182,17 @@ function relevanceView(
   });
   const tags = parseTags(opp.tags);
   // The visible score and verdict follow the authoritative quality decision: without purchased-scope evidence the
-  // score is capped and an "accept" is shown as "review", whatever the classifier or a stored score says.
+  // score is capped and an "accept" is shown as "review", whatever the classifier or a stored score says. A current
+  // stored decision (releaseC/decisionRecord) that is authoritative replaces the listing-text verdict entirely.
   const score = quality.relevanceScore;
   const classifierDecision = decideRelevance(classification);
   const scopeHeld = !quality.purchasedScopeEvidenced && classifierDecision.verdict === "accept";
-  const decision = scopeHeld
-    ? { ...classifierDecision, verdict: "review" as const }
-    : classifierDecision;
+  const decision = stored?.authoritative && stored.state
+    ? { ...classifierDecision, verdict: verdictForState(stored.state) }
+    : scopeHeld
+      ? { ...classifierDecision, verdict: "review" as const }
+      : classifierDecision;
+  const followsStoredApproval = Boolean(stored?.authoritative && decision.verdict === "accept");
   const dateUnknown =
     tags.includes("date-unknown") ||
     !opp.postedDate ||
@@ -189,7 +215,7 @@ function relevanceView(
     verdict: decision.verdict,
     thresholds: decision.thresholds,
     reasons: [
-      ...(quality.purchasedScopeEvidenced
+      ...(quality.purchasedScopeEvidenced || followsStoredApproval
         ? []
         : ["Specific purchased-scope evidence is missing; review the solicitation."]),
       ...classification.reasons,
@@ -215,6 +241,7 @@ function mapOpportunity(
   opp: Record<string, any>,
   contextualAdjustment = 0,
   quality: OpportunityQualityView = classifyOpportunityQuality(opp),
+  decision: AuthoritativeDecisionView | null = null,
 ) {
   return {
     ...opp,
@@ -228,7 +255,10 @@ function mapOpportunity(
       ? Number(opp.relevanceScore)
       : undefined,
     tags: parseTags(opp.tags),
-    relevance: relevanceView(opp, contextualAdjustment, quality),
+    relevance: relevanceView(opp, contextualAdjustment, quality, decision),
+    // The one outcome for this opportunity: the stored decision's state and versions (source "none" when no
+    // decision is stored yet), whether the view above follows it, and any read-time disagreement (a flag only).
+    ...(decision ? { decision } : {}),
   };
 }
 
@@ -349,15 +379,17 @@ router.get("/opportunities", async (req, res) => {
         .limit(batchLimit)
         .offset(scanned));
       scanned += batch.length;
+      // Read-time classification defers to a current stored decision (it may flag a disagreement, not overturn it).
+      const storedById = await loadStoredDecisionsForRows(batch);
       const eligible = batch.flatMap((row) => {
-        const quality = classifyOpportunityQuality(row);
-        return qualityMatchesView(quality, view) ? [{ row, quality }] : [];
+        const { quality, decision } = qualityWithDecision(row, storedById.get(String(row.id)));
+        return qualityMatchesView(quality, view) ? [{ row, quality, decision }] : [];
       });
       const context = await contextualAdjustments(
         eligible.map(({ row }) => row),
         search || undefined,
       );
-      for (const { row, quality } of eligible) {
+      for (const { row, quality, decision } of eligible) {
         const contextual = context.get(String(row.id)) ?? { adjustment: 0, contextHash: "" };
         const authority = sourceAuthority(row.providerName ?? row.source);
         const contextualFeedback = Math.max(-5, Math.min(5, contextual.adjustment));
@@ -371,7 +403,7 @@ router.get("/opportunities", async (req, res) => {
             id: String(row.id), title: String(row.title ?? ""), rank, authority,
             contextualAdjustment: contextual.adjustment, contextualFeedback,
             contextHash: contextual.contextHash, suppressed: row.userGrade === "spam",
-            sources: [provider],
+            sources: [provider], decision,
           });
           continue;
         }
@@ -382,7 +414,7 @@ router.get("/opportunities", async (req, res) => {
           Object.assign(existing, {
             id: String(row.id), title: String(row.title ?? ""), authority,
             contextualAdjustment: contextual.adjustment, contextualFeedback,
-            contextHash: contextual.contextHash, suppressed: row.userGrade === "spam",
+            contextHash: contextual.contextHash, suppressed: row.userGrade === "spam", decision,
           });
         }
         existing.rank = Math.max(existing.rank, rank);
@@ -418,10 +450,10 @@ router.get("/opportunities", async (req, res) => {
     const data = pageEntries.flatMap((entry) => {
       const row = rowsById.get(entry.id);
       if (!row) return [];
-      const quality = classifyOpportunityQuality(row);
+      const quality = classifyOpportunityQuality(row, new Date(), entry.decision.override);
       const rankBreakdown = calculateOpportunityRank(row, quality);
       return [{
-        ...mapOpportunity(row, entry.contextualAdjustment, quality),
+        ...mapOpportunity(row, entry.contextualAdjustment, quality, entry.decision.view),
         quality,
         crossSource: {
           canonicalKey: canonicalOpportunityKey(row),

@@ -14,6 +14,9 @@ import { getRelevanceProfile } from "../lib/search/relevanceProfile";
 import { matchedServiceLines } from "../lib/search/profileServiceLines";
 import { classifyTestingTypes } from "../lib/search/testingTypes";
 import { hasPrimaryOccuMedServiceEvidence } from "../lib/opportunityScopeEvidence";
+import { classifyOpportunityQuality } from "../lib/opportunityQuality";
+import { isApprovedState, type AuthoritativeDecisionView } from "../lib/releaseC/decisionRecord";
+import { loadStoredDecisionsForRows, readTimeDecision } from "../lib/releaseC/readTimeDecision";
 import { judgeScopeBlock, profileServiceLabels } from "../lib/search/profileText";
 import {
   cancelManualIngestion,
@@ -120,7 +123,7 @@ function parseTags(raw: unknown): string[] {
  * warnings (stale / low-confidence). Uses stored values when present (web rows
  * scored at write time) and falls back to live classification for older rows.
  */
-function buildRelevanceView(opp: any) {
+function buildRelevanceView(opp: any, decision: AuthoritativeDecisionView | null = null) {
   const samClassificationEvidence = samGovOpportunityClassificationEvidence(opp);
   const cls = classifyResult({
     title: opp.title,
@@ -142,9 +145,13 @@ function buildRelevanceView(opp: any) {
   const primaryScopeEvidenced = hasPrimaryOccuMedServiceEvidence(
     String(opp.title ?? ""), String(opp.description ?? ""),
   );
-  // Persisted scores are historical rankings, not proof of purchased-scope fit.
+  // Persisted scores are historical rankings, not proof of purchased-scope fit. A current, authoritative stored
+  // decision is: its score is shown and its approval is not re-capped by the listing-text check.
   const rawScore = Number.isFinite(storedScore) ? Math.round(storedScore) : cls.score;
-  const score = primaryScopeEvidenced ? rawScore : Math.min(rawScore, 49);
+  const followsStoredApproval = Boolean(decision?.authoritative && isApprovedState(decision.state));
+  const score = decision?.authoritative && decision.score != null
+    ? Math.round(decision.score)
+    : primaryScopeEvidenced || followsStoredApproval ? rawScore : Math.min(rawScore, 49);
 
   const notesText = typeof opp.notes === "string" ? opp.notes : "";
   const whyMatch = notesText.match(/\[why:\s*([^\]]+?)(?:\s*\|\s*via:\s*([\w-]+))?\s*\]/);
@@ -176,7 +183,7 @@ function buildRelevanceView(opp: any) {
   else if (feedbackAdj <= -5) feedbackReasons.push("Down-ranked by your feedback");
 
   const reasons = [
-    ...(!primaryScopeEvidenced ? ["Specific purchased-scope evidence is missing; review the solicitation."] : []),
+    ...(!primaryScopeEvidenced && !followsStoredApproval ? ["Specific purchased-scope evidence is missing; review the solicitation."] : []),
     ...feedbackReasons, ...baseReasons,
   ].slice(0, 4);
 
@@ -317,7 +324,10 @@ router.get("/opportunities/:id", async (req, res) => {
   try {
     const rows = await db.select().from(opportunitiesTable).where(eq(opportunitiesTable.id, req.params.id));
     if (rows.length === 0) return res.status(404).json({ error: "Opportunity not found" });
-    return res.json(mapOpportunity(rows[0]));
+    // The detail view shows the same authoritative outcome as the list (see opportunity-safety-boundary.ts).
+    const stored = (await loadStoredDecisionsForRows(rows)).get(String(rows[0].id));
+    const { view: decision } = readTimeDecision(rows[0], stored, classifyOpportunityQuality(rows[0]).relevanceEligible);
+    return res.json({ ...mapOpportunity(rows[0]), relevance: buildRelevanceView(rows[0], decision), decision });
   } catch (err) {
     req.log.error(err);
     return res.status(500).json({ error: "Failed to get opportunity" });
