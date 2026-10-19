@@ -111,14 +111,17 @@ const whisperPool = new FreeTierCredentialPool(
   [{ envKey: "LLMWHISPERER_API_KEY" }, { envKey: "LLMWHISPERER_API_KEY_2" }],
   {
     rotateOnSuccess: false,
-    accounts: { policyFor: llmWhispererPolicy, probe: (apiKey) => llmWhispererUsage(apiKey), unitsPerCall: 1, probeBeforeEachRun: true },
+    // Both slots are separately registered free accounts with verified daily allowances: a second concurrent
+    // document goes to the other account instead of queueing on the active one.
+    maxConcurrentPerAccount: 1,
+    accounts: { policyFor: llmWhispererPolicy, probe: (apiKey) => llmWhispererUsage(apiKey), unitsPerCall: 1, probeBeforeEachRun: true, purpose: "ocr" },
   },
 );
 
 const nutrientPool = new FreeTierCredentialPool(
   "nutrient-extraction",
   [{ envKey: "NUTRIENT_API_KEY" }],
-  { rotateOnSuccess: false, accounts: { policyFor: nutrientPolicy, unitsPerCall: 1 } },
+  { rotateOnSuccess: false, accounts: { policyFor: nutrientPolicy, unitsPerCall: 1, purpose: "ocr" } },
 );
 
 /**

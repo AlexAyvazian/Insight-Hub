@@ -15,7 +15,7 @@ import {
 } from "../providers/openAiCompatible";
 import { prioritizeCandidatesWithCloudflare } from "./candidateSemanticPriority";
 import { runLimitedProviderPool } from "../limitedProviderPool";
-import { canonicalCandidateUrl } from "./sharedWork";
+import { WORKER_ID, awaitOtherWorkers, canonicalCandidateUrl, sharedWorkStore } from "./sharedWork";
 
 export interface AiExtraction {
   isOpportunity: boolean;
@@ -141,6 +141,10 @@ function cacheKey(input: BatchExtractInput): string {
     .digest("hex")
     .slice(0, 24);
 }
+
+const EXTRACTION_KIND = "ai_extraction";
+const EXTRACTION_LEASE_MS = 3 * 60_000;
+const EXTRACTION_WAIT_MS = 20_000;
 
 /** Extractions in progress in another batch (a parallel provider run), shared instead of requested twice. */
 const inflightExtractions = new Map<string, Promise<AiExtraction | null>>();
@@ -415,7 +419,7 @@ export async function extractOpportunitiesBatch(
   let cloudflareErrors: string[] = [];
 
   pruneExtractionCache();
-  const pending: Array<{ input: BatchExtractInput; index: number }> = [];
+  let pending: Array<{ input: BatchExtractInput; index: number }> = [];
   const joined: Array<{ index: number; promise: Promise<AiExtraction | null> }> = [];
   const owned = new Map<string, { resolve: (value: AiExtraction | null) => void; indexes: number[] }>();
   inputs.forEach((input, index) => {
@@ -444,6 +448,30 @@ export async function extractOpportunitiesBatch(
     pending.push({ input, index });
   });
 
+  // Across workers and deploys: reuse extractions already stored, and wait briefly for pages another worker is
+  // extracting right now, instead of sending the same page to a model twice.
+  const store = sharedWorkStore();
+  const claimed = new Set<string>();
+  if (store && pending.length > 0) {
+    const keyOf = new Map(pending.map((entry) => [entry.index, cacheKey(entry.input)]));
+    const fill = (found: Map<string, unknown>) => {
+      for (const entry of pending) {
+        const value = found.get(keyOf.get(entry.index)!) as AiExtraction | undefined;
+        if (!value || typeof value !== "object") continue;
+        for (const index of owned.get(keyOf.get(entry.index)!)?.indexes ?? [entry.index]) extractions[index] = value;
+        setCached(entry.input, value);
+        cacheHits += 1;
+      }
+      pending = pending.filter((entry) => !found.has(keyOf.get(entry.index)!));
+    };
+    fill(await store.getMany(EXTRACTION_KIND, [...new Set(keyOf.values())]).catch(() => new Map<string, unknown>()));
+    const wanted = pending.map((entry) => keyOf.get(entry.index)!);
+    const mine = await store.claimMany(EXTRACTION_KIND, wanted, WORKER_ID, EXTRACTION_LEASE_MS).catch(() => new Set(wanted));
+    for (const key of mine) claimed.add(key);
+    const elsewhere = wanted.filter((key) => !mine.has(key));
+    if (elsewhere.length > 0) fill(await awaitOtherWorkers(store, EXTRACTION_KIND, elsewhere, EXTRACTION_WAIT_MS, 1_000));
+  }
+
   const releaseOwned = () => {
     for (const [key, entry] of owned) {
       const value = entry.indexes.map((index) => extractions[index]).find((row): row is AiExtraction => Boolean(row)) ?? null;
@@ -453,8 +481,22 @@ export async function extractOpportunitiesBatch(
     }
     owned.clear();
   };
+  const settleDurable = async () => {
+    if (!store || claimed.size === 0) return;
+    const finished: Array<{ key: string; value: unknown }> = [];
+    for (const [key, entry] of owned) {
+      if (!claimed.has(key)) continue;
+      const value = entry.indexes.map((index) => extractions[index]).find((row): row is AiExtraction => Boolean(row));
+      if (value) finished.push({ key, value });
+    }
+    const done = new Set(finished.map((entry) => entry.key));
+    await store.completeMany(EXTRACTION_KIND, finished, WORKER_ID, CACHE_TTL_MS).catch(() => undefined);
+    await store.abandonMany(EXTRACTION_KIND, [...claimed].filter((key) => !done.has(key)), WORKER_ID).catch(() => undefined);
+    claimed.clear();
+  };
   try {
     const result = await extractPending();
+    await settleDurable();
     // Release this batch's pages before waiting on another batch's, so two batches sharing pages never wait on
     // each other.
     releaseOwned();
@@ -469,6 +511,7 @@ export async function extractOpportunitiesBatch(
     }
     return result;
   } finally {
+    await settleDurable();
     releaseOwned();
   }
 

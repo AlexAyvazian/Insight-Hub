@@ -2,6 +2,10 @@
 -- No pre-existing table, column or row is touched; opportunities, staging, settings and the Neon profile are untouched.
 -- Run manually, only as an explicit recovery decision (see docs/RELEASE_ROLLBACK.md). The application never runs it.
 BEGIN;
+DROP TABLE IF EXISTS provider_pool_cooldowns;
+DROP TABLE IF EXISTS provider_purpose_usage;
+DROP TABLE IF EXISTS provider_account_reservations;
+DROP TABLE IF EXISTS shared_work_results;
 DROP TABLE IF EXISTS source_query_checkpoints;
 DROP TABLE IF EXISTS remote_extraction_jobs;
 DROP TABLE IF EXISTS opportunity_audit_log;

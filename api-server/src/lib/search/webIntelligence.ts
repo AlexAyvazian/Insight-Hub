@@ -50,11 +50,16 @@ import type { ProviderName } from "../config/providerConfig";
 import { buildSignalWeights } from "../learning/feedbackModel";
 import { runLimitedProviderPool } from "../limitedProviderPool";
 
-const ENRICHMENT_MAX_URLS = 10;
+export const ENRICHMENT_MAX_URLS = 10;
 
 type EnrichmentOutcome = { value: string | null; provider: string | null; errors: string[] };
-/** One page fetch per canonical URL across the providers running in parallel (6h reuse). */
-export const sharedPageEnrichment = new SharedWork<EnrichmentOutcome>(6 * 3_600_000, 400, (outcome) => Boolean(outcome.value && outcome.provider));
+/** One page fetch per canonical URL across parallel providers, workers and deploys (6h reuse). */
+export const sharedPageEnrichment = new SharedWork<EnrichmentOutcome>(
+  6 * 3_600_000,
+  400,
+  (outcome) => Boolean(outcome.value && outcome.provider),
+  { kind: "page_enrichment", leaseMs: 90_000, waitMs: 20_000 },
+);
 const EXA_RESULTS_PER_QUERY = 20;
 const DAY_MS = 86_400_000;
 
@@ -169,6 +174,8 @@ interface Candidate {
   sourceProvider: SearchCandidateProvider;
   dateRaw?: string;
   enrichedBy?: string;
+  /** Every discovery provider that returned this page (set when several providers' candidates are consolidated). */
+  foundBy?: string[];
 }
 
 export type DiscoveryTriage =
@@ -314,6 +321,7 @@ function buildWebOpportunity(
       fallback: fields.fallback,
       extractedFrom: candidate.sourceProvider,
       enrichedBy: candidate.enrichedBy,
+      ...(candidate.foundBy && candidate.foundBy.length > 1 ? { discoveredBy: candidate.foundBy } : {}),
       ...(fields.extra ?? {}),
     },
   };
@@ -336,7 +344,7 @@ function addCandidate(candidates: Candidate[], seen: Set<string>, candidate: Can
   candidates.push(candidate);
 }
 
-export async function webIntelligenceFetch(options: {
+export interface WebIntelligenceOptions {
   keywords?: string;
   dateRange?: number;
   useGemini?: boolean;
@@ -358,7 +366,18 @@ export async function webIntelligenceFetch(options: {
   discoveryQueries?: string[];
   candidateUrlFilter?: (url: string) => boolean;
   signal?: AbortSignal;
-}): Promise<WebIntelligenceResult> {
+}
+
+/** Raw candidates from the discovery searches, before any page fetch or AI call. */
+export interface WebDiscoveryBatch {
+  candidates: Candidate[];
+  stats: WebIntelligenceResult["stats"];
+  errors: string[];
+  publishedAfterMs: number;
+}
+
+/** Search only: the discovery queries against the selected search providers. No enrichment or extraction. */
+export async function discoverWebCandidates(options: WebIntelligenceOptions): Promise<WebDiscoveryBatch> {
   throwIfAborted(options.signal);
   // Load the Occu-Med profile phrases the relevance gate reads synchronously.
   await import("./occumedSearchProfile")
@@ -662,6 +681,78 @@ export async function webIntelligenceFetch(options: {
     }
   }
 
+  return { candidates, stats, errors, publishedAfterMs: publishedAfter.getTime() };
+}
+
+/**
+ * Discovery (search) then shared downstream work (triage, page enrichment, AI extraction, qualification). Callers
+ * that run several discovery providers in parallel call discoverWebCandidates per provider, consolidate with
+ * mergeWebDiscoveryBatches, and run processWebCandidates once, so a page found by several providers is fetched and
+ * extracted once.
+ */
+export async function webIntelligenceFetch(options: WebIntelligenceOptions): Promise<WebIntelligenceResult> {
+  const batch = await discoverWebCandidates(options);
+  return processWebCandidates(batch, options);
+}
+
+/**
+ * One batch from several providers' discovery batches: candidates consolidated by canonical URL (the richest
+ * snippet kept, every finder recorded), per-provider result counters summed, errors kept.
+ */
+export function mergeWebDiscoveryBatches(batches: Array<{ provider: string; batch: WebDiscoveryBatch }>): WebDiscoveryBatch {
+  const byUrl = new Map<string, Candidate>();
+  const errors: string[] = [];
+  const stats = batches[0]?.batch.stats ? structuredClone(batches[0].batch.stats) : null;
+  let publishedAfterMs = Number.POSITIVE_INFINITY;
+  for (const [position, { provider, batch }] of batches.entries()) {
+    errors.push(...batch.errors.map((error) => `${provider}: ${error}`));
+    publishedAfterMs = Math.min(publishedAfterMs, batch.publishedAfterMs);
+    if (stats && position > 0) {
+      for (const [key, value] of Object.entries(batch.stats)) {
+        if (/Results$/.test(key) && typeof value === "number") (stats as Record<string, unknown>)[key] = Number((stats as Record<string, unknown>)[key] ?? 0) + value;
+      }
+      stats.queryPlan = {
+        keyword: Math.max(stats.queryPlan.keyword, batch.stats.queryPlan.keyword),
+        generated: Math.max(stats.queryPlan.generated, batch.stats.queryPlan.generated),
+        profile: Math.max(stats.queryPlan.profile, batch.stats.queryPlan.profile),
+      };
+    }
+    for (const candidate of batch.candidates) {
+      const key = canonicalCandidateUrl(candidate.url);
+      const existing = byUrl.get(key);
+      const finders = new Set([...(existing?.foundBy ?? []), ...(candidate.foundBy ?? [provider])]);
+      if (!existing) {
+        byUrl.set(key, { ...candidate, foundBy: [...finders] });
+        continue;
+      }
+      const richer = candidate.content.length > existing.content.length ? candidate : existing;
+      byUrl.set(key, { ...richer, dateRaw: existing.dateRaw ?? candidate.dateRaw, foundBy: [...finders] });
+    }
+  }
+  const merged = stats ?? ({} as WebIntelligenceResult["stats"]);
+  return {
+    candidates: [...byUrl.values()],
+    stats: merged,
+    errors,
+    publishedAfterMs: Number.isFinite(publishedAfterMs) ? publishedAfterMs : Date.now() - 30 * DAY_MS,
+  };
+}
+
+/** Candidates found by more than one provider, i.e. page fetches and AI extractions a merged pass did not repeat. */
+export function consolidatedDuplicateCount(batches: Array<{ batch: WebDiscoveryBatch }>, merged: WebDiscoveryBatch): number {
+  return batches.reduce((sum, entry) => sum + entry.batch.candidates.length, 0) - merged.candidates.length;
+}
+
+/** Triage, enrichment and extraction of discovered candidates (shared downstream work). */
+export async function processWebCandidates(
+  batch: WebDiscoveryBatch,
+  options: Pick<WebIntelligenceOptions, "keywords" | "signal" | "useSelfHostedCrawler"> & { enrichmentMaxUrls?: number },
+): Promise<WebIntelligenceResult> {
+  const { candidates, stats } = batch;
+  const errors = [...batch.errors];
+  const publishedAfter = new Date(batch.publishedAfterMs);
+  const useSelfHostedCrawler = options.useSelfHostedCrawler === true;
+  const enrichmentMaxUrls = Math.max(0, options.enrichmentMaxUrls ?? ENRICHMENT_MAX_URLS);
   stats.totalCandidates = candidates.length;
   const dateBoundedCandidates = candidates.filter((candidate) => {
     if (!candidate.dateRaw) return true;
@@ -693,7 +784,7 @@ export async function webIntelligenceFetch(options: {
     .map((candidate, index) => ({ candidate, index }))
     .filter(({ candidate }) => candidate.content.length < 800)
     .sort((a, b) => Number(reviewBand.has(b.candidate)) - Number(reviewBand.has(a.candidate)) || a.index - b.index)
-    .slice(0, ENRICHMENT_MAX_URLS);
+    .slice(0, enrichmentMaxUrls);
 
   for (const { candidate, index } of toEnrich) {
     throwIfAborted(options.signal);

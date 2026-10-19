@@ -8,6 +8,10 @@
  *   OPPORTUNITY_REQUIREMENT_LEDGER_ENABLED per-requirement evidence ledger and multi-axis assessment
  *   OPPORTUNITY_COVERAGE_TRACKING_ENABLED  per-query/page/family coverage events and partition-exclusion audit
  *   DOCUMENT_EXTRACTION_WORKER_MODE       "off" (default) | "child": run the extraction worker as a child process
+ *   OPPORTUNITY_SHARED_WORK_DURABLE       share page fetches / AI extractions across workers and deploys (default on
+ *                                         in production, off elsewhere so tests never read another run's results)
+ *   PROVIDER_ACCOUNTING_FAIL_CLOSED       refuse billable-capable account calls while durable accounting is down
+ *                                         (default on)
  *
  * Defaults: queue, ledger and coverage tracking default ON (they only add records/telemetry and never drop work);
  * the document pipeline and the stricter evidence requirement default OFF until activated in production.
@@ -43,4 +47,13 @@ export type ReviewMode = "single" | "panel";
 export function reviewMode(override?: ReviewMode): ReviewMode {
   if (override) return override;
   return process.env.OPPORTUNITY_REVIEW_MODE?.trim().toLowerCase() === "panel" ? "panel" : "single";
+}
+
+export function durableSharedWorkEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return flag("OPPORTUNITY_SHARED_WORK_DURABLE", env.NODE_ENV === "production", env);
+}
+
+/** Billable-capable accounts are not used while reservations cannot be recorded durably. */
+export function accountingFailClosed(env: Record<string, string | undefined> = process.env): boolean {
+  return flag("PROVIDER_ACCOUNTING_FAIL_CLOSED", true, env);
 }

@@ -12,8 +12,15 @@
  * - One-time trial credits never "renew tomorrow": an exhausted trial stays exhausted until a probe shows credit.
  * - A rate limit is a cooldown, not exhaustion: it clears at the provider's reset time or Retry-After.
  * - A usage cap below the provider's free allowance (safety margin) stops spending before any paid overage.
+ * - Units planned by in-flight calls are held as reservations in the same transaction as the capacity check, so
+ *   concurrent workers cannot each pass a check that has room for only one of them. A reservation left by a worker
+ *   that died expires on its own.
+ * - Fail closed: an account that can bill beyond its free allowance is not used while the reservation cannot be
+ *   recorded durably (PROVIDER_ACCOUNTING_FAIL_CLOSED, default on).
  */
+import { randomUUID } from "node:crypto";
 import { rcPool } from "../releaseC/db";
+import { accountingFailClosed } from "../releaseC/flags";
 import { ensureReleaseCSchema } from "../releaseC/schema";
 
 export type AllowanceKind =
@@ -90,15 +97,37 @@ export interface SpendDecision {
   remaining: number | null;
 }
 
+/** What a call is spending on; each purpose has its own budget (see purposeBudget.ts). */
+export type SpendPurpose = "search" | "page_extraction" | "ocr" | "ai_evaluation";
+
+export interface ReservationHold {
+  id: string;
+  accountId: string;
+  units: number;
+  purpose: SpendPurpose | null;
+  expiresAt: Date;
+}
+
 export interface LedgerStoreIO {
   load(id: string): Promise<AccountState | null>;
   save(state: AccountState): Promise<void>;
+  /** Units currently held by unexpired reservations on the account. */
+  reserved?(id: string, now: Date): Promise<number>;
+  hold?(hold: ReservationHold): Promise<void>;
+  /** False when this read-modify-write could not reach durable storage (the in-process fallback is in use). */
+  durable?: boolean;
 }
 
 export interface LedgerStore extends LedgerStoreIO {
   list(pool?: string): Promise<AccountState[]>;
   /** Runs one read-modify-write for an account so concurrent processes cannot lose each other's updates. */
   atomic?<T>(id: string, work: (io: LedgerStoreIO) => Promise<T>): Promise<T>;
+  releaseHold?(holdId: string): Promise<void>;
+}
+
+export function reservationTtlMs(): number {
+  const value = Number(process.env.PROVIDER_RESERVATION_TTL_MS);
+  return Number.isFinite(value) && value >= 10_000 ? value : 15 * 60_000;
 }
 
 const dayKey = (now: Date) => now.toISOString().slice(0, 10);
@@ -231,6 +260,21 @@ function nextResetGuess(state: AccountState, now: Date): Date {
 
 export class MemoryLedgerStore implements LedgerStore {
   private readonly rows = new Map<string, AccountState>();
+  private readonly holds = new Map<string, ReservationHold>();
+  async reserved(id: string, now: Date) {
+    let total = 0;
+    for (const [key, hold] of this.holds) {
+      if (hold.expiresAt.getTime() <= now.getTime()) this.holds.delete(key);
+      else if (hold.accountId === id) total += hold.units;
+    }
+    return total;
+  }
+  async hold(hold: ReservationHold) {
+    this.holds.set(hold.id, { ...hold });
+  }
+  async releaseHold(holdId: string) {
+    this.holds.delete(holdId);
+  }
   async load(id: string) {
     const row = this.rows.get(id);
     return row ? { ...row } : null;
@@ -342,8 +386,15 @@ export class PostgresLedgerStore implements LedgerStore {
         await holder.client.query("ROLLBACK").catch(() => undefined);
         holder.client.release();
       }
-      // Database unavailable: the in-process queue still serialises this account.
-      return work(this.fallback);
+      // Database unavailable: the in-process queue still serialises this account, and the caller is told the
+      // result is not durable (billable-capable accounts fail closed on it).
+      return work({
+        load: (accountId) => this.fallback.load(accountId),
+        save: (state) => this.fallback.save(state),
+        reserved: (accountId, now) => this.fallback.reserved(accountId, now),
+        hold: (entry) => this.fallback.hold(entry),
+        durable: false,
+      });
     }
     const tx = holder.client;
     try {
@@ -356,6 +407,20 @@ export class PostgresLedgerStore implements LedgerStore {
           await this.fallback.save(state);
           await tx.query(UPSERT_ACCOUNT_SQL, upsertParams(state));
         },
+        reserved: async (accountId) => {
+          const rows = (await tx.query(
+            `SELECT COALESCE(SUM(units), 0) AS units FROM provider_account_reservations WHERE account_id = $1 AND expires_at > now()`,
+            [accountId],
+          )).rows;
+          return Number(rows[0]?.units ?? 0);
+        },
+        hold: async (entry) => {
+          await tx.query(
+            `INSERT INTO provider_account_reservations (id, account_id, units, purpose, owner, expires_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+            [entry.id, entry.accountId, entry.units, entry.purpose, String(process.pid), entry.expiresAt.toISOString()],
+          );
+        },
+        durable: true,
       });
       await tx.query("COMMIT");
       return result;
@@ -364,6 +429,33 @@ export class PostgresLedgerStore implements LedgerStore {
       throw error;
     } finally {
       tx.release();
+    }
+  }
+
+  async releaseHold(holdId: string): Promise<void> {
+    await this.fallback.releaseHold(holdId);
+    try {
+      await ensureReleaseCSchema();
+      const pool = await rcPool();
+      await pool.query(`DELETE FROM provider_account_reservations WHERE id = $1`, [holdId]);
+      if (Math.random() < 0.05) {
+        await pool.query(`DELETE FROM provider_account_reservations WHERE expires_at < now() - interval '1 day'`).catch(() => undefined);
+      }
+    } catch {
+      // An unreleased hold only makes the account more conservative until it expires.
+    }
+  }
+
+  async reserved(id: string, now: Date): Promise<number> {
+    try {
+      await ensureReleaseCSchema();
+      const result = await (await rcPool()).query(
+        `SELECT COALESCE(SUM(units), 0) AS units FROM provider_account_reservations WHERE account_id = $1 AND expires_at > now()`,
+        [id],
+      );
+      return Number((result.rows[0] as Row | undefined)?.units ?? 0);
+    } catch {
+      return this.fallback.reserved(id, now);
     }
   }
 
@@ -424,7 +516,8 @@ export class AccountLedger {
   ) {}
 
   private readonly queues = new Map<string, Promise<unknown>>();
-  private readonly reservations = new Map<string, number>();
+  /** Holds for stores that cannot keep reservations themselves (in-process only). */
+  private readonly localHolds = new MemoryLedgerStore();
 
   /** Serialises work per account in this process; the store's atomic() also locks across processes. */
   private serial<T>(id: string, work: () => Promise<T>): Promise<T> {
@@ -468,9 +561,8 @@ export class AccountLedger {
     );
   }
 
-  /** Units planned by in-flight calls in this process count against capacity until they settle. */
-  private withReservations(state: AccountState): AccountState {
-    const reserved = this.reservations.get(state.id) ?? 0;
+  /** Units planned by in-flight calls (in any worker) count against capacity until they settle. */
+  private withReservations(state: AccountState, reserved: number): AccountState {
     if (reserved <= 0) return state;
     return {
       ...state,
@@ -482,26 +574,60 @@ export class AccountLedger {
   }
 
   /**
-   * Checks capacity and reserves the planned units in one step, so concurrent callers cannot all pass a check that
-   * has room for only one of them. release() must be called once the real usage has been recorded.
+   * Checks capacity and reserves the planned units in one transaction (one advisory lock per account across
+   * workers), so concurrent callers cannot all pass a check that has room for only one of them. release() must be
+   * called once the real usage has been recorded.
    */
-  async reserve(policy: AccountPolicy, units: number, hasProbe: boolean): Promise<SpendDecision & { release: () => void }> {
+  async reserve(
+    policy: AccountPolicy,
+    units: number,
+    hasProbe: boolean,
+    options: { purpose?: SpendPurpose } = {},
+  ): Promise<SpendDecision & { release: () => void; durable: boolean }> {
     const id = accountId(policy.pool, policy.slot);
+    const noop = () => undefined;
     return this.serial(id, async () => {
-      const decision = decideSpend(policy, this.withReservations(await this.state(policy)), units, this.clock(), hasProbe);
-      if (!decision.ok || units <= 0) return { ...decision, release: () => undefined };
-      this.reservations.set(id, (this.reservations.get(id) ?? 0) + units);
-      let released = false;
-      return {
-        ...decision,
-        release: () => {
-          if (released) return;
-          released = true;
-          const left = (this.reservations.get(id) ?? 0) - units;
-          if (left > 0) this.reservations.set(id, left);
-          else this.reservations.delete(id);
-        },
+      const run = async (io: LedgerStoreIO) => {
+        const now = this.clock();
+        const durable = io.durable !== false;
+        if (!durable && policy.overageBillable && accountingFailClosed()) {
+          return {
+            ok: false,
+            reason: "durable accounting unavailable; a billable-capable account is not used without a durable reservation",
+            retryAt: new Date(now.getTime() + 60_000).toISOString(),
+            needsProbe: false,
+            remaining: null,
+            release: noop,
+            durable,
+          };
+        }
+        const state = this.normalise(policy, await io.load(id), now);
+        const holdsHere = Boolean(io.reserved && io.hold);
+        const reserved = holdsHere ? await io.reserved!(id, now) : await this.localHolds.reserved(id, now);
+        const decision = decideSpend(policy, this.withReservations(state, reserved), units, now, hasProbe);
+        if (!decision.ok || units <= 0) return { ...decision, release: noop, durable };
+        const hold: ReservationHold = {
+          id: randomUUID(),
+          accountId: id,
+          units,
+          purpose: options.purpose ?? null,
+          expiresAt: new Date(now.getTime() + reservationTtlMs()),
+        };
+        if (holdsHere) await io.hold!(hold);
+        else await this.localHolds.hold(hold);
+        let released = false;
+        return {
+          ...decision,
+          durable,
+          release: () => {
+            if (released) return;
+            released = true;
+            void this.localHolds.releaseHold(hold.id);
+            if (holdsHere) void this.store.releaseHold?.(hold.id).catch(() => undefined);
+          },
+        };
       };
+      return this.store.atomic ? this.store.atomic(id, run) : run(this.store);
     });
   }
 
@@ -523,7 +649,9 @@ export class AccountLedger {
   }
 
   async canSpend(policy: AccountPolicy, units: number, hasProbe: boolean): Promise<SpendDecision> {
-    return decideSpend(policy, this.withReservations(await this.state(policy)), units, this.clock(), hasProbe);
+    const id = accountId(policy.pool, policy.slot);
+    const reserved = (this.store.reserved ? await this.store.reserved(id, this.clock()) : 0) + (await this.localHolds.reserved(id, this.clock()));
+    return decideSpend(policy, this.withReservations(await this.state(policy), reserved), units, this.clock(), hasProbe);
   }
 
   /** Records a provider-reported capacity snapshot (from a free probe or response headers/body). */

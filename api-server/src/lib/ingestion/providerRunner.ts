@@ -673,6 +673,11 @@ async function loadDiscoveryRuntime() {
     keenableProvider: keenable.keenableProvider,
     tinyfishProvider: tinyfish.tinyfishProvider,
     webIntelligenceFetch: intelligence.webIntelligenceFetch,
+    discoverWebCandidates: intelligence.discoverWebCandidates,
+    mergeWebDiscoveryBatches: intelligence.mergeWebDiscoveryBatches,
+    consolidatedDuplicateCount: intelligence.consolidatedDuplicateCount,
+    processWebCandidates: intelligence.processWebCandidates,
+    ENRICHMENT_MAX_URLS: intelligence.ENRICHMENT_MAX_URLS,
   };
 }
 
@@ -795,35 +800,61 @@ async function fetchConfiguredAiDiscovery(
     };
   }
 
-  const settled = await Promise.allSettled(
-    selected.map(async (provider) => {
-      try {
-        const result = await runtime.webIntelligenceFetch({
-          keywords: options.keywords,
-          dateRange: options.dateRange,
-          signal: options.signal,
-          ...discoveryOptions(provider),
-        });
-        if (result.opportunities.length > 0) {
-          await recordProviderSuccess(provider, result.opportunities.length);
-        } else if (result.errors.length > 0) {
-          await recordProviderFailure(provider, result.errors.join("; "));
-        } else {
-          await recordProviderSuccess(provider, 0);
-        }
-        return { provider, result };
-      } catch (error) {
-        await recordProviderFailure(provider, error);
-        throw error;
-      }
-    }),
+  // Raw discovery runs in parallel per provider (search only). The candidates are then consolidated by canonical URL
+  // and enriched, extracted and qualified once, so a page several providers found costs one page fetch and one AI
+  // extraction instead of one per provider.
+  const discovered = await Promise.allSettled(
+    selected.map(async (provider) => ({
+      provider,
+      batch: await runtime.discoverWebCandidates({
+        keywords: options.keywords,
+        dateRange: options.dateRange,
+        signal: options.signal,
+        ...discoveryOptions(provider),
+      }),
+    })),
   );
+  const batches = discovered
+    .filter((entry): entry is PromiseFulfilledResult<{ provider: DiscoveryProvider; batch: Awaited<ReturnType<typeof runtime.discoverWebCandidates>> }> => entry.status === "fulfilled")
+    .map((entry) => entry.value);
+  const consolidated = runtime.mergeWebDiscoveryBatches(batches);
+  const duplicatesConsolidated = runtime.consolidatedDuplicateCount(batches, consolidated);
+  let shared: Awaited<ReturnType<typeof runtime.processWebCandidates>> | null = null;
+  let sharedError: unknown = null;
+  if (batches.length > 0) {
+    try {
+      // The per-provider enrichment allowance is kept in total; it is now spent once per distinct page.
+      shared = await runtime.processWebCandidates(consolidated, {
+        keywords: options.keywords,
+        signal: options.signal,
+        enrichmentMaxUrls: runtime.ENRICHMENT_MAX_URLS * batches.length,
+      });
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      sharedError = error;
+    }
+  }
+  const foundBy = (record: NormalizedOpportunity): string[] => {
+    const raw = record.rawData as Record<string, unknown> | undefined;
+    const list = Array.isArray(raw?.discoveredBy) ? (raw!.discoveredBy as unknown[]).map(String) : [];
+    return list.length > 0 ? list : [String(raw?.providerName ?? record.source)];
+  };
 
-  const allRecords: NormalizedOpportunity[] = [];
-  const errors: string[] = [];
+  const allRecords: NormalizedOpportunity[] = shared ? [...shared.opportunities] : [];
+  const errors: string[] = shared ? [...shared.errors] : [...consolidated.errors];
+  if (sharedError) errors.push(`shared enrichment/extraction: ${sharedError instanceof Error ? sharedError.message : String(sharedError)}`);
   const diagnostics: Array<Record<string, unknown>> = [];
-  for (let index = 0; index < settled.length; index += 1) {
-    const entry = settled[index]!;
+  const enrichment = shared
+    ? {
+        jina: shared.stats.jinaEnriched,
+        keenable: shared.stats.keenableEnriched,
+        browserbase: shared.stats.browserbaseEnriched,
+        firecrawl: shared.stats.firecrawlEnriched,
+        microlink: shared.stats.microlinkEnriched,
+      }
+    : null;
+  for (let index = 0; index < discovered.length; index += 1) {
+    const entry = discovered[index]!;
     const provider = selected[index]!;
     const policy = discoveryQuotaPolicy(provider);
     const accountSlot = await activeAccountSlot(provider);
@@ -832,6 +863,7 @@ async function fetchConfiguredAiDiscovery(
         entry.reason instanceof Error
           ? entry.reason.message
           : String(entry.reason);
+      await recordProviderFailure(provider, entry.reason);
       errors.push(`${provider}: ${message}`);
       diagnostics.push({ provider, status: "failed", quota: policy });
       recordIngestionProviderTelemetry(options.runId, {
@@ -845,23 +877,18 @@ async function fetchConfiguredAiDiscovery(
       continue;
     }
 
-    const member = entry.value.result;
-    allRecords.push(...member.opportunities);
-    errors.push(...member.errors.map((error) => `${provider}: ${error}`));
-    const enrichment = {
-      jina: member.stats.jinaEnriched,
-      keenable: member.stats.keenableEnriched,
-      browserbase: member.stats.browserbaseEnriched,
-      firecrawl: member.stats.firecrawlEnriched,
-      microlink: member.stats.microlinkEnriched,
-    };
+    const member = entry.value.batch;
+    const accepted = allRecords.filter((record) => foundBy(record).includes(provider)).length;
+    if (accepted > 0) await recordProviderSuccess(provider, accepted);
+    else if (member.errors.length > 0) await recordProviderFailure(provider, member.errors.join("; "));
+    else await recordProviderSuccess(provider, 0);
     diagnostics.push({
       provider,
       quota: policy,
       status: member.errors.length > 0 ? "warning" : "ok",
-      candidates: member.stats.totalCandidates,
-      accepted: member.opportunities.length,
-      aiScorers: member.stats.aiScorers,
+      candidates: member.candidates.length,
+      accepted,
+      aiScorers: shared?.stats.aiScorers ?? [],
       enrichment,
       errors: member.errors.length,
     });
@@ -870,13 +897,13 @@ async function fetchConfiguredAiDiscovery(
       status: member.errors.length > 0 ? "warning" : "used",
       renewal: policy?.renewal ?? null,
       accountSlot,
-      candidates: member.stats.totalCandidates,
-      accepted: member.opportunities.length,
-      aiScorers: member.stats.aiScorers,
-      enrichment,
+      candidates: member.candidates.length,
+      accepted,
+      aiScorers: shared?.stats.aiScorers ?? [],
+      ...(enrichment ? { enrichment } : {}),
       spent: true,
       note:
-        member.opportunities.length > 0
+        accepted > 0
           ? "Discovery provider returned usable opportunity candidates"
           : "Discovery provider ran but returned no accepted opportunities",
     });
@@ -905,6 +932,9 @@ async function fetchConfiguredAiDiscovery(
       memberRuns: diagnostics,
       acceptedBeforeDedupe: allRecords.length,
       acceptedAfterDedupe: merged.length,
+      candidatesBeforeConsolidation: consolidated.candidates.length + duplicatesConsolidated,
+      candidatesConsolidated: consolidated.candidates.length,
+      duplicateCandidatesSkipped: duplicatesConsolidated,
       failures: uniqueErrors.length,
     }),
   );
@@ -918,6 +948,8 @@ async function fetchConfiguredAiDiscovery(
       aiScorers,
       acceptedBeforeDedupe: allRecords.length,
       acceptedAfterDedupe: merged.length,
+      candidatesConsolidated: consolidated.candidates.length,
+      duplicateCandidatesSkipped: duplicatesConsolidated,
     },
   };
 }
