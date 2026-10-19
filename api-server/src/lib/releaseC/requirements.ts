@@ -394,6 +394,11 @@ export function buildLedger(record: NormalizedOpportunity, sections: EvidenceSec
  * Cited excerpts for the classifier and judges: scope, amendment, exclusion and qualification sections first, each
  * prefixed with its citation. Bounded so a large solicitation cannot flood a prompt.
  */
+/** The bracketed citation a section carries in the evidence excerpt (and that an evaluator may cite back). */
+export function sectionCitationLabel(section: EvidenceSection): string {
+  return `[${section.documentTitle ?? "document"}${section.pageStart != null ? `, p.${section.pageStart}${section.pageEnd && section.pageEnd !== section.pageStart ? `-${section.pageEnd}` : ""}` : ""}${section.heading ? `, ${section.heading.slice(0, 60)}` : ""}]`;
+}
+
 export function evidenceExcerpts(sections: EvidenceSection[], maxChars = 12_000): { text: string; citations: string[] } {
   const order: SectionKind[] = ["amendment", "scope", "exclusion", "qualification", "location", "deadline", "evaluation", "pricing", "general"];
   const sorted = [...sections].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
@@ -402,7 +407,7 @@ export function evidenceExcerpts(sections: EvidenceSection[], maxChars = 12_000)
   let used = 0;
   for (const section of sorted) {
     if (used >= maxChars) break;
-    const cite = `[${section.documentTitle ?? "document"}${section.pageStart != null ? `, p.${section.pageStart}${section.pageEnd && section.pageEnd !== section.pageStart ? `-${section.pageEnd}` : ""}` : ""}${section.heading ? `, ${section.heading.slice(0, 60)}` : ""}]`;
+    const cite = sectionCitationLabel(section);
     const room = maxChars - used - cite.length - 2;
     if (room < 200) break;
     const body = section.text.slice(0, Math.min(room, 3_000));

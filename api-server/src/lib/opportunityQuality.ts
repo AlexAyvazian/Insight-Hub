@@ -184,9 +184,20 @@ export function deadlineEndForComparison(value: unknown): Date | null {
   return date;
 }
 
+/**
+ * The stored authoritative decision for this row (releaseC/decisionRecord.authoritativeDecisionView), when the
+ * caller has one that is current and authoritative. It replaces the listing-text relevance judgment; source,
+ * deadline, buyer and notice-stage checks still apply.
+ */
+export interface StoredDecisionOverride {
+  relevanceEligible: boolean;
+  score: number | null;
+}
+
 export function classifyOpportunityQuality(
   opp: OpportunityLike,
   now = new Date(),
+  storedDecision?: StoredDecisionOverride | null,
 ): OpportunityQualityView {
   const tags = parseTags(opp.tags).map((t) => t.toLowerCase());
   const provider = String(
@@ -304,10 +315,11 @@ export function classifyOpportunityQuality(
   const purchasedScopeEvidenced = hasPrimaryOccuMedServiceEvidence(
     String(opp.title ?? ""), String(opp.description ?? ""),
   );
-  const relevanceEligible =
-    decideRelevance(relevance).verdict === "accept" &&
-    relevance.confidence !== "possible_adjacent" &&
-    purchasedScopeEvidenced;
+  const relevanceEligible = storedDecision
+    ? storedDecision.relevanceEligible
+    : decideRelevance(relevance).verdict === "accept" &&
+      relevance.confidence !== "possible_adjacent" &&
+      purchasedScopeEvidenced;
   const structuredDirectEvidence =
     normalizedEvidenceVerified || completeStoredDirectEvidence;
   const reasons: string[] = [];
@@ -350,7 +362,13 @@ export function classifyOpportunityQuality(
     reasons.push(
       "The notice is early-stage market research or not yet a bid-ready solicitation.",
     );
-  if (!purchasedScopeEvidenced)
+  if (storedDecision)
+    reasons.push(
+      storedDecision.relevanceEligible
+        ? "Relevance follows the stored authoritative decision."
+        : "The stored authoritative decision holds this record for review.",
+    );
+  else if (!purchasedScopeEvidenced)
     reasons.push("Specific purchased-scope evidence is unconfirmed; retained for review.");
   else if (!relevanceEligible)
     reasons.push("The record does not have a strong current match to Occu-Med service lines.");
@@ -383,7 +401,9 @@ export function classifyOpportunityQuality(
     bidReadyNotice,
     relevanceEligible,
     purchasedScopeEvidenced,
-    relevanceScore: purchasedScopeEvidenced ? relevance.score : Math.min(relevance.score, UNEVIDENCED_SCOPE_SCORE_CAP),
+    relevanceScore: storedDecision?.score != null
+      ? Math.round(storedDecision.score)
+      : purchasedScopeEvidenced ? relevance.score : Math.min(relevance.score, UNEVIDENCED_SCOPE_SCORE_CAP),
     sourceVerified,
     sourceAuthority: sourceVerified ? "trusted" : aggregator ? "medium" : "low",
     evidenceFingerprint: createHash("sha256")

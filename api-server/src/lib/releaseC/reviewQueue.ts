@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { rcPool } from "./db";
 import type { NormalizedOpportunity } from "../providers/types";
 import { ensureReleaseCSchema } from "./schema";
+import { reopenDecisions } from "./decisionRecord";
 
 export type QueueStatus = "queued" | "in_review" | "decided" | "held" | "expired";
 
@@ -236,7 +237,10 @@ export async function closeQueuedByKeys(
   );
 }
 
-/** Reopens one opportunity (used when new document evidence arrives). */
+/**
+ * Reopens one opportunity (used when new document evidence arrives): its stored decision is marked stale and it
+ * re-enters the queue, from the decision's snapshot when it never had a queue row (a deterministic approval).
+ */
 export async function reopenOpportunity(opportunityKey: string, reason: string): Promise<void> {
   await ensureReleaseCSchema();
   await (await rcPool()).query(
@@ -244,6 +248,7 @@ export async function reopenOpportunity(opportunityKey: string, reason: string):
      WHERE opportunity_key = $1 AND status IN ('held','decided','queued')`,
     [opportunityKey, reason.slice(0, 500)],
   );
+  await reopenDecisions([opportunityKey], reason);
 }
 
 export async function reviewQueueStats(): Promise<{ byStatus: Record<string, number>; dueNow: number; oldestQueuedHours: number | null }> {

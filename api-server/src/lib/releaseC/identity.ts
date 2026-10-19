@@ -12,6 +12,30 @@ export function opportunityKey(record: NormalizedOpportunity): string {
   return `provider:${providerKeyForOpportunity(record)}:${generatedProviderNativeId(record).trim().toLowerCase()}`;
 }
 
+/**
+ * The same key for a stored opportunities row: promotion stores generatedProviderNativeId as notice_id and
+ * providerKeyForOpportunity as provider_key, so a row maps back to the decision made on its record.
+ */
+export function opportunityKeyForRow(row: {
+  providerKey?: unknown;
+  noticeId?: unknown;
+  samUrl?: unknown;
+  title?: unknown;
+  agency?: unknown;
+  solicitationNumber?: unknown;
+}): string {
+  const notice = String(row.noticeId ?? "").trim();
+  const native = notice ||
+    generatedProviderNativeId({
+      externalId: "",
+      sourceUrl: row.samUrl ? String(row.samUrl) : undefined,
+      title: String(row.title ?? ""),
+      agency: String(row.agency ?? ""),
+      solicitationNumber: row.solicitationNumber ? String(row.solicitationNumber) : undefined,
+    } as NormalizedOpportunity);
+  return `provider:${String(row.providerKey ?? "") || "manual"}:${native.trim().toLowerCase()}`;
+}
+
 function iso(value: Date | string | null | undefined): string {
   if (!value) return "";
   const date = value instanceof Date ? value : new Date(value);

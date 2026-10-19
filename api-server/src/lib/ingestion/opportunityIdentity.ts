@@ -5,6 +5,8 @@ import { classifyResult, type RelevanceResult } from "../search/relevance";
 import { decideRelevance } from "../search/relevanceDecision";
 import { normalizedToDbRecord } from "../search/normalization";
 import { canonicalSamOpportunityUrl } from "../opportunityQuality";
+import { isApprovedState, type DecisionState } from "../releaseC/decisionRecord";
+import { decisionAuthority } from "../releaseC/flags";
 
 export type OpportunityDedupeKeyType =
   | "provider"
@@ -52,6 +54,12 @@ function structuredDecisionMarker(record: NormalizedOpportunity): StructuredDeci
   return marker && (marker.status === "held" || marker.status === "rejected") && typeof marker.reason === "string"
     ? (marker as StructuredDecisionMarker)
     : null;
+}
+
+/** Approved by the structured decision of this run (see structuredOpportunityDecision / releaseC/decisionRecord). */
+function approvedByStoredDecision(record: NormalizedOpportunity): boolean {
+  const raw = (record.rawData ?? {}) as Record<string, unknown>;
+  return raw.opportunityDecision === "actionable" && isApprovedState(raw.opportunityDecisionState as DecisionState | undefined);
 }
 
 function documentEvidenceFor(record: NormalizedOpportunity): string {
@@ -367,6 +375,11 @@ export function decideOpportunityQuality(
       completenessScore,
       sourceConfidence,
     };
+  }
+  // The authoritative structured decision (qualified / provisional) settles the review band: the listing-text
+  // classifier here may not hold back what the decision approved. Hard rejections above still win.
+  if (decision.verdict === "review" && approvedByStoredDecision(record) && decisionAuthority() !== "off") {
+    return { status: "accepted", reason: null, completenessScore, sourceConfidence };
   }
   if (decision.verdict === "review") {
     return {

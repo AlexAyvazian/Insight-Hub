@@ -23,6 +23,7 @@
 import { REASON_CODES } from "./relevanceReasonCodes";
 import type { RelevanceResult } from "./relevance";
 import { getRelevanceProfile, type RelevanceProfile } from "./relevanceProfile";
+import { primaryOccuMedServiceEvidence, type PrimaryScopeEvidencePath } from "../opportunityScopeEvidence";
 
 /** Profile category ids that describe components or delivery mechanics, not a primary occupational service. */
 const COMPONENT_ONLY_CATEGORY_IDS = new Set(["lab_diagnostic_components", "network_program_management"]);
@@ -115,5 +116,45 @@ export function applyPrimaryPurchasedScope(
     negativeSignals: [...relevance.negativeSignals, `primary scope: ${assessment.kind}`],
     reasonCodes: [...relevance.reasonCodes, REASON_CODES.primaryScopeHold],
     confidence: "insufficient",
+  };
+}
+
+/**
+ * What the stored decision cites as the thing being bought. Only the primary-scope evidence counts (a title service
+ * term, or a title signal corroborated by explicit description phrases; see opportunityScopeEvidence): a service
+ * word that appears only in boilerplate, a FAR clause or a background paragraph is not cited. Document excerpts are
+ * consulted only when the notice itself does not evidence the scope.
+ */
+export interface PrimaryScopeCitation {
+  evidenced: boolean;
+  path: PrimaryScopeEvidencePath;
+  /** Profile terms naming the purchased service. */
+  terms: string[];
+  /** service, or the component-only / supply-only shapes that are held for review. */
+  kind: PrimaryScopeAssessment["kind"];
+  /** Why the shape is held, when it is. */
+  hold: string | null;
+  source: "notice" | "documents" | "none";
+}
+
+export function primaryPurchasedScopeCitation(
+  relevance: RelevanceResult,
+  input: PrimaryScopeInput & { documents?: string | null },
+  profile: RelevanceProfile = getRelevanceProfile(),
+): PrimaryScopeCitation {
+  const assessment = assessPrimaryPurchasedScope(relevance, input, profile);
+  const title = input.title ?? "";
+  const notice = primaryOccuMedServiceEvidence(title, input.description ?? "", profile);
+  const withDocuments = !notice.evidenced && input.documents
+    ? primaryOccuMedServiceEvidence(title, `${input.description ?? ""}\n\n${input.documents}`, profile)
+    : null;
+  const evidence = withDocuments?.evidenced ? withDocuments : notice;
+  return {
+    evidenced: evidence.evidenced,
+    path: evidence.path,
+    terms: evidence.terms,
+    kind: assessment.kind,
+    hold: assessment.reason,
+    source: notice.evidenced ? "notice" : withDocuments?.evidenced ? "documents" : "none",
   };
 }
