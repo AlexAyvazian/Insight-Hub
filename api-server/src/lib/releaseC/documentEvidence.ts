@@ -22,7 +22,8 @@ import { discoverAttachmentsWithCoverage, hasAuthoritativeAttachmentList } from 
 import { documentsFor, registerAttachments, sectionsFor, type StoredDocument } from "../documents/store";
 import { isCurrentlyExtracted } from "../documents/types";
 import { countInjectionSignals } from "../security/untrustedContent";
-import type { ReleaseCFlags } from "./flags";
+import { fullCorpusEvidenceEnabled, type ReleaseCFlags } from "./flags";
+import { corpusEvidence, type CorpusEvidence, type CorpusFinding } from "./passages";
 import { evidenceExcerpts, type EvidenceSection } from "./requirements";
 
 export const DOCUMENT_EVIDENCE_CHARS = 12_000;
@@ -34,6 +35,14 @@ export interface DocumentEvidence {
   extracted: number;
   pending: number;
   hashes: string[];
+  /** How much of the stored corpus was read and how much the excerpt carries (full-corpus retrieval). */
+  coverage?: CorpusEvidence["coverage"];
+  /** Found anywhere in the corpus, whether or not the passage fits in the excerpt. */
+  exclusions?: CorpusFinding[];
+  eligibility?: CorpusFinding[];
+  superseding?: CorpusFinding[];
+  /** Section ids the excerpt cites (for validating evaluator citations). */
+  sectionIds?: string[];
 }
 
 export interface DocumentContext {
@@ -72,9 +81,13 @@ export async function loadDocumentContext(
     await registerAttachments(opportunityKey, discovery.attachments, priority, {
       authoritative: hasAuthoritativeAttachmentList(record),
       listedUrls: discovery.listedUrls,
+      deferred: discovery.deferred,
     });
     const [documents, sections] = await Promise.all([documentsFor(opportunityKey), sectionsFor(opportunityKey)]);
-    const excerpt = evidenceExcerpts(sections, DOCUMENT_EVIDENCE_CHARS);
+    // Passages ranked over every section of every document (OPPORTUNITY_FULL_CORPUS_EVIDENCE, default on); off
+    // restores the earlier kind-ordered prefix excerpt.
+    const corpus = fullCorpusEvidenceEnabled() ? corpusEvidence(sections, DOCUMENT_EVIDENCE_CHARS) : null;
+    const excerpt = corpus ?? evidenceExcerpts(sections, DOCUMENT_EVIDENCE_CHARS);
     // Every current document counts, including ones not fetched yet, so a newly listed attachment changes the
     // judgment hash at once and a decision made before it was read is not reused.
     // A restored attachment awaiting its re-check counts as pending too, so an earlier decision is not reused.
@@ -87,10 +100,30 @@ export async function loadDocumentContext(
       documents,
       documentHashes: identities,
       evidence: excerpt.text
-        ? { text: excerpt.text, citations: excerpt.citations, documents: documents.length, extracted, pending: documents.length - extracted, hashes }
+        ? {
+            text: excerpt.text,
+            citations: excerpt.citations,
+            documents: documents.length,
+            extracted,
+            pending: documents.length - extracted,
+            hashes,
+            ...(corpus
+              ? {
+                  coverage: corpus.coverage,
+                  exclusions: corpus.exclusions.slice(0, 12),
+                  eligibility: corpus.eligibility.slice(0, 12),
+                  superseding: corpus.superseding.slice(0, 12),
+                  sectionIds: [...new Set(corpus.passages.map((p) => p.sectionId).filter((id): id is string => Boolean(id)))],
+                }
+              : {}),
+          }
         : null,
       injectionSignals: countInjectionSignals(excerpt.text),
-      attachmentsNotRegistered: discovery.overflow,
+      // Listed but not yet read: deferred inventory rows plus anything beyond the inventory cap.
+      attachmentsNotRegistered: Math.max(
+        discovery.overflow,
+        documents.filter((d) => d.retrievalStatus === "deferred").length + (discovery.overflow - discovery.deferred.length),
+      ),
       error: null,
     };
   } catch (error) {
@@ -101,6 +134,16 @@ export async function loadDocumentContext(
 export function withDocumentEvidence(record: NormalizedOpportunity, context: DocumentContext): NormalizedOpportunity {
   if (!context.evidence) return record;
   return { ...record, rawData: { ...(record.rawData ?? {}), documentEvidence: context.evidence } };
+}
+
+/** Exclusion and superseding statements found anywhere in the corpus (not only in the excerpt). */
+export function corpusStatements(record: NormalizedOpportunity): string[] {
+  const evidence = (record.rawData as Record<string, unknown> | undefined)?.documentEvidence as
+    | { exclusions?: unknown; superseding?: unknown }
+    | undefined;
+  const pick = (value: unknown) =>
+    Array.isArray(value) ? value.map((entry) => (entry as { statement?: unknown })?.statement).filter((s): s is string => typeof s === "string") : [];
+  return [...pick(evidence?.exclusions), ...pick(evidence?.superseding)];
 }
 
 export function documentEvidenceText(record: NormalizedOpportunity): string {
@@ -123,7 +166,7 @@ export function classifyWithDocumentEvidence(record: NormalizedOpportunity): { r
   const augmented = classifyProviderRecordRelevance({ ...record, description: `${record.description ?? ""}\n\n${evidence}` });
   const raised = RANK[decideRelevance(augmented).verdict] > RANK[decideRelevance(base).verdict];
   const chosen = raised ? augmented : base;
-  const contradictions = contradictingStatements(evidence, record);
+  const contradictions = contradictingStatements([evidence, ...corpusStatements(record)].join("\n"), record);
   if (contradictions.length > 0 && decideRelevance(chosen).verdict === "accept") {
     return { result: capToReview(chosen, contradictions), usedDocuments: true, contradictions };
   }
