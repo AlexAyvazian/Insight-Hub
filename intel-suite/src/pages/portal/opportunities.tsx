@@ -24,6 +24,17 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { ProviderQuotaTelemetry } from "@/components/ProviderQuotaTelemetry";
+import {
+  OpportunityStateBadge,
+  OpportunityStateFilter,
+} from "@/components/opportunities/OpportunityDecisionState";
+import { OpportunityEvidencePanel } from "@/components/opportunities/OpportunityEvidencePanel";
+import { ProviderStatusIndicator } from "@/components/opportunities/ProviderStatusIndicator";
+import {
+  displayStateCounts,
+  opportunityDisplayState,
+  type OpportunityDisplayState,
+} from "@/components/opportunities/opportunityDecision";
 import { useToast } from "@/hooks/use-toast";
 import {
   Select,
@@ -229,6 +240,8 @@ export default function OpportunitiesDashboard() {
   const [dateFilter, setDateFilter] = useState("90");
   const [page, setPage] = useState(1);
   const [testingTypeFilter, setTestingTypeFilter] = useState<string | null>(null);
+  const [decisionStateFilter, setDecisionStateFilter] =
+    useState<OpportunityDisplayState | null>(null);
   const PAGE_SIZE = 50;
 
   const [isFetchOpen, setIsFetchOpen] = useState(false);
@@ -816,7 +829,18 @@ export default function OpportunitiesDashboard() {
     opp.agency === "Unknown"
       ? (extractAgencyHint(opp.title) ?? "—")
       : (opp.agency ?? "—");
-  const opportunities = oppsData?.data ?? [];
+  const loadedOpportunities = oppsData?.data ?? [];
+  // Decision-state chips filter the loaded page (stored decision first, listing classification as fallback).
+  const decisionStateCounts = displayStateCounts(loadedOpportunities);
+  const activeDecisionState =
+    decisionStateFilter && decisionStateCounts[decisionStateFilter] > 0
+      ? decisionStateFilter
+      : null;
+  const opportunities = activeDecisionState
+    ? loadedOpportunities.filter(
+        (opp: any) => opportunityDisplayState(opp) === activeDecisionState,
+      )
+    : loadedOpportunities;
   // Group by the server-assigned primary testing type (largest group first, "Uncategorized" last). The UI never
   // infers a type; the chips below filter the loaded page to one type.
   const allTypeGroups = groupByTestingType(opportunities);
@@ -978,14 +1002,18 @@ export default function OpportunitiesDashboard() {
         )}
       </div>
 
-      <QualityViewTabs
-        value={qualityView}
-        onChange={(value) => {
-          setQualityView(value);
-          setStatus("all");
-          setPage(1);
-        }}
-      />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <QualityViewTabs
+          value={qualityView}
+          onChange={(value) => {
+            setQualityView(value);
+            setStatus("all");
+            setDecisionStateFilter(null);
+            setPage(1);
+          }}
+        />
+        <ProviderStatusIndicator />
+      </div>
 
       <div className="glass-panel rounded-2xl p-4 flex flex-col md:flex-row gap-4 items-center">
         <div className="relative flex-1 w-full">
@@ -1086,7 +1114,7 @@ export default function OpportunitiesDashboard() {
               Try Again
             </Button>
           </div>
-        ) : opportunities.length === 0 ? (
+        ) : loadedOpportunities.length === 0 ? (
           <div className="p-16 text-center text-muted-foreground flex flex-col items-center justify-center">
             <AlertCircle className="w-12 h-12 mb-4 opacity-25" />
             <h3 className="text-lg font-medium text-white mb-2">
@@ -1099,6 +1127,11 @@ export default function OpportunitiesDashboard() {
           </div>
         ) : (
           <>
+          <OpportunityStateFilter
+            value={activeDecisionState}
+            counts={decisionStateCounts}
+            onChange={setDecisionStateFilter}
+          />
           {allTypeGroups.length > 1 && (
             <div
               role="group"
@@ -1196,6 +1229,7 @@ export default function OpportunitiesDashboard() {
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex flex-wrap gap-2 items-center">
                         {getSourceBadge(opp.source, opp.providerName)}
+                        <OpportunityStateBadge opp={opp} />
                         {getQualityBadge(opp)}
                         {relScore != null && (
                           <Badge
@@ -1819,6 +1853,9 @@ export default function OpportunitiesDashboard() {
           </DialogHeader>
 
           <div className="py-2 space-y-5">
+            {selectedOpportunity && (
+              <OpportunityEvidencePanel opp={selectedOpportunity} />
+            )}
             {summaryLoading ? (
               <div className="py-12 text-center space-y-3">
                 <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto" />
