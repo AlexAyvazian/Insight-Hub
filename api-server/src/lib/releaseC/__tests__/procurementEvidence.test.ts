@@ -17,6 +17,8 @@ import { ensureReleaseCSchema } from "../schema";
 import type { EvidenceSection } from "../requirements";
 
 const DAY_MS = 86_400_000;
+// Providers report statuses outside the normalized union (cancelled, withdrawn, open); versions read them as text.
+const status = (value: string) => value as unknown as NormalizedOpportunity["status"];
 // Database-backed cases run only where Postgres is actually reachable (some CI jobs set the URL without a server).
 const hasDb = await (async () => {
   if (!process.env.RFP_DATABASE_URL) return false;
@@ -116,9 +118,9 @@ describe("procurement identity and versions", () => {
     const extended = versionSnapshot(notice({ responseDeadline: new Date("2026-12-15T17:00:00Z") }));
     assert.deepEqual(changedFields(first, extended), ["deadline"]);
     assert.equal(releaseTag(first, extended), "amendment");
-    const cancelled = versionSnapshot(notice({ status: "cancelled" }));
+    const cancelled = versionSnapshot(notice({ status: status("cancelled") }));
     assert.equal(releaseTag(first, cancelled), "cancellation");
-    const contact = versionSnapshot(notice({ status: "open" }));
+    const contact = versionSnapshot(notice({ status: status("open") }));
     assert.equal(releaseTag(first, contact), "update");
   });
 
@@ -129,7 +131,7 @@ describe("procurement identity and versions", () => {
     assert.equal(await recordOpportunityVersion(input(notice())), "tender");
     assert.equal(await recordOpportunityVersion(input(notice())), null, "an unchanged observation adds nothing");
     assert.equal(await recordOpportunityVersion(input(notice({ responseDeadline: new Date("2026-12-20T17:00:00Z") }))), "amendment");
-    assert.equal(await recordOpportunityVersion(input(notice({ responseDeadline: new Date("2026-12-20T17:00:00Z"), status: "withdrawn" }))), "cancellation");
+    assert.equal(await recordOpportunityVersion(input(notice({ responseDeadline: new Date("2026-12-20T17:00:00Z"), status: status("withdrawn") }))), "cancellation");
     const versions = await listOpportunityVersions(opportunityId);
     assert.deepEqual(versions.map((version) => version.releaseTag), ["cancellation", "amendment", "tender"]);
     assert.deepEqual(versions[1]!.changedFields, ["deadline"]);
