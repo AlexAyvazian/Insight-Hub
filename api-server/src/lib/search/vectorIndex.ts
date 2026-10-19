@@ -160,11 +160,46 @@ export async function indexOpportunities(opportunities: NormalizedOpportunity[])
  * opportunityVectorSync.ts; hits without one are counted, not guessed. Throws RetrievalMethodError so the caller can
  * fall back to lexical-only and record why.
  */
+/**
+ * While the vector store or query embedding is failing, searches skip the vector leg for a cooldown instead of
+ * waiting several seconds per request for the same failure (HYBRID_VECTOR_COOLDOWN_MS, default 5 minutes).
+ */
+let vectorUnavailableUntil = 0;
+let lastVectorFailure: RetrievalMethodError | null = null;
+
+function vectorCooldownMs(): number {
+  const raw = Number(process.env.HYBRID_VECTOR_COOLDOWN_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60_000;
+}
+
+export function clearVectorCooldownForTests(): void {
+  vectorUnavailableUntil = 0;
+  lastVectorFailure = null;
+}
+
 export async function searchVectorIndex(
   query: string,
   limit: number,
   options: VectorIndexOptions = {},
 ): Promise<MethodRetrieval> {
+  if (Date.now() < vectorUnavailableUntil && lastVectorFailure) {
+    throw new RetrievalMethodError("vector_index_cooling_down", `Skipped after a recent failure: ${lastVectorFailure.message}`, {
+      failedCode: lastVectorFailure.code,
+      retryAt: new Date(vectorUnavailableUntil).toISOString(),
+    });
+  }
+  try {
+    return await searchVectorStore(query, limit, options);
+  } catch (error) {
+    if (error instanceof RetrievalMethodError) {
+      lastVectorFailure = error;
+      vectorUnavailableUntil = Date.now() + vectorCooldownMs();
+    }
+    throw error;
+  }
+}
+
+async function searchVectorStore(query: string, limit: number, options: VectorIndexOptions): Promise<MethodRetrieval> {
   const qdrant = await qdrantProvider.isConfigured();
   const pinecone = !qdrant && (await pineconeProvider.isConfigured());
   if (!qdrant && !pinecone) {
