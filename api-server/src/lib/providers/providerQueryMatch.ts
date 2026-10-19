@@ -217,9 +217,29 @@ export function recordMatchesProviderQuery(
   return queryInProfileScope(query) && decideRelevance(classifyProviderRecordRelevance(record)).verdict !== "reject";
 }
 
-function mismatchSample(
+/** Below this much own description text a missing query term says more about the snippet than about the notice. */
+export const THIN_SNIPPET_CHARS = 160;
+
+/**
+ * Why a record that did not match the query is deferred. Neither reason is a rejection: missing keywords and thin
+ * snippets are retrieval evidence, not relevance evidence, so the canonical decision still judges the record.
+ */
+export type QueryDeferralReason = "thin_snippet" | "query_terms_absent";
+
+export function queryDeferralReason(record: NormalizedOpportunity): QueryDeferralReason {
+  const ownText = (isWebDiscoverySource(record.source) ? ownNoticeText(record.description) : record.description) ?? "";
+  return ownText.replace(/\s+/g, " ").trim().length < THIN_SNIPPET_CHARS ? "thin_snippet" : "query_terms_absent";
+}
+
+/**
+ * A query non-match, kept and flagged instead of dropped. `manualQueryMismatch` keeps the existing downstream
+ * handling (admitted after matches, AI recovery may clear it); `queryMatchDeferred` tells the quality decision the
+ * record is deferred for review rather than rejected for the missing keywords alone.
+ */
+function deferredRecord(
   record: NormalizedOpportunity,
   query: string,
+  reason: QueryDeferralReason,
 ): NormalizedOpportunity {
   return {
     ...record,
@@ -227,8 +247,10 @@ function mismatchSample(
       ...(record.rawData ?? {}),
       manualQueryMismatch: true,
       manualQuery: query,
+      queryMatchDeferred: true,
+      queryDeferralReason: reason,
       tags: Array.from(
-        new Set([...stringTags(record), "manual-query-mismatch"]),
+        new Set([...stringTags(record), "manual-query-mismatch", "query-deferred"]),
       ),
     },
   };
@@ -236,10 +258,15 @@ function mismatchSample(
 
 export interface ProviderQueryPartition {
   matched: NormalizedOpportunity[];
+  /** Every query non-match, flagged and in a deterministic order (title, then external id). Nothing is dropped. */
+  deferred: NormalizedOpportunity[];
+  /** The first `rejectionSampleLimit` deferred records, for callers that only want bounded diagnostics. */
   rejectedSamples: NormalizedOpportunity[];
   rawCount: number;
   matchedCount: number;
+  /** Count of query non-matches (all of them are in `deferred`). */
   rejectedCount: number;
+  deferredByReason: Record<QueryDeferralReason, number>;
 }
 
 export function partitionProviderRecordsForQuery(
@@ -251,37 +278,45 @@ export function partitionProviderRecordsForQuery(
   if (!query?.trim()) {
     return {
       matched: normalizedRecords,
+      deferred: [],
       rejectedSamples: [],
       rawCount: normalizedRecords.length,
       matchedCount: normalizedRecords.length,
       rejectedCount: 0,
+      deferredByReason: { thin_snippet: 0, query_terms_absent: 0 },
     };
   }
 
   const matched: NormalizedOpportunity[] = [];
-  const rejected: NormalizedOpportunity[] = [];
+  const unmatched: NormalizedOpportunity[] = [];
   for (const record of normalizedRecords) {
     if (recordMatchesProviderQuery(record, query)) matched.push(record);
-    else rejected.push(record);
+    else unmatched.push(record);
   }
 
-  const sampleLimit = Math.max(0, Math.floor(rejectionSampleLimit));
-  const rejectedSamples = rejected
+  const deferredByReason: Record<QueryDeferralReason, number> = { thin_snippet: 0, query_terms_absent: 0 };
+  const deferred = unmatched
     .slice()
     .sort(
       (left, right) =>
         left.title.localeCompare(right.title) ||
         left.externalId.localeCompare(right.externalId),
     )
-    .slice(0, sampleLimit)
-    .map((record) => mismatchSample(record, query));
+    .map((record) => {
+      const reason = queryDeferralReason(record);
+      deferredByReason[reason]++;
+      return deferredRecord(record, query, reason);
+    });
+  const sampleLimit = Math.max(0, Math.floor(rejectionSampleLimit));
 
   return {
     matched,
-    rejectedSamples,
+    deferred,
+    rejectedSamples: deferred.slice(0, sampleLimit),
     rawCount: normalizedRecords.length,
     matchedCount: matched.length,
-    rejectedCount: rejected.length,
+    rejectedCount: deferred.length,
+    deferredByReason,
   };
 }
 

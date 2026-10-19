@@ -72,8 +72,8 @@ function roundRobin(
 
 /**
  * Deterministically interleaves one record per source before returning to a
- * prolific source. Query matches are always admitted before bounded mismatch
- * samples, so diagnostics never displace actionable records.
+ * prolific source. Query matches are always admitted before deferred query
+ * non-matches, so deferred records never displace actionable ones.
  */
 export function fairMergeOpportunityGroups(
   groups: readonly OpportunitySourceGroup[],

@@ -9,6 +9,7 @@ import {
   meaningfulManualQueryTerms,
   recordMatchesManualQuery,
 } from "../manualQueryFilter";
+import { partitionProviderRecordsForQuery } from "../../providers/providerQueryMatch";
 import {
   calculateCompletenessScore,
   decideOpportunityQuality,
@@ -178,5 +179,45 @@ describe("manual ingestion query boundary", () => {
     });
     assert.equal(calculateCompletenessScore(unknownDate), 88);
     assert.equal(calculateCompletenessScore(knownDate), 100);
+  });
+});
+
+describe("query non-matches are deferred, not dropped", () => {
+  const relevant = record("Occupational Health Services", {
+    description:
+      "Pre-employment physical examinations, drug testing, audiograms, and respirator fit testing for county employees across all departments, with annual medical surveillance.",
+  });
+  const janitorial = record("DFCM Maintenance - Stage II Janitorial Services - Invitation to Bid", { type: "Bid" });
+
+  it("keeps every non-match, flagged with a deferral reason, after the matches", () => {
+    const partition = partitionProviderRecordsForQuery([relevant, janitorial], "fleet telematics", 0);
+    assert.equal(partition.matchedCount, 0);
+    assert.equal(partition.rejectedCount, 2);
+    assert.equal(partition.deferred.length, 2, "nothing is dropped beyond the diagnostic sample limit");
+    assert.equal(partition.rejectedSamples.length, 0);
+    assert.ok(partition.deferred.every((r) => r.rawData?.queryMatchDeferred === true && r.rawData?.manualQueryMismatch === true));
+    const reasons = Object.fromEntries(partition.deferred.map((r) => [r.title, r.rawData?.queryDeferralReason]));
+    assert.equal(reasons["Occupational Health Services"], "query_terms_absent");
+    assert.equal(reasons["DFCM Maintenance - Stage II Janitorial Services - Invitation to Bid"], "thin_snippet");
+    assert.deepEqual(partition.deferredByReason, { thin_snippet: 1, query_terms_absent: 1 });
+  });
+
+  it("holds a deferred record for review unless the canonical decision rejects it on its own grounds", () => {
+    const partition = partitionProviderRecordsForQuery([relevant, janitorial], "fleet telematics", 0);
+    const byTitle = new Map(partition.deferred.map((r) => [r.title, r]));
+    const held = decideOpportunityQuality(byTitle.get("Occupational Health Services")!);
+    assert.equal(held.status, "quarantined");
+    assert.match(held.reason ?? "", /^query_deferred\|/);
+    const rejected = decideOpportunityQuality(byTitle.get(janitorial.title)!);
+    assert.equal(rejected.status, "rejected");
+    assert.doesNotMatch(rejected.reason ?? "", /^manual_query_mismatch\|/, "rejected for relevance, not for the missing keywords");
+  });
+
+  it("still rejects a legacy mismatch sample that was never marked deferred", () => {
+    const legacy = record("Occupational Health Services", {
+      description: relevant.description,
+      rawData: { sourceConfidence: "high", manualQueryMismatch: true, manualQuery: "fleet telematics" },
+    });
+    assert.match(decideOpportunityQuality(legacy).reason ?? "", /^manual_query_mismatch\|/);
   });
 });

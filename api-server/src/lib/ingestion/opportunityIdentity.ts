@@ -33,6 +33,7 @@ export const QUALITY_REJECTION_CODES = {
   missingServiceEvidence: "missing_occumed_service_evidence",
   insufficientCombination: "insufficient_evidence_combination",
   manualQueryMismatch: "manual_query_mismatch",
+  queryDeferred: "query_deferred",
   unknownPostedDate: "unknown_posted_date",
   structuredReviewHeld: "structured_review_held",
 } as const;
@@ -267,7 +268,10 @@ export function decideOpportunityQuality(
       sourceConfidence,
     };
   }
-  if (record.rawData?.manualQueryMismatch === true) {
+  // A query non-match flagged as deferred (providerQueryMatch.ts) is not rejected for missing keywords or a thin
+  // snippet: the canonical decision below judges it, and if it would keep it the record is held for review.
+  const queryDeferred = record.rawData?.manualQueryMismatch === true && record.rawData?.queryMatchDeferred === true;
+  if (record.rawData?.manualQueryMismatch === true && !queryDeferred) {
     const query =
       typeof record.rawData.manualQuery === "string"
         ? record.rawData.manualQuery
@@ -347,6 +351,19 @@ export function decideOpportunityQuality(
     return {
       status: "quarantined",
       reason: encodedQualityReason(QUALITY_REJECTION_CODES.structuredReviewHeld, `${structured.code}: ${structured.reason}`),
+      completenessScore,
+      sourceConfidence,
+    };
+  }
+  if (queryDeferred) {
+    const query = typeof record.rawData?.manualQuery === "string" ? record.rawData.manualQuery : "the requested query";
+    const why = record.rawData?.queryDeferralReason === "thin_snippet" ? "its source snippet is too thin to show the query terms" : "it does not contain the query terms";
+    return {
+      status: "quarantined",
+      reason: encodedQualityReason(
+        QUALITY_REJECTION_CODES.queryDeferred,
+        `Deferred for review: ${why} (${JSON.stringify(query.slice(0, 120))}), but the canonical relevance decision (${decision.verdict}) does not reject it.`,
+      ),
       completenessScore,
       sourceConfidence,
     };

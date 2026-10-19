@@ -354,10 +354,12 @@ async function collectSource(
       source,
       partition: {
         matched: [],
+        deferred: [],
         rejectedSamples: [],
         rawCount: 0,
         matchedCount: 0,
         rejectedCount: 0,
+        deferredByReason: { thin_snippet: 0, query_terms_absent: 0 },
       },
       records: [],
       errors,
@@ -409,7 +411,8 @@ async function collectSource(
   return {
     source,
     partition,
-    records: [...partition.matched, ...partition.rejectedSamples],
+    // Query non-matches are deferred, not dropped: the fair merge admits them only after every source's matches.
+    records: [...partition.matched, ...partition.deferred],
     errors,
   };
 }
