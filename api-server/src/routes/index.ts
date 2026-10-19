@@ -54,6 +54,12 @@ router.use(
     () => import("./opportunity-summary-v2"),
   ),
 );
+router.use(
+  lazyRouter(
+    (req) => req.method === "GET" && /^\/opportunities\/[^/]+\/(versions|documents)\/?$/.test(req.path),
+    () => import("./opportunity-evidence"),
+  ),
+);
 router.use(rfpProviderBoundaryRouter);
 router.use(
   lazyRouter(

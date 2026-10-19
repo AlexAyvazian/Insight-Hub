@@ -70,9 +70,9 @@ export async function registerAttachments(
   opportunityKey: string,
   attachments: AttachmentRef[],
   priority: number,
-  options: { authoritative?: boolean; listedUrls?: string[] } = {},
-): Promise<{ registered: number; queued: number; withdrawn: number }> {
-  if (attachments.length === 0 && !options.authoritative) return { registered: 0, queued: 0, withdrawn: 0 };
+  options: { authoritative?: boolean; listedUrls?: string[]; deferred?: AttachmentRef[] } = {},
+): Promise<{ registered: number; queued: number; withdrawn: number; deferred: number }> {
+  if (attachments.length === 0 && !options.authoritative && !options.deferred?.length) return { registered: 0, queued: 0, withdrawn: 0, deferred: 0 };
   await ensureReleaseCSchema();
   let withdrawn = 0;
   if (options.authoritative) {
@@ -136,8 +136,62 @@ export async function registerAttachments(
     );
     if (job.rows[0]?.inserted) queued += 1;
   }
-  return { registered, queued, withdrawn };
+  const deferred = await inventoryDeferred(opportunityKey, options.deferred ?? []);
+  return { registered, queued, withdrawn, deferred };
 }
+
+/**
+ * Over-cap attachments go into the inventory as 'deferred' documents with no extraction job (one statement), so
+ * the full listed set is visible and none is mistaken for absent; promoteDeferredDocuments() feeds them to the
+ * worker a few at a time. Returns how many were newly inventoried.
+ */
+async function inventoryDeferred(opportunityKey: string, refs: AttachmentRef[]): Promise<number> {
+  if (refs.length === 0) return 0;
+  const rows = refs.map((ref) => ({ id: randomUUID(), url: ref.url, role: ref.role, title: ref.title, version: ref.sourceVersion, amended: ref.amendedAt }));
+  const result = await (await rcPool()).query(
+    `INSERT INTO opportunity_documents (id, opportunity_key, source_url, document_role, title, source_version, amended_at, retrieval_status)
+     SELECT r.id, $1, r.url, r.role, r.title, r.version, r.amended::timestamptz, 'deferred'
+       FROM jsonb_to_recordset($2::jsonb) AS r(id text, url text, role text, title text, version text, amended text)
+      WHERE NOT EXISTS (SELECT 1 FROM opportunity_documents d WHERE d.opportunity_key = $1 AND d.source_url = r.url)
+     ON CONFLICT DO NOTHING`,
+    [opportunityKey, JSON.stringify(rows)],
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
+ * Bounded background processing of deferred attachments: up to `limit` per call, spread across opportunities
+ * (oldest first), and at most `dailyLimit` per UTC day overall, at a priority below every registered document.
+ */
+export async function promoteDeferredDocuments(limit: number, dailyLimit: number): Promise<number> {
+  await ensureReleaseCSchema();
+  const pool = await rcPool();
+  const today = await pool.query(
+    `SELECT count(*)::int AS n FROM document_extraction_jobs WHERE priority <= $1 AND created_at >= date_trunc('day', now() AT TIME ZONE 'utc') AT TIME ZONE 'utc'`,
+    [DEFERRED_PRIORITY],
+  );
+  const room = Math.min(limit, dailyLimit - Number(today.rows[0]?.n ?? 0));
+  if (room <= 0) return 0;
+  const result = await pool.query(
+    `WITH picked AS (
+       SELECT id, opportunity_key FROM (
+         SELECT id, opportunity_key, first_seen_at,
+                row_number() OVER (PARTITION BY opportunity_key ORDER BY first_seen_at, id) AS rank_in_notice
+           FROM opportunity_documents WHERE retrieval_status = 'deferred' AND superseded_by IS NULL
+       ) ranked ORDER BY rank_in_notice, first_seen_at, id LIMIT $1
+     ), promoted AS (
+       UPDATE opportunity_documents d SET retrieval_status = 'pending', updated_at = now()
+         FROM picked WHERE d.id = picked.id RETURNING d.id, d.opportunity_key
+     )
+     INSERT INTO document_extraction_jobs (id, document_id, opportunity_key, priority)
+     SELECT gen_random_uuid()::text, id, opportunity_key, $2 FROM promoted
+     ON CONFLICT (document_id) DO NOTHING`,
+    [room, DEFERRED_PRIORITY],
+  );
+  return result.rowCount ?? 0;
+}
+
+export const DEFERRED_PRIORITY = -10;
 
 /**
  * Re-queues documents that failed only because their content type was not on the download allow-list, when that

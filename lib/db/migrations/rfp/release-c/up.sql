@@ -296,4 +296,21 @@ CREATE TABLE IF NOT EXISTS provider_pool_cooldowns (
     reason text,
     updated_at timestamptz NOT NULL DEFAULT now()
   );
+CREATE TABLE IF NOT EXISTS opportunity_versions (
+    id text PRIMARY KEY,
+    opportunity_id text NOT NULL,
+    opportunity_key text,
+    provider text NOT NULL,
+    provider_native_id text,
+    raw_record_id text,
+    release_tag text NOT NULL,
+    content_hash text NOT NULL,
+    snapshot jsonb NOT NULL,
+    changed_fields jsonb NOT NULL DEFAULT '[]'::jsonb,
+    solicitation_number text,
+    source_url text,
+    source_modified text,
+    observed_at timestamptz NOT NULL DEFAULT now()
+  );
+CREATE INDEX IF NOT EXISTS idx_opportunity_versions_opportunity ON opportunity_versions (opportunity_id, observed_at DESC);
 COMMIT;

@@ -40,6 +40,7 @@ import {
 } from "./providerRunner";
 import {
   classifyIdentityMatch,
+  isSeparateProcurement,
   failedProvidersForRetry,
   finalIngestionStatus,
   mergeSourceRefresh,
@@ -49,6 +50,7 @@ import {
   STALE_INGESTION_RUN_AFTER_MS,
 } from "./pipelineRules";
 import { conciseIngestionError } from "./ingestionError";
+import { recordOpportunityVersion } from "../releaseC/versions";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const RETRYABLE_RUN_STATUSES = new Set([
@@ -276,7 +278,30 @@ async function createPersistedRun(
   return (await getIngestionRun(runId))!;
 }
 
+/**
+ * A weak match (same canonical URL, or same title and buyer) is not the same procurement when both records state
+ * different solicitation numbers: a re-issued annual contract or a sibling lot on the same portal page is a separate
+ * procurement, not a duplicate. Strong matches (provider id, solicitation number) are unaffected.
+ */
 async function findExistingOpportunity(
+  tx: any,
+  record: NormalizedOpportunity,
+  keys: OpportunityDedupeKey[],
+): Promise<{
+  opportunityId: string;
+  matchType: OpportunityDedupeKey["type"];
+} | null> {
+  const match = await findIdentityMatch(tx, record, keys);
+  if (!match || (match.matchType !== "url" && match.matchType !== "fingerprint") || !record.solicitationNumber?.trim()) return match;
+  const [matched] = await tx
+    .select({ solicitationNumber: opportunitiesTable.solicitationNumber })
+    .from(opportunitiesTable)
+    .where(eq(opportunitiesTable.id, match.opportunityId))
+    .limit(1);
+  return isSeparateProcurement(match.matchType, record.solicitationNumber, matched?.solicitationNumber) ? null : match;
+}
+
+async function findIdentityMatch(
   tx: any,
   record: NormalizedOpportunity,
   keys: OpportunityDedupeKey[],
@@ -432,8 +457,9 @@ async function processOneRecord(
     externalId: providerNativeId,
   });
   const quality = decideOpportunityQuality(record);
+  let resolvedOpportunityId: string | null = null;
 
-  return rfpDb.transaction(async (tx) => {
+  const counts = await rfpDb.transaction(async (tx): Promise<Omit<ProcessingCounts, "staged"> & { staged: 1 }> => {
     await tx.insert(opportunityRawRecordsTable).values({
       id: rawRecordId,
       runId,
@@ -552,6 +578,7 @@ async function processOneRecord(
           updatedAt: now,
         })
         .where(eq(opportunityStagingTable.id, stagingId));
+      resolvedOpportunityId = opportunityId;
       return {
         staged: 1,
         accepted: 0,
@@ -627,6 +654,7 @@ async function processOneRecord(
         updatedAt: now,
       })
       .where(eq(opportunityStagingTable.id, stagingId));
+    resolvedOpportunityId = opportunityId;
     return {
       staged: 1,
       accepted: 1,
@@ -636,6 +664,11 @@ async function processOneRecord(
       updated,
     };
   });
+  // Version history (OCDS-style releases): best effort and outside the transaction, so it never blocks ingestion.
+  if (resolvedOpportunityId) {
+    await recordOpportunityVersion({ opportunityId: resolvedOpportunityId, provider, providerNativeId, rawRecordId, record }).catch(() => undefined);
+  }
+  return counts;
 }
 
 async function incrementProgress(

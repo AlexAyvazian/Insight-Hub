@@ -17,6 +17,7 @@ import { acceptedJobError, CAPPED_METHOD_SUFFIX, extractionCredentialPools, extr
 import { buildSections } from "./sections";
 import {
   claimNextJob,
+  promoteDeferredDocuments,
   copySections,
   findExtractedByHash,
   finishJob,
@@ -300,6 +301,8 @@ export function retryDelayMs(status: number, attempts: number, retryAfter: strin
 }
 
 let allowListRecoveryDone = false;
+const DEFERRED_BATCH = Math.max(1, Number(process.env.DOCUMENT_DEFERRED_BATCH ?? 5) || 5);
+const DEFERRED_DAILY_LIMIT = Math.max(0, Number(process.env.DOCUMENT_DEFERRED_DAILY_LIMIT ?? 150) || 0);
 
 export interface WorkerRunSummary {
   processed: number;
@@ -331,7 +334,15 @@ export async function runDocumentWorker(options: {
   }
   while (outcomes.length < options.maxJobs) {
     if (Date.now() - started > options.deadlineMs) return { processed: outcomes.length, outcomes, stoppedBy: "deadline" };
-    const job = await claimNextJob(workerId);
+    let job = await claimNextJob(workerId);
+    if (!job) {
+      // Idle: take a few deferred (over-cap) attachments into the queue, within a daily bound.
+      const promoted = await promoteDeferredDocuments(DEFERRED_BATCH, DEFERRED_DAILY_LIMIT).catch(() => 0);
+      if (promoted > 0) {
+        console.info(JSON.stringify({ event: "document_deferred_promoted", promoted }));
+        job = await claimNextJob(workerId);
+      }
+    }
     if (!job) return { processed: outcomes.length, outcomes, stoppedBy: "empty" };
     try {
       outcomes.push(await processJob(job, options.reopen));

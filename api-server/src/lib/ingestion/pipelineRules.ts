@@ -87,6 +87,23 @@ export function classifyIdentityMatch(
   return null;
 }
 
+/**
+ * A weak identity match (same canonical URL, or same title and buyer) is a separate procurement, not a duplicate,
+ * when both records state different solicitation numbers: a re-issued annual contract, or sibling lots listed on
+ * one portal page. Strong matches (provider id, solicitation number) are never split.
+ */
+export function isSeparateProcurement(
+  matchType: OpportunityDedupeKey["type"],
+  incomingSolicitation: string | null | undefined,
+  matchedSolicitation: string | null | undefined,
+): boolean {
+  if (matchType !== "url" && matchType !== "fingerprint") return false;
+  const normalize = (value: string | null | undefined) => (value ?? "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  const incoming = normalize(incomingSolicitation);
+  const matched = normalize(matchedSolicitation);
+  return incoming.length > 0 && matched.length > 0 && incoming !== matched;
+}
+
 export function shouldProtectCanonicalFromRefresh(
   matchType: OpportunityDedupeKey["type"],
   fallback: boolean,

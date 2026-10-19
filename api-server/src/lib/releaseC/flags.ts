@@ -10,6 +10,7 @@
  *   DOCUMENT_EXTRACTION_WORKER_MODE       "off" (default) | "child": run the extraction worker as a child process
  *   OPPORTUNITY_SHARED_WORK_DURABLE       share page fetches / AI extractions across workers and deploys (default on
  *                                         in production, off elsewhere so tests never read another run's results)
+ *   OPPORTUNITY_FULL_CORPUS_EVIDENCE      rank evidence passages over every document section (default on)
  *   PROVIDER_ACCOUNTING_FAIL_CLOSED       refuse billable-capable account calls while durable accounting is down
  *                                         (default on)
  *
@@ -56,4 +57,9 @@ export function durableSharedWorkEnabled(env: Record<string, string | undefined>
 /** Billable-capable accounts are not used while reservations cannot be recorded durably. */
 export function accountingFailClosed(env: Record<string, string | undefined> = process.env): boolean {
   return flag("PROVIDER_ACCOUNTING_FAIL_CLOSED", true, env);
+}
+
+/** Document evidence ranked over every stored section instead of a kind-ordered prefix (default on). */
+export function fullCorpusEvidenceEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return flag("OPPORTUNITY_FULL_CORPUS_EVIDENCE", true, env);
 }

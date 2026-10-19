@@ -28,6 +28,7 @@ export const RELEASE_C_TABLES = [
   "provider_account_reservations",
   "provider_purpose_usage",
   "provider_pool_cooldowns",
+  "opportunity_versions",
 ] as const;
 
 export const RELEASE_C_DDL: readonly string[] = [
@@ -313,6 +314,24 @@ export const RELEASE_C_DDL: readonly string[] = [
     reason text,
     updated_at timestamptz NOT NULL DEFAULT now()
   )`,
+  // OCDS-style release history per procurement: tender, amendment, cancellation, update (Opportunities wave 2).
+  `CREATE TABLE IF NOT EXISTS opportunity_versions (
+    id text PRIMARY KEY,
+    opportunity_id text NOT NULL,
+    opportunity_key text,
+    provider text NOT NULL,
+    provider_native_id text,
+    raw_record_id text,
+    release_tag text NOT NULL,
+    content_hash text NOT NULL,
+    snapshot jsonb NOT NULL,
+    changed_fields jsonb NOT NULL DEFAULT '[]'::jsonb,
+    solicitation_number text,
+    source_url text,
+    source_modified text,
+    observed_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_opportunity_versions_opportunity ON opportunity_versions (opportunity_id, observed_at DESC)`,
 ];
 
 type Runner = (statement: string) => Promise<unknown>;

@@ -12,6 +12,9 @@ const DOCUMENT_LINK = /\.(pdf|docx?|xlsx?|txt|rtf|zip)(?:$|[?#])|\/(?:download|a
 // Registration cap per notice. Attachments beyond it are counted (never silently dropped) and their URLs still
 // count as listed, so they are not mistaken for withdrawn ones; the document set is reported incomplete.
 export const MAX_ATTACHMENTS = Math.max(10, Number(process.env.DOCUMENT_MAX_ATTACHMENTS ?? 120) || 120);
+// Attachments over the cap are still inventoried (as deferred documents processed later by bounded background
+// jobs), up to this many per notice; anything beyond it is only counted.
+export const MAX_INVENTORIED_ATTACHMENTS = Math.max(MAX_ATTACHMENTS, Number(process.env.DOCUMENT_MAX_INVENTORY ?? 2_000) || 2_000);
 
 function safeDecode(value: string): string {
   try {
@@ -34,6 +37,7 @@ interface Collector {
   out: AttachmentRef[];
   seen: Set<string>;
   overflow: string[];
+  deferred: AttachmentRef[];
 }
 
 function pushUnique(collector: Collector, url: string | undefined | null, title: string | null, extra: Partial<AttachmentRef> = {}) {
@@ -49,11 +53,13 @@ function pushUnique(collector: Collector, url: string | undefined | null, title:
   }
   if (isObviouslyUnsafeUrl(normalized) || seen.has(normalized)) return;
   seen.add(normalized);
+  const ref: AttachmentRef = { url: normalized, title, role: extra.role ?? roleFor(normalized, title), sourceVersion: extra.sourceVersion ?? null, amendedAt: extra.amendedAt ?? null };
   if (out.length >= MAX_ATTACHMENTS) {
     collector.overflow.push(normalized);
+    if (out.length + collector.deferred.length < MAX_INVENTORIED_ATTACHMENTS) collector.deferred.push(ref);
     return;
   }
-  out.push({ url: normalized, title, role: extra.role ?? roleFor(normalized, title), sourceVersion: extra.sourceVersion ?? null, amendedAt: extra.amendedAt ?? null });
+  out.push(ref);
 }
 
 function linksIn(text: string): Array<{ url: string; title: string | null }> {
@@ -93,11 +99,13 @@ export interface AttachmentDiscovery {
   listedUrls: string[];
   /** Listed attachments over the registration cap. */
   overflow: number;
+  /** The over-cap attachments that are inventoried as deferred documents (the rest of `overflow` is only counted). */
+  deferred: AttachmentRef[];
 }
 
 export function discoverAttachmentsWithCoverage(record: NormalizedOpportunity): AttachmentDiscovery {
   const base = record.sourceUrl && /^https?:\/\//i.test(record.sourceUrl) ? record.sourceUrl : null;
-  const collector: Collector = { out: [], seen: new Set<string>(), overflow: [] };
+  const collector: Collector = { out: [], seen: new Set<string>(), overflow: [], deferred: [] };
   const raw = (record.rawData ?? {}) as Record<string, unknown>;
   const modified = typeof raw.modifiedDate === "string" ? raw.modifiedDate : typeof raw.postedDate === "string" ? raw.postedDate : null;
 
@@ -143,6 +151,7 @@ export function discoverAttachmentsWithCoverage(record: NormalizedOpportunity): 
     attachments: collector.out,
     listedUrls: [...collector.out.map((a) => a.url), ...collector.overflow],
     overflow: collector.overflow.length,
+    deferred: collector.deferred,
   };
 }
 
