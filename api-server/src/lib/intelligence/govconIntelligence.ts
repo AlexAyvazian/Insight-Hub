@@ -3,6 +3,7 @@ import { embedTexts } from "../search/embeddings";
 import { getOccuMedSemanticProfile } from "../search/semanticRerank";
 import { classifyResult } from "../search/relevance";
 import { decideRelevanceWithCodes, type RelevanceVerdict } from "../search/relevanceDecision";
+import { primaryPurchasedScopeCitation, applyPrimaryPurchasedScope, assessPrimaryPurchasedScope } from "../search/primaryPurchasedScope";
 
 export type GovConIntelligenceMode = "forecast" | "recompete";
 
@@ -26,6 +27,9 @@ export interface GovConRelevance {
   semanticSimilarity: number | null;
   provider: "gemini" | "deterministic";
   reasons: string[];
+  primaryScopeEvidenced: boolean;
+  profileSource: string;
+  profileVersion: string;
 }
 
 function normalizedText(record: GovConRankableRecord): string {
@@ -55,18 +59,22 @@ function deterministicScore(record: GovConRankableRecord, mode: GovConIntelligen
   score: number;
   verdict: RelevanceVerdict;
   reasons: string[];
+  primaryScopeEvidenced: boolean;
+  profileSource: string;
+  profileVersion: string;
 } {
   const result = classifyResult({
     title: record.title,
     snippet: [record.description, record.naics, record.setAside].filter(Boolean).join(" "),
     allowHistorical: true,
-    // Forecasts / Recompete keep legacy containment matching until measured separately (Opportunities uses "token").
-    matchMode: "substring",
+    matchMode: "token",
   });
-  const decision = decideRelevanceWithCodes(result, [{ system: "NAICS 2022", code: record.naics }]);
-  const reasons = result.rejected
-    ? [result.rejectReason ?? decision.reason]
-    : result.reasons.slice(0, 4);
+  const input = { title: record.title, description: record.description };
+  const scoped = applyPrimaryPurchasedScope(result, assessPrimaryPurchasedScope(result, input));
+  const decision = decideRelevanceWithCodes(scoped, [{ system: "NAICS 2022", code: record.naics }]);
+  const reasons = scoped.rejected
+    ? [scoped.rejectReason ?? decision.reason]
+    : scoped.reasons.slice(0, 4);
   if (result.rejected && decision.verdict === "review") {
     // Say what actually happened: nothing in the title/description named an Occu-Med service, and the record is only
     // here because of its classification code or a partial signal. "Insufficient evidence" read like a rejection.
@@ -82,9 +90,16 @@ function deterministicScore(record: GovConRankableRecord, mode: GovConIntelligen
   if (mode === "recompete" && (record.incumbentName || record.isRecompete)) {
     reasons.push("Published recompete or incumbent signal");
   }
+  const primaryScope = primaryPurchasedScopeCitation(result, input);
+  // Matching an industry code or incidental medical wording is discovery evidence, not proof of purchased scope.
+  const verdict = decision.verdict === "accept" && (!primaryScope.evidenced || primaryScope.hold) ? "review" : decision.verdict;
+  if (verdict !== decision.verdict) reasons.unshift("Primary purchased scope does not establish an Occu-Med service; held for review");
   return {
-    score: result.score,
-    verdict: decision.verdict,
+    score: scoped.score,
+    verdict,
+    primaryScopeEvidenced: primaryScope.evidenced,
+    profileSource: result.profileSource,
+    profileVersion: result.profileVersion,
     reasons: Array.from(new Set(reasons)).slice(0, 5),
   };
 }
@@ -162,7 +177,7 @@ export async function rankGovConRecords<T extends GovConRankableRecord>(
 
   return records
     .map((record, index): T & { relevance: GovConRelevance } => {
-      const base = deterministic[index] ?? { score: 0, verdict: "reject" as RelevanceVerdict, reasons: [] };
+      const base = deterministic[index]!;
       const semanticSimilarity = similarities?.[index] ?? null;
       // The verdict is the canonical Neon decision. Optional semantic similarity only orders records within it.
       const score = Math.round(base.score);
@@ -181,6 +196,9 @@ export async function rankGovConRecords<T extends GovConRankableRecord>(
           semanticSimilarity,
           provider,
           reasons: Array.from(new Set(reasons)).slice(0, 6),
+          primaryScopeEvidenced: base.primaryScopeEvidenced,
+          profileSource: base.profileSource,
+          profileVersion: base.profileVersion,
         },
       };
     })
@@ -196,4 +214,9 @@ export async function rankGovConRecords<T extends GovConRankableRecord>(
         (right.relevance.semanticSimilarity ?? 0) - (left.relevance.semanticSimilarity ?? 0)
       );
     });
+}
+
+/** The default workspace contains accepted service purchases, never code-only or unassessed review candidates. */
+export function isOccuMedFit(record: { relevance: GovConRelevance }): boolean {
+  return record.relevance.profileSource !== "unavailable" && record.relevance.verdict === "accept" && record.relevance.primaryScopeEvidenced;
 }

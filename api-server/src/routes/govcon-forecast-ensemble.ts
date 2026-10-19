@@ -1,10 +1,13 @@
+import { workspaceResult } from "../lib/intelligence/workspaceResults";
+import { ensureRelevanceProfile } from "../lib/occumedAware/relevanceProfileLoader";
+import { getRelevanceProfile } from "../lib/search/relevanceProfile";
 import { Router } from "express";
 import { logger } from "../lib/logger";
 import {
   isGovConRecordSuppressed,
   loadGovConSuppressions,
 } from "../lib/intelligence/govconFeedback";
-import { rankGovConRecords } from "../lib/intelligence/govconIntelligence";
+import { isOccuMedFit, rankGovConRecords } from "../lib/intelligence/govconIntelligence";
 import { fetchAgencyForecastLeads } from "../lib/intelligence/agencyForecastDiscovery";
 import { loadLocalOfficialSignals } from "../lib/intelligence/localOfficialSignals";
 import { fetchTangoForecasts } from "../lib/intelligence/tangoForecastProvider";
@@ -18,7 +21,6 @@ const router = Router();
 const GOVCON_BASE_URL = "https://govconapi.com/api/v1";
 const REQUEST_TIMEOUT_MS = 12_000;
 const CACHE_TTL_MS = 10 * 60_000;
-const MAX_CACHE_ENTRIES = 40;
 const DAY_MS = 86_400_000;
 
 type JsonRecord = Record<string, unknown>;
@@ -54,12 +56,6 @@ type ForecastPayload = Omit<ForecastDataset, "records"> & {
   };
   cached: boolean;
 };
-
-const cache = new Map<
-  string,
-  { expiresAt: number; dataset: ForecastDataset }
->();
-const inFlight = new Map<string, Promise<ForecastDataset>>();
 
 function stringQuery(value: unknown, maxLength = 160): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -243,17 +239,6 @@ export function isForwardForecast(
     record.estimatedAwardFiscalYear >= currentFy &&
     record.estimatedAwardFiscalYear <= currentFy + 5;
   return solicitationInWindow || awardFiscalYearInWindow;
-}
-
-function pruneCache(now = Date.now()): void {
-  for (const [key, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(key);
-  }
-  while (cache.size >= MAX_CACHE_ENTRIES) {
-    const oldest = cache.keys().next().value as string | undefined;
-    if (!oldest) break;
-    cache.delete(oldest);
-  }
 }
 
 function normalizedText(value: unknown): string {
@@ -477,7 +462,7 @@ async function buildForecastDataset(
   );
   const ranked = await rankGovConRecords(unsuppressed, "forecast", focus);
   const records = fitOnly
-    ? ranked.filter((record) => record.relevance.verdict !== "reject")
+    ? ranked.filter(isOccuMedFit)
     : ranked;
 
   return {
@@ -490,7 +475,7 @@ async function buildForecastDataset(
     ),
     suppressedCount: combined.length - unsuppressed.length,
     lowRelevanceCount: ranked.filter(
-      (record) => record.relevance.verdict === "reject",
+      (record) => !isOccuMedFit(record),
     ).length,
     filtersApplied: filters,
     semanticProvider: records.some(
@@ -546,28 +531,23 @@ router.get("/govcon/forecasts", async (req, res, next) => {
     state: stringQuery(req.query.state, 2),
   };
 
-  const cacheKey = JSON.stringify({ fitOnly, focus, filters });
-  pruneCache();
-  const cached = cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return res.json(
-      paginateForecastDataset(cached.dataset, limit, offset, true),
-    );
-  }
-
+  await ensureRelevanceProfile();
+  const profile = getRelevanceProfile();
+  if (profile.source === "unavailable") return res.status(503).json({ error: "Occu-Med Aware profile unavailable. Relevance cannot be verified; try again shortly." });
+  const currentSuppressions = await loadGovConSuppressions("forecast");
+  const suppressionVersion = [...currentSuppressions.recordIds, ...currentSuppressions.fingerprints].sort().join(",");
+  const cacheKey = JSON.stringify({ policy: 2, profile: profile.version, suppressionVersion, fitOnly, focus, filters });
   try {
-    let request = inFlight.get(cacheKey);
-    if (!request) {
-      request = buildForecastDataset(fitOnly, focus, filters);
-      inFlight.set(cacheKey, request);
-    }
-    const dataset = await request;
-    pruneCache();
-    cache.set(cacheKey, {
-      dataset,
-      expiresAt: Date.now() + CACHE_TTL_MS,
+    const dataset = await workspaceResult<ForecastDataset>("forecasts-v2", cacheKey, {
+      ttlMs: CACHE_TTL_MS,
+      refresh: req.query.refresh === "true",
+      load: () => buildForecastDataset(fitOnly, focus, filters),
+      usable: value => value.records.length > 0 || value.sourceBreakdown.recoveredErrors.length === 0,
     });
-    return res.json(paginateForecastDataset(dataset, limit, offset, false));
+    // Feedback is applied again on reads so restored snapshots cannot resurrect hidden records.
+    const suppressions = await loadGovConSuppressions("forecast");
+    const records = dataset.records.filter(record => !isGovConRecordSuppressed(suppressions, record));
+    return res.json(paginateForecastDataset({ ...dataset, records }, limit, offset, Boolean(dataset.savedResult)));
   } catch (error) {
     logger.error({ err: error }, "Forecast ensemble failed");
     const statusCode =
@@ -580,8 +560,6 @@ router.get("/govcon/forecasts", async (req, res, next) => {
         ? { diagnostics: diagnostics.slice(0, 6) }
         : {}),
     });
-  } finally {
-    inFlight.delete(cacheKey);
   }
 });
 

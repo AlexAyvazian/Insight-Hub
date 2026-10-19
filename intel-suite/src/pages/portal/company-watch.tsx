@@ -18,7 +18,7 @@ type AwardLead = {
 type AwardsResponse = { companies: Record<string, AwardLead[]>; warnings?: string[]; lastPass?: { finishedAt: string | null } | null; generatedAt: string };
 type ProviderResult = { name: string; status: string; count: number; error?: string | null };
 const NEWS_PROVIDER_LABELS: Record<string, string> = { tinyfish: "TinyFish", keenable: "Keenable", gnews: "GNews", apitube: "APITube", thenewsapi: "The News API", currents: "Currents", gdelt: "GDELT", newsdata: "NewsData.io" };
-type SearchResult = { articles: Article[]; updatedAt: string | null; warnings?: string[]; providers?: ProviderResult[] };
+type SearchResult = { articles: Article[]; updatedAt: string | null; warnings?: string[]; providers?: ProviderResult[]; refreshWarning?: string; persistenceWarning?: string };
 type CompanyCheck = { updatedAt: string | null; warnings: string[]; providers: ProviderResult[] };
 const SEED=['Leidos','IAP Worldwide Services','MAG Aerospace','Camber Corporation','Trace Systems','KBR','BAE Systems','Weatherford International','Versar','Constellis','C3EL','Fluor Corporation','Clovehitch','V2X','Sierra Nevada Corporation','Valiant Integrated Services','AC Transit','Freeport-McMoRan','California Department of Corrections and Rehabilitation','Alutiiq','ManTech International','GDC','CACI International','IDS International','SOS International','ITC Defense','DataPath','SkyBridge Tactical','Amentum','American International Contractors','Anduril','APVI','ASRC Federal','Astrapi Advisors','Atlas Advisors','Bell Textron','BL Harbert International','CDAS','Dynamic Aviation','Fathom 4','GardaWorld','General Dynamics Information Technology','Group SSI','IAP','International SOS','Jacobs Technology','Leidos','Navmar Applied Science Corporation','Noblis','Olgoonik Solutions','Patriot Group International','Peraton','Platform Aerospace','Prüst Holding','S3 International','Strategic Solutions Unlimited','University of Maryland Global Campus','Vectrus','Versar Global Solutions','Westinghouse Electric Company'];
 const COMPANY_DOMAINS: Record<string,string> = { Leidos:'leidos.com', 'IAP Worldwide Services':'iapws.com', 'MAG Aerospace':'magaero.com', 'Camber Corporation':'camber.com', 'Trace Systems':'tracesystems.com', KBR:'kbr.com', 'BAE Systems':'baesystems.com', 'Weatherford International':'weatherford.com', Versar:'versar.com', Constellis:'constellis.com', C3EL:'c3el.com', 'Fluor Corporation':'fluor.com', Clovehitch:'clovehitch.com', V2X:'v2x.com', 'Sierra Nevada Corporation':'sncorp.com', 'Valiant Integrated Services':'valiantintegrated.com', 'AC Transit':'actransit.org', 'Freeport-McMoRan':'fcx.com', Alutiiq:'alutiiq.com', 'ManTech International':'mantech.com', GDC:'gdc4s.com', 'CACI International':'caci.com', 'IDS International':'idsinternational.com', 'SOS International':'internationalsos.com', 'ITC Defense':'itcdefense.com', 'DataPath':'datapath.com', 'SkyBridge Tactical':'skybridgetactical.com', Amentum:'amentum.com', Anduril:'anduril.com', 'ASRC Federal':'asrcfederal.com', 'Bell Textron':'bellflight.com', 'Dynamic Aviation':'dynamicaviation.com', 'GardaWorld':'garda.com', 'General Dynamics Information Technology':'gdit.com', 'International SOS':'internationalsos.com', 'Jacobs Technology':'jacobs.com', Noblis:'noblis.org', Peraton:'peraton.com', Vectrus:'v2x.com', 'Westinghouse Electric Company':'westinghouse.com' };
@@ -195,6 +195,42 @@ export default function CompanyWatchPage() {
   const [awards, setAwards] = useState<Record<string, AwardLead[]>>({});
   const [awardsState, setAwardsState] = useState<{ loading: boolean; error: string | null; generatedAt: string | null }>({ loading: false, error: null, generatedAt: null });
   const companyNamesKey = companies.map(company => company.name).join("\u0000");
+  const [restoring, setRestoring] = useState(true);
+  useEffect(() => {
+    const controller = new AbortController();
+    setRestoring(true);
+    void (async () => {
+      try {
+        const response = await fetch(`${baseUrl}/api/company-watch/saved`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ companies: companyNamesKey.split("\u0000").filter(Boolean) }),
+          signal: controller.signal,
+        });
+        const result = await response.json() as { companies?: Record<string, SearchResult>; error?: string };
+        if (!response.ok) throw new Error(result.error || "Saved company news could not be loaded.");
+        if (controller.signal.aborted) return;
+        const saved = Object.entries(result.companies ?? {});
+        setChecks(previous => ({ ...Object.fromEntries(saved.map(([name, value]) => [name, { updatedAt: value.updatedAt, warnings: value.warnings ?? [], providers: value.providers ?? [] }])), ...previous }));
+        setArticles(previous => {
+          const merged = new Map<string, Article>();
+          for (const [name, value] of saved) for (const article of value.articles) {
+            const existing = merged.get(article.url);
+            merged.set(article.url, { ...article, companyNames: [...new Set([...(existing?.companyNames ?? []), name])], assessments: { ...existing?.assessments, ...article.assessments } });
+          }
+          for (const article of previous) {
+            const existing = merged.get(article.url);
+            merged.set(article.url, { ...article, companyNames: [...new Set([...(existing?.companyNames ?? []), ...(article.companyNames ?? [])])], assessments: { ...existing?.assessments, ...article.assessments } });
+          }
+          return [...merged.values()];
+        });
+        const latest = saved.map(([, value]) => value.updatedAt).filter((date): date is string => Boolean(date)).sort().at(-1);
+        if (latest) setUpdated(previous => previous && previous > latest ? previous : latest);
+      } catch (error) {
+        if (!controller.signal.aborted) setWarnings(previous => [...new Set([...previous, error instanceof Error ? error.message : "Saved news unavailable."])]);
+      } finally { if (!controller.signal.aborted) setRestoring(false); }
+    })();
+    return () => controller.abort();
+  }, [companyNamesKey]);
   const loadAwards = useCallback(async () => {
     const names = companyNamesKey ? companyNamesKey.split("\u0000") : [];
     if (!names.length) { setAwards({}); return; }
@@ -236,7 +272,8 @@ export default function CompanyWatchPage() {
           const result: SearchResult & { error?: string } = await response.json();
           if (!response.ok) throw new Error(result.error || "Company news search failed");
           const providerResults = result.providers ?? [];
-          const failed = providerResults.length > 0 && providerResults.every(provider => provider.status === "error");
+          const failed = providerResults.length > 0 && !providerResults.some(provider => provider.status === "ok");
+          result.warnings = [...new Set([...(result.warnings ?? []), ...[result.refreshWarning, result.persistenceWarning].filter((value): value is string => Boolean(value))])];
           setChecks(previous => ({ ...previous, [name]: {
             updatedAt: failed ? previous[name]?.updatedAt ?? null : result.updatedAt,
             warnings: result.warnings ?? [], providers: providerResults,
@@ -273,7 +310,7 @@ export default function CompanyWatchPage() {
     onSettled: () => { void loadAwards(); },
   });
   useEffect(() => {
-    if (!auto || !companies.length) return;
+    if (!auto || !companies.length || restoring) return;
     const tick = () => {
       const now = new Date();
       const time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
@@ -285,7 +322,7 @@ export default function CompanyWatchPage() {
     };
     const interval = window.setInterval(tick, 10_000);
     return () => window.clearInterval(interval);
-  }, [auto, times, companies.length, mutation]);
+  }, [auto, times, companies.length, mutation, restoring]);
   useEffect(() => {
     if (!selected) return;
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setSelected(null); };
@@ -316,7 +353,7 @@ export default function CompanyWatchPage() {
             <input aria-label="Add a company" value={add} onChange={event => setAdd(event.target.value)} onKeyDown={event => { if (event.key === "Enter") addCompany(); }} placeholder="Add a company to watch…" className="min-h-12 min-w-0 flex-1 rounded-xl border border-white/20 bg-black/20 px-4 text-base text-white outline-none focus:border-primary" />
             <button type="button" onClick={addCompany} className="inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-4 text-base font-semibold text-[#09163a]"><Plus className="h-5 w-5" />Add</button>
           </div>
-          <button type="button" onClick={() => mutation.mutate(companies.map(company => company.name))} disabled={mutation.isPending || !companies.length} className="inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/15 px-5 text-base font-semibold text-white hover:bg-primary/25 disabled:opacity-50">
+          <button type="button" onClick={() => mutation.mutate(companies.map(company => company.name))} disabled={restoring || mutation.isPending || !companies.length} className="inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/15 px-5 text-base font-semibold text-white hover:bg-primary/25 disabled:opacity-50">
             {mutation.isPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <Search className="h-5 w-5" />}{mutation.isPending ? "Searching…" : "Search Saved Companies"}
           </button>
         </div>
@@ -343,6 +380,7 @@ export default function CompanyWatchPage() {
 
       {mutation.isError && <div role="alert" className="flex gap-3 rounded-2xl border border-red-300/30 bg-red-950/60 p-5 text-base text-red-100"><CircleAlert className="h-5 w-5 shrink-0" /><span>{mutation.error instanceof Error ? mutation.error.message : "Company news search failed."}</span></div>}
       {warnings.length > 0 && <div role="status" className="rounded-2xl border border-amber-300/30 bg-amber-950/60 p-5 text-base text-amber-100">{warnings.map(warning => <p key={warning}>{warning}</p>)}</div>}
+      {restoring && <p role="status" className="text-slate-200">Restoring saved company news…</p>}
 
       <div className="flex flex-wrap items-center justify-between gap-3 text-base text-slate-200" aria-live="polite">
         <span>{companies.length} companies watched{updated && ` · last search ${ago(updated)}`}</span>
@@ -373,7 +411,7 @@ export default function CompanyWatchPage() {
                 </div>
               </button>
               <div className="px-5 pb-5">
-                <button type="button" aria-label={`Search news for ${company.name}`} onClick={() => mutation.mutate([company.name])} disabled={mutation.isPending} className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/15 px-4 text-base font-semibold text-white hover:bg-primary/25 disabled:opacity-50">
+                <button type="button" aria-label={`Search news for ${company.name}`} onClick={() => mutation.mutate([company.name])} disabled={restoring || mutation.isPending} className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/15 px-4 text-base font-semibold text-white hover:bg-primary/25 disabled:opacity-50">
                   {searching ? <Loader2 className="h-5 w-5 animate-spin" /> : <Search className="h-5 w-5" />}{searching ? "Searching…" : "Search this company"}
                 </button>
               </div>
@@ -388,7 +426,7 @@ export default function CompanyWatchPage() {
             <div><h2 id="company-update-title" className="text-3xl font-bold text-white">{selected.name}</h2><p className="mt-2 text-base text-slate-200">{checks[selected.name]?.updatedAt ? `Last checked ${ago(checks[selected.name].updatedAt)}` : "Search this company to load current coverage."}</p></div>
             <button type="button" aria-label="Close company updates" onClick={() => setSelected(null)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 text-white hover:bg-white/10"><X className="h-5 w-5" /></button>
           </div>
-          <button type="button" onClick={() => mutation.mutate([selected.name])} disabled={mutation.isPending} className="mt-4 inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-5 text-base font-semibold text-[#09163a] disabled:opacity-50"><Search className="h-5 w-5" />{mutation.isPending ? "Searching…" : "Search this company"}</button>
+          <button type="button" onClick={() => mutation.mutate([selected.name])} disabled={restoring || mutation.isPending} className="mt-4 inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-5 text-base font-semibold text-[#09163a] disabled:opacity-50"><Search className="h-5 w-5" />{mutation.isPending ? "Searching…" : "Search this company"}</button>
           {checks[selected.name]?.warnings.map(warning => <p key={warning} role="status" className="mt-3 text-base text-amber-100">{warning}</p>)}
           <section aria-label="Official contract awards" className="mt-6">
             <div className="mb-3 flex flex-wrap items-center gap-3">

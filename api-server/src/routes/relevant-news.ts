@@ -1,3 +1,4 @@
+import { workspaceResult } from "../lib/intelligence/workspaceResults";
 import { Router, type IRouter } from "express";
 import { resolveCredential } from "../lib/config/providerConfig";
 import { keenableProvider } from "../lib/providers/keenable";
@@ -20,7 +21,6 @@ router.get("/news/article-image", async (req, res) => {
 const GNEWS_SEARCH_URL = "https://gnews.io/api/v4/search";
 const REQUEST_TIMEOUT_MS = 12_000;
 const CACHE_TTL_MS = 15 * 60 * 1000;
-const MAX_CACHE_ENTRIES = 30;
 
 // Keep the upstream query broad enough to return useful reporting, then apply
 // Occu-Med-specific relevance scoring locally. GNews treats publisher country as
@@ -63,14 +63,6 @@ type NewsPayload = {
   deduplicated: number;
   fetchedAt: string;
 };
-
-type CacheEntry = {
-  expiresAt: number;
-  payload: NewsPayload;
-};
-
-const responseCache = new Map<string, CacheEntry>();
-const inFlight = new Map<string, Promise<NewsPayload>>();
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -237,18 +229,6 @@ export function normalizeArticle(rawValue: unknown): NewsArticle | null {
     companies: contractorSignals.companies,
     signals: contractorSignals.signals,
   };
-}
-
-function pruneCache(): void {
-  const now = Date.now();
-  for (const [key, entry] of responseCache) {
-    if (entry.expiresAt <= now) responseCache.delete(key);
-  }
-  while (responseCache.size > MAX_CACHE_ENTRIES) {
-    const oldestKey = responseCache.keys().next().value as string | undefined;
-    if (!oldestKey) break;
-    responseCache.delete(oldestKey);
-  }
 }
 
 async function requestGNews(query: string, max: number, page: number, apiKey: string): Promise<JsonRecord> {
@@ -450,29 +430,19 @@ router.get("/relevant-news", async (req, res) => {
   const newsKeyConfigured = Boolean(await resolveCredential("tinyfishApiKey", "TINYFISH_API_KEY"));
   const cacheKey = `${newsKeyConfigured}|${sourceDomains.join(",")}|${query}|${max}|${page}|${Boolean(process.env.GNEWS_API_KEY?.trim())}|${apitubeKeys().length}|${process.env.GNEWS_MAX_ARTICLES}|${process.env.APITUBE_NEWS_MAX_ARTICLES}|${Boolean(process.env.THENEWSAPI_API_TOKEN)}|${Boolean(process.env.CURRENTS_API_KEY)}|${Boolean(process.env.NEWSDATA_IO_API_KEY)}|${Boolean(process.env.NEWSDATA_IO_API_KEY_2)}`;
 
-  pruneCache();
-  const cached = responseCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return res.json({ ...cached.payload, cached: true });
-  }
-
   try {
-    let request = inFlight.get(cacheKey);
-    if (!request) {
-      request = fetchRelevantNews(query, max, page, userSearch, sourceDomains);
-      inFlight.set(cacheKey, request);
-    }
-
-    const payload = await request;
-    responseCache.set(cacheKey, { payload, expiresAt: Date.now() + (payload.warnings.length ? 60_000 : CACHE_TTL_MS) });
-    return res.json({ ...payload, cached: false });
+    const payload = await workspaceResult<NewsPayload>("relevant-news-v1", cacheKey, {
+      ttlMs: CACHE_TTL_MS,
+      refresh: req.query.refresh === "true",
+      load: () => fetchRelevantNews(query, max, page, userSearch, sourceDomains),
+      usable: value => value.articles.length > 0 || value.warnings.length === 0,
+    });
+    return res.json({ ...payload, cached: Boolean(payload.savedResult) });
   } catch (error) {
     const statusCode = Number((error as { statusCode?: number }).statusCode) || 502;
     const message = error instanceof Error ? error.message : "Failed to retrieve relevant news";
     logger.error({ statusCode, query }, "Relevant news request failed");
     return res.status(statusCode).json({ error: message });
-  } finally {
-    inFlight.delete(cacheKey);
   }
 });
 

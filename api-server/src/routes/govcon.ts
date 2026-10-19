@@ -1,3 +1,6 @@
+import { workspaceResult } from "../lib/intelligence/workspaceResults";
+import { ensureRelevanceProfile } from "../lib/occumedAware/relevanceProfileLoader";
+import { getRelevanceProfile } from "../lib/search/relevanceProfile";
 import { Router, type IRouter } from "express";
 import { logger } from "../lib/logger";
 import {
@@ -9,6 +12,7 @@ import {
 } from "../lib/intelligence/govconFeedback";
 import {
   rankGovConRecords,
+  isOccuMedFit,
   type GovConRelevance,
 } from "../lib/intelligence/govconIntelligence";
 import { verifyRecompete } from "../lib/intelligence/recompeteVerification";
@@ -66,11 +70,6 @@ type ForecastPayload = {
   fetchedAt: string;
 };
 
-type CacheEntry = {
-  expiresAt: number;
-  payload: ForecastPayload;
-};
-
 /** Show upstream provider health without relaying provider error bodies or credentials. */
 export function safeForecastProviderError(name: "GovCon" | "Tango", error: string): string {
   const status = /(?:HTTP |API returned |API )(\d{3})\b/i.exec(error)?.[1];
@@ -81,8 +80,6 @@ export function safeForecastProviderError(name: "GovCon" | "Tango", error: strin
   return name + " provider request failed";
 }
 
-const responseCache = new Map<string, CacheEntry>();
-const inFlight = new Map<string, Promise<ForecastPayload>>();
 const indexedAt = new Map<string, number>();
 
 function stringQuery(value: unknown, maxLength = 160): string | undefined {
@@ -270,23 +267,10 @@ export function isGovConSemanticCandidate(
   );
 }
 
-function pruneCache(): void {
-  const now = Date.now();
-  for (const [key, entry] of responseCache) {
-    if (entry.expiresAt <= now) responseCache.delete(key);
-  }
-  for (const [key, timestamp] of indexedAt) {
-    if (timestamp + INDEX_TTL_MS <= now) indexedAt.delete(key);
-  }
-  while (responseCache.size > MAX_CACHE_ENTRIES) {
-    const oldestKey = responseCache.keys().next().value as string | undefined;
-    if (!oldestKey) break;
-    responseCache.delete(oldestKey);
-  }
-}
-
 function scheduleVectorIndex(cacheKey: string, mode: GovConFeedbackMode, records: RankedForecast[]): void {
+  for (const [key, timestamp] of indexedAt) if (timestamp + INDEX_TTL_MS <= Date.now()) indexedAt.delete(key);
   if (records.length === 0 || indexedAt.has(cacheKey)) return;
+  while (indexedAt.size >= MAX_CACHE_ENTRIES) indexedAt.delete(indexedAt.keys().next().value!);
   indexedAt.set(cacheKey, Date.now());
   queueMicrotask(() => {
     void indexVectorDocuments(
@@ -425,9 +409,9 @@ async function fetchForecasts(
   });
   const unsuppressed = allCandidates.filter((record) => !isGovConRecordSuppressed(suppressions, record));
   const ranked = await rankGovConRecords(unsuppressed, mode, focus);
-  const lowRelevanceCount = ranked.filter((record) => record.relevance.verdict === "reject").length;
+  const lowRelevanceCount = ranked.filter((record) => !isOccuMedFit(record)).length;
   const records = fitOnly
-    ? ranked.filter((record) => record.relevance.verdict !== "reject")
+    ? ranked.filter(isOccuMedFit)
     : ranked;
 
   return {
@@ -492,32 +476,26 @@ router.get("/govcon/forecasts", async (req, res) => {
 
   if (mode === "recompete") params.set("is_recompete", "true");
 
-  const cacheKey = `${mode}|fit:${fitOnly}|focus:${focus ?? ""}|${params.toString()}`;
-  pruneCache();
-  const cached = responseCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    scheduleVectorIndex(cacheKey, mode, cached.payload.records);
-    return res.json({ ...cached.payload, cached: true });
-  }
-
+  await ensureRelevanceProfile();
+  const profile = getRelevanceProfile();
+  if (profile.source === "unavailable") return res.status(503).json({ error: "Occu-Med Aware profile unavailable. Relevance cannot be verified; try again shortly." });
+  const suppressions = await loadGovConSuppressions(mode);
+  const suppressionVersion = [...suppressions.recordIds, ...suppressions.fingerprints].sort().join(",");
+  const cacheKey = `v2|${profile.version}|${suppressionVersion}|${mode}|fit:${fitOnly}|focus:${focus ?? ""}|${params.toString()}`;
   try {
-    let request = inFlight.get(cacheKey);
-    if (!request) {
-      request = fetchForecasts(params, mode, fitOnly, focus);
-      inFlight.set(cacheKey, request);
-    }
-
-    const payload = await request;
-    responseCache.set(cacheKey, { payload, expiresAt: Date.now() + CACHE_TTL_MS });
+    const payload = await workspaceResult<ForecastPayload>("recompetes-v2", cacheKey, {
+      ttlMs: CACHE_TTL_MS,
+      refresh: req.query.refresh === "true",
+      load: () => fetchForecasts(params, mode, fitOnly, focus),
+      usable: value => value.records.length > 0 || value.sourceBreakdown.recoveredErrors.length === 0,
+    });
     scheduleVectorIndex(cacheKey, mode, payload.records);
-    return res.json({ ...payload, cached: false });
+    return res.json({ ...payload, cached: Boolean(payload.savedResult) });
   } catch (error) {
     const statusCode = Number((error as { statusCode?: number }).statusCode) || 502;
     const message = error instanceof Error ? error.message : "Failed to retrieve GovCon forecasts";
     logger.error({ err: error, filters: Object.fromEntries(params) }, "GovCon forecast request failed");
     return res.status(statusCode).json({ error: message });
-  } finally {
-    inFlight.delete(cacheKey);
   }
 });
 
@@ -527,7 +505,6 @@ router.post("/govcon/feedback", async (req, res) => {
   try {
     if (action === "restore_all") {
       const restored = await restoreGovConFeedback(mode);
-      responseCache.clear();
       return res.json({ ok: true, restored });
     }
 
@@ -538,7 +515,6 @@ router.post("/govcon/feedback", async (req, res) => {
       return res.status(400).json({ error: "recordId, title, and agency are required" });
     }
     await saveGovConNotRelevant({ mode, recordId, title, agency });
-    responseCache.clear();
     return res.json({ ok: true });
   } catch (error) {
     logger.error({ err: error, mode, action }, "GovCon feedback persistence failed");
@@ -587,7 +563,6 @@ router.post("/govcon/budget-reset", async (req, res) => {
       .delete(settingsTable)
       .where(inArray(settingsTable.key, keys));
     clearProviderBudgetMemory();
-    responseCache.clear();
     logger.info({ deleted: result.rowCount ?? 0 }, "GovCon budget cooldown reset");
     return res.json({
       ok: true,
