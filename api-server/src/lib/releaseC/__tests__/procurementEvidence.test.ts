@@ -136,6 +136,19 @@ describe("procurement identity and versions", () => {
     assert.deepEqual(versions.map((version) => version.releaseTag), ["cancellation", "amendment", "tender"]);
     assert.deepEqual(versions[1]!.changedFields, ["deadline"]);
   });
+
+  it("judges a change against the same provider's last view, so another provider's wording is not an amendment", { skip: !hasDb }, async () => {
+    await ensureReleaseCSchema();
+    const opportunityId = `opp-${run}-cross`;
+    const observe = (provider: string, record: NormalizedOpportunity) =>
+      recordOpportunityVersion({ opportunityId, provider, providerNativeId: record.externalId!, rawRecordId: null, record });
+    assert.equal(await observe("samGov", notice()), "tender");
+    const reworded = notice({ agency: "EXAMPLE COUNTY GOVERNMENT", description: "Occupational medical examinations for county staff." });
+    assert.equal(await observe("tango", reworded), "update", "a second source's own wording is a cross-source update");
+    assert.equal(await observe("samGov", notice()), null, "the first source's unchanged view adds nothing");
+    assert.equal(await observe("tango", reworded), null);
+    assert.equal(await observe("tango", { ...reworded, responseDeadline: new Date("2026-12-22T17:00:00Z") }), "amendment");
+  });
 });
 
 describe("full attachment inventory", () => {

@@ -84,6 +84,12 @@ export function releaseTag(previous: VersionSnapshot | null, next: VersionSnapsh
   return "update";
 }
 
+/** A further provider's first view of a procurement already on record: a cancellation if it says so, else an update. */
+export function crossSourceTag(previous: VersionSnapshot | null, next: VersionSnapshot): ReleaseTag {
+  const tag = releaseTag(previous, next);
+  return tag === "cancellation" ? tag : "update";
+}
+
 export function snapshotHash(snapshot: VersionSnapshot): string {
   return hash(JSON.stringify(snapshot));
 }
@@ -103,14 +109,24 @@ export async function recordOpportunityVersion(input: {
   const pool = await rcPool();
   const snapshot = versionSnapshot(input.record);
   const contentHash = snapshotHash(snapshot);
+  // Each provider describes a notice in its own words (agency naming, description, attachment list), so a change is
+  // judged against this provider's own previous observation. The first observation from a further provider is a
+  // cross-source "update", never an amendment.
   const latest = await pool.query(
-    `SELECT content_hash, snapshot FROM opportunity_versions WHERE opportunity_id = $1 ORDER BY observed_at DESC, id DESC LIMIT 1`,
-    [input.opportunityId],
+    `(SELECT 'same' AS which, content_hash, snapshot FROM opportunity_versions WHERE opportunity_id = $1 AND provider = $2
+       ORDER BY observed_at DESC, id DESC LIMIT 1)
+     UNION ALL
+     (SELECT 'any' AS which, content_hash, snapshot FROM opportunity_versions WHERE opportunity_id = $1
+       ORDER BY observed_at DESC, id DESC LIMIT 1)`,
+    [input.opportunityId, input.provider],
   );
-  const previousRow = latest.rows[0] as { content_hash?: string; snapshot?: VersionSnapshot } | undefined;
-  if (previousRow?.content_hash === contentHash) return null;
-  const previous = previousRow?.snapshot ?? null;
-  const tag = releaseTag(previous, snapshot);
+  type Row = { which: "same" | "any"; content_hash?: string; snapshot?: VersionSnapshot };
+  const rows = latest.rows as Row[];
+  const sameProvider = rows.find((row) => row.which === "same");
+  const anyProvider = rows.find((row) => row.which === "any");
+  if (sameProvider?.content_hash === contentHash || anyProvider?.content_hash === contentHash) return null;
+  const previous = (sameProvider ?? anyProvider)?.snapshot ?? null;
+  const tag = sameProvider || !anyProvider ? releaseTag(previous, snapshot) : crossSourceTag(previous, snapshot);
   await pool.query(
     `INSERT INTO opportunity_versions (id, opportunity_id, opportunity_key, provider, provider_native_id, raw_record_id,
        release_tag, content_hash, snapshot, changed_fields, solicitation_number, source_url, source_modified)
