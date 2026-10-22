@@ -85,9 +85,8 @@ export function releaseTag(previous: VersionSnapshot | null, next: VersionSnapsh
 }
 
 /** A further provider's first view of a procurement already on record: a cancellation if it says so, else an update. */
-export function crossSourceTag(previous: VersionSnapshot | null, next: VersionSnapshot): ReleaseTag {
-  const tag = releaseTag(previous, next);
-  return tag === "cancellation" ? tag : "update";
+export function crossSourceTag(_previous: VersionSnapshot | null, next: VersionSnapshot): ReleaseTag {
+  return CANCELLED.test(`${next.type} ${next.status} ${next.title}`) ? "cancellation" : "update";
 }
 
 export function snapshotHash(snapshot: VersionSnapshot): string {
@@ -109,16 +108,19 @@ export async function recordOpportunityVersion(input: {
   const pool = await rcPool();
   const snapshot = versionSnapshot(input.record);
   const contentHash = snapshotHash(snapshot);
+  const sourceId = typeof input.record.rawData?.sourceId === "string" ? input.record.rawData.sourceId.trim() || null : null;
   // Each provider describes a notice in its own words (agency naming, description, attachment list), so a change is
-  // judged against this provider's own previous observation. The first observation from a further provider is a
-  // cross-source "update", never an amendment.
+  // judged against this source's own previous observation, including the tenant of an aggregate provider.
+  // Legacy snapshots without a sourceId cannot establish a tenant's lineage: start it with a cross-source update
+  // rather than guessing which tenant supplied the old view. Providers without sourceId keep their old lineage.
   const latest = await pool.query(
     `(SELECT 'same' AS which, content_hash, snapshot FROM opportunity_versions WHERE opportunity_id = $1 AND provider = $2
+       AND (snapshot->>'sourceId') IS NOT DISTINCT FROM $3::text
        ORDER BY observed_at DESC, id DESC LIMIT 1)
      UNION ALL
      (SELECT 'any' AS which, content_hash, snapshot FROM opportunity_versions WHERE opportunity_id = $1
        ORDER BY observed_at DESC, id DESC LIMIT 1)`,
-    [input.opportunityId, input.provider],
+    [input.opportunityId, input.provider, sourceId],
   );
   type Row = { which: "same" | "any"; content_hash?: string; snapshot?: VersionSnapshot };
   const rows = latest.rows as Row[];
@@ -140,7 +142,8 @@ export async function recordOpportunityVersion(input: {
       input.rawRecordId,
       tag,
       contentHash,
-      JSON.stringify(snapshot),
+      // Lineage is stored as metadata, outside the content hash and changed-field comparison.
+      JSON.stringify({ ...snapshot, sourceId }),
       JSON.stringify(changedFields(previous, snapshot)),
       snapshot.solicitation || null,
       snapshot.sourceUrl || null,
