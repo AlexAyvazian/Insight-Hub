@@ -3,6 +3,7 @@ import { Link } from "wouter";
 import {
   ArrowRight,
   CalendarRange,
+  Building2,
   ExternalLink,
   FileText,
   Network,
@@ -303,18 +304,27 @@ export default function Home() {
               desc: "Follow current federal contractor awards, acquisitions, procurement activity, solicitations, and recompete developments.",
               delay: 0.6,
             },
+            {
+              href: "/portal/company-watch",
+              imgUrl: "",
+              alt: "Company Watch",
+              icon: <Building2 className="w-5 h-5 text-primary-foreground" />,
+              title: "Company Watch",
+              desc: "Monitor companies and their awards in a separate workspace.",
+              delay: 0.7,
+            },
           ].map((card) => {
             const cardBody = (
               <div className="glass-card group relative h-full overflow-hidden rounded-3xl p-1">
                 <div className="absolute inset-0 bg-gradient-to-b from-primary/10 to-transparent opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
                 <div className="relative mb-4 overflow-hidden rounded-2xl border border-white/10">
-                  <img
+                  {card.imgUrl ? <img
                     src={card.imgUrl}
                     alt={card.alt}
                     loading="lazy"
                     decoding="async"
                     className="h-auto w-full object-contain transition-transform duration-700 group-hover:scale-105"
-                  />
+                  /> : <div role="img" aria-label={card.alt} className="flex h-40 items-center justify-center bg-gradient-to-br from-blue-950 via-sky-900/40 to-slate-950"><Building2 className="h-16 w-16 text-sky-300/70" /></div>}
                   <div className="absolute inset-0 bg-gradient-to-t from-[hsl(207,72%,10%)]/40 to-transparent" />
                   <div className="glass-panel absolute left-4 top-4 rounded-full p-2">
                     {card.icon}

@@ -256,16 +256,10 @@ async function assertPortalChrome(path, activeLabel) {
   });
   await page.getByRole("main").waitFor();
 
-  const nav = page.getByRole("navigation", {
-    name: "Intelligence workspaces",
-  });
-  await nav.waitFor();
-  const active = nav.getByRole("link", { name: activeLabel });
-  assert.equal(
-    await active.getAttribute("aria-current"),
-    "page",
-    `${path} must expose its active workspace`,
-  );
+  assert.equal(await page.getByRole("navigation", { name: "Intelligence workspaces" }).count(), 0,
+    `${path} must not link into other intelligence workspaces`);
+  const returnLink = page.getByRole("link", { name: "Back to Insight Hub" });
+  await returnLink.waitFor();
 
   const skipLink = page.getByRole("link", { name: "Skip to content" });
   await skipLink.waitFor();
@@ -286,10 +280,10 @@ async function assertPortalChrome(path, activeLabel) {
   );
   assert.ok(metrics.scrollHeight >= metrics.clientHeight, `${path} must fill the viewport`);
 
-  const activeBox = await active.boundingBox();
+  const activeBox = await returnLink.boundingBox();
   assert.ok(
     activeBox && activeBox.height >= 44,
-    `${path} active nav target must be at least 44px high`,
+    `${path} return target must be at least 44px high`,
   );
 
   const orbAnimation = await page

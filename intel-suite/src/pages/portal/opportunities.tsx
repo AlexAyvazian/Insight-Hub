@@ -265,7 +265,6 @@ export default function OpportunitiesDashboard() {
     "sam_gov",
     "tango",
     "internationalPublicPortals",
-    "aiDiscovery",
   ]);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [gradingIds, setGradingIds] = useState<Set<string>>(new Set());
@@ -552,7 +551,7 @@ export default function OpportunitiesDashboard() {
         toast({
           title: "Fetch started",
           description:
-            "Progress is saved. SAM.gov, Tango, and Canada + Europe respect your selections; browser discovery spends renewable quota before lower-priority fallbacks.",
+            "Progress is saved. Official and structured sources run by default. Web discovery is optional and its unverified hits stay out of the bid-ready view.",
         });
       } catch (err: any) {
         toast({

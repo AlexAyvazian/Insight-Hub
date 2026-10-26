@@ -81,7 +81,10 @@ export function buildTedQuery(keywords?: string): string {
     const escaped = focus.replace(/"/g, "").slice(0, 120);
     clauses.push(`FT~"${escaped}"`);
   }
-  return clauses.length > 1 ? `(${clauses.join(" OR ")})` : clauses[0] ?? "";
+  // The profile can be unavailable during a manual run. TED rejects an empty
+  // expert query with HTTP 400; retain a narrow medical procurement anchor.
+  if (clauses.length === 0) clauses.push('FT~"occupational health"');
+  return clauses.length > 1 ? `(${clauses.join(" OR ")})` : clauses[0]!;
 }
 
 function firstString(value: unknown): string | undefined {

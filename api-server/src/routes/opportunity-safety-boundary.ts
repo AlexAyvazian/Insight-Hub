@@ -50,6 +50,7 @@ const RANKING_DESCRIPTION_CHARS = 8_000;
 interface RankedEntry {
   id: string;
   title: string;
+  classification: OpportunityQualityView["classification"];
   rank: number;
   authority: ReturnType<typeof sourceAuthority>;
   contextualAdjustment: number;
@@ -400,7 +401,7 @@ router.get("/opportunities", async (req, res) => {
         const existing = best.get(key);
         if (!existing) {
           best.set(key, {
-            id: String(row.id), title: String(row.title ?? ""), rank, authority,
+            id: String(row.id), title: String(row.title ?? ""), classification: quality.classification, rank, authority,
             contextualAdjustment: contextual.adjustment, contextualFeedback,
             contextHash: contextual.contextHash, suppressed: row.userGrade === "spam",
             sources: [provider], decision,
@@ -412,7 +413,7 @@ router.get("/opportunities", async (req, res) => {
           (authority.bonus === existing.authority.bonus && rank > existing.rank);
         if (canonicalWins) {
           Object.assign(existing, {
-            id: String(row.id), title: String(row.title ?? ""), authority,
+            id: String(row.id), title: String(row.title ?? ""), classification: quality.classification, authority,
             contextualAdjustment: contextual.adjustment, contextualFeedback,
             contextHash: contextual.contextHash, suppressed: row.userGrade === "spam", decision,
           });
@@ -433,7 +434,12 @@ router.get("/opportunities", async (req, res) => {
       }
     }
 
+    const qualityOrder = { "verified-open": 0, "needs-verification": 1, "discovery-only": 2, closed: 3, archived: 3, award: 3, forecast: 3 } as const;
     const sorted = Array.from(best.values()).sort((left, right) => {
+      if (view === "all") {
+        const difference = qualityOrder[left.classification] - qualityOrder[right.classification];
+        if (difference) return difference;
+      }
       if (right.rank !== left.rank) return right.rank - left.rank;
       return left.title.localeCompare(right.title);
     });
