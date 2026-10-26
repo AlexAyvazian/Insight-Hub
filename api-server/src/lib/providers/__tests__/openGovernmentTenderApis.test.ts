@@ -148,6 +148,28 @@ test("a failing UK API reports the error and keeps earlier pages", async () => {
   }
 });
 
+test("Contracts Finder follows the publisher's signed next-page URL", async () => {
+  const realFetch = globalThis.fetch;
+  const urls: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    urls.push(url);
+    const body = urls.length === 1
+      ? { releases: [release()], links: { next: "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search?limit=100&stages=tender&publishedFrom=2026-10-12&publishedTo=2026-10-26T02%3A40%3A15Z&cursor=SIGNED%3D%3D" } }
+      : { releases: [release({ id: "012346-2026" })] };
+    return new Response(JSON.stringify(body), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { fetchContractsFinder } = await import("../openGovernmentTenderApis");
+    await fetchContractsFinder({ dateRange: 14 });
+    assert.equal(urls.length, 2);
+    assert.ok(urls[1]!.includes("publishedTo=2026-10-26T02%3A40%3A15Z"));
+    assert.ok(urls[1]!.includes("cursor=SIGNED%3D%3D"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 function notice(overrides: Record<string, unknown> = {}) {
   return {
     id: "OP00474744",
