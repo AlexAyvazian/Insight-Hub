@@ -46,7 +46,7 @@
     "esbuild-plugin-pino": "^2.3.3",
     "pino-pretty": "^13",
     "playwright": "^1.64.1",
-    "thread-stream": "3.1.0",
+    "thread-stream": "4.2.0",
     "tsx": "catalog:"
   }
 }
