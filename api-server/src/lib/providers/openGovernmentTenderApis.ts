@@ -232,16 +232,17 @@ async function fetchOcdsPortal(portal: OcdsPortal, options: FetchOptions): Promi
   let scanned = 0;
   let pages = 0;
   let cursor: string | undefined;
+  let nextUrl: string | undefined;
+  const base = portal === "findATender" ? FIND_A_TENDER_URL : CONTRACTS_FINDER_URL;
 
   while (pages < OCDS_MAX_PAGES) {
     const params = new URLSearchParams({ limit: String(OCDS_PAGE_LIMIT), stages: "tender" });
     if (portal === "findATender") params.set("updatedFrom", ocdsTimestamp(since));
     else params.set("publishedFrom", since.toISOString().slice(0, 10));
     if (cursor) params.set("cursor", cursor);
-    const base = portal === "findATender" ? FIND_A_TENDER_URL : CONTRACTS_FINDER_URL;
     let pkg: Json;
     try {
-      pkg = await getJson(`${base}?${params.toString()}`, options.signal, `${meta.name} API`);
+      pkg = await getJson(nextUrl ?? `${base}?${params.toString()}`, options.signal, `${meta.name} API`);
     } catch (error) {
       // Keep whatever earlier pages produced; surface the failure.
       errors.push(error instanceof Error ? error.message : String(error));
@@ -256,6 +257,20 @@ async function fetchOcdsPortal(portal: OcdsPortal, options: FetchOptions): Promi
     }
     const next = ocdsNextCursor(pkg);
     if (!next || next === cursor || releases.length === 0) break;
+    const linkedNext = text(asObject(pkg.links)?.next);
+    if (linkedNext?.startsWith("http")) {
+      const link = new URL(linkedNext);
+      const official = new URL(base);
+      if (link.origin !== official.origin || link.pathname !== official.pathname || link.searchParams.get("cursor") !== next) {
+        errors.push(`${meta.name} returned an invalid next-page link`);
+        break;
+      }
+      // The publisher includes a fixed publishedTo in the cursor signature.
+      // Reconstructing the request without it causes Contracts Finder HTTP 400.
+      nextUrl = link.toString();
+    } else {
+      nextUrl = undefined;
+    }
     cursor = next;
   }
 
