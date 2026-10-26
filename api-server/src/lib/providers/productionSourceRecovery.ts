@@ -436,7 +436,7 @@ const INDIANA: StaticRecoveryTenant = {
   platformFamily: "state_html",
   sourceBadge: "Indiana Current Business Opportunities",
   urls: [
-    "https://www.in.gov/idoa/procurement/current-business-opportunities/index.html",
+    "https://www.in.gov/idoa/procurement/current-business-opportunities/",
   ],
 };
 

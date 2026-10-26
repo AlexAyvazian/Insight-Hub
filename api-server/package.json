@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:ai-intelligence": "node --import tsx --test src/lib/search/__tests__/aiIntelligenceStack.test.ts src/lib/search/__tests__/structuredOpportunityJudge.test.ts src/lib/search/__tests__/structuredOpportunityDecision.test.ts",
     "test:semantic-priority": "node --import tsx --test src/lib/search/__tests__/aiIntelligenceStack.test.ts",
-    "test:ingestion": "node --import tsx --test src/lib/__tests__/runtimeHealth.test.ts src/lib/__tests__/limitedProviderPool.test.ts src/lib/ingestion/__tests__/manualIngestion.test.ts src/lib/ingestion/__tests__/dailyScheduler.test.ts src/lib/ingestion/__tests__/opportunityExpiration.test.ts src/lib/ingestion/__tests__/providerRunner.test.ts src/lib/ingestion/__tests__/runtimeHardening.test.ts src/lib/providers/__tests__/freeTierCredentialPool.test.ts src/lib/providers/__tests__/sourcePagination.test.ts src/lib/providers/__tests__/providerOrchestration.test.ts src/lib/providers/__tests__/multiAccountSearchProviders.test.ts src/lib/providers/__tests__/liveVerificationClassification.test.ts src/lib/providers/__tests__/portalDirectory.test.ts src/lib/providers/__tests__/providerRuntimeCompatibility.test.ts src/lib/providers/__tests__/statePlatformAdapters.test.ts src/lib/providers/__tests__/statePlatformOwnership.test.ts src/lib/search/__tests__/aiIntelligenceStack.test.ts src/lib/search/__tests__/structuredOpportunityJudge.test.ts src/lib/search/__tests__/structuredOpportunityDecision.test.ts src/routes/__tests__/opportunityIngestionHandlers.test.ts src/routes/__tests__/opportunityListQuery.test.ts src/routes/__tests__/ingestionApiGeneration.test.ts",
+    "test:ingestion": "node --import tsx --test src/lib/__tests__/runtimeHealth.test.ts src/lib/__tests__/limitedProviderPool.test.ts src/lib/ingestion/__tests__/manualIngestion.test.ts src/lib/ingestion/__tests__/dailyScheduler.test.ts src/lib/ingestion/__tests__/opportunityExpiration.test.ts src/lib/ingestion/__tests__/providerRunner.test.ts src/lib/ingestion/__tests__/runtimeHardening.test.ts src/lib/providers/__tests__/freeTierCredentialPool.test.ts src/lib/providers/__tests__/sourcePagination.test.ts src/lib/providers/__tests__/providerOrchestration.test.ts src/lib/providers/__tests__/multiAccountSearchProviders.test.ts src/lib/providers/__tests__/liveVerificationClassification.test.ts src/lib/providers/__tests__/portalDirectory.test.ts src/lib/providers/__tests__/providerRuntimeCompatibility.test.ts src/lib/providers/__tests__/statePlatformAdapters.test.ts src/lib/providers/__tests__/statePlatformOwnership.test.ts src/lib/search/__tests__/aiIntelligenceStack.test.ts src/lib/search/__tests__/structuredOpportunityJudge.test.ts src/lib/search/__tests__/structuredOpportunityDecision.test.ts src/routes/__tests__/opportunityIngestionHandlers.test.ts src/routes/__tests__/opportunityListQuery.test.ts src/routes/__tests__/ingestionApiGeneration.test.ts src/lib/providers/__tests__/emailEnvelopeDate.test.ts",
     "test:release-c": "node --import tsx --test src/lib/releaseC/__tests__/releaseCFoundations.test.ts src/lib/releaseC/__tests__/opportunitiesModernization.test.ts src/lib/releaseC/__tests__/adaptiveReview.test.ts src/lib/releaseC/__tests__/remoteExtraction.test.ts src/lib/releaseC/__tests__/reviewFindings.test.ts src/lib/releaseC/__tests__/releaseCBenchmark.test.ts src/lib/releaseC/__tests__/releaseCStatus.test.ts src/lib/search/__tests__/procurementAuthenticity.test.ts src/lib/search/__tests__/primaryPurchasedScope.test.ts src/lib/search/__tests__/structuredOpportunityDecision.test.ts src/lib/search/__tests__/structuredReviewPreservation.test.ts src/lib/search/__tests__/structuredOpportunityJudge.test.ts src/lib/releaseC/__tests__/procurementEvidence.test.ts src/lib/releaseC/__tests__/qualificationDecision.test.ts",
     "test:search-quality": "node --import tsx --test src/lib/search/__tests__/hybridFusion.test.ts src/lib/search/__tests__/goldenSet.test.ts src/lib/search/__tests__/occumedPromptContext.test.ts src/lib/search/__tests__/occumedSearchProfile.test.ts src/lib/search/__tests__/decisionReasonStorage.test.ts src/lib/providers/__tests__/tangoTargetedQueries.test.ts src/lib/providers/__tests__/samGovPageVerification.test.ts src/lib/providers/__tests__/canadaBuysPageVerification.test.ts src/lib/providers/__tests__/internationalPublicPortals.test.ts src/lib/providers/__tests__/openGovernmentTenderApis.test.ts src/lib/providers/__tests__/usOpenDataBids.test.ts src/lib/intelligence/__tests__/tangoRecords.test.ts src/lib/providers/__tests__/tangoTextAndGroqModel.test.ts",
     "test:quality": "node --import tsx --test src/lib/__tests__/opportunityQuality.test.ts src/lib/providers/__tests__/samGovQuality.test.ts src/lib/search/__tests__/localSearchPolicy.test.ts src/lib/search/__tests__/testingTypes.test.ts src/lib/search/__tests__/opportunityPrimaryScope.test.ts src/lib/search/__tests__/opportunityTokenMatching.test.ts src/lib/search/__tests__/opportunityScopeFallback.test.ts src/lib/search/__tests__/structuredReviewPreservation.test.ts src/lib/search/__tests__/webDiscoveryTriage.test.ts src/routes/__tests__/opportunityActiveRoute.test.ts src/lib/search/__tests__/profileQueryCoverage.test.ts src/routes/__tests__/opportunityListCompleteness.test.ts src/routes/__tests__/opportunityListQuery.test.ts src/routes/__tests__/opportunitySummaryQuality.test.ts src/lib/ingestion/__tests__/manualIngestion.test.ts src/lib/ingestion/__tests__/manualQueryFilter.test.ts",
@@ -22,30 +22,30 @@
     "test:workspaces": "node --import tsx --test src/lib/intelligence/__tests__/workspaceResults.test.ts src/lib/intelligence/__tests__/govconServiceFit.test.ts src/lib/search/__tests__/opportunityTokenMatching.test.ts src/routes/__tests__/govconSemantics.test.ts"
   },
   "dependencies": {
-    "@types/multer": "^2.1.0",
+    "@types/multer": "^2.3.0",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
     "cookie-parser": "^1.4.7",
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
-    "fflate": "0.8.2",
-    "imapflow": "^1.0.162",
-    "multer": "^2.3.0",
-    "pg": "^8.20.0",
+    "fflate": "0.8.3",
+    "imapflow": "^2.4.3",
+    "multer": "^2.5.0",
+    "pg": "^8.23.1",
     "pino": "^9",
     "pino-http": "^10",
-    "unpdf": "1.8.1"
+    "unpdf": "1.9.0"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "catalog:",
-    "esbuild": "^0.27.3",
+    "esbuild": "^0.28.2",
     "esbuild-plugin-pino": "^2.3.3",
     "pino-pretty": "^13",
-    "playwright": "^1.61.1",
+    "playwright": "^1.64.1",
     "thread-stream": "3.1.0",
     "tsx": "catalog:"
   }
