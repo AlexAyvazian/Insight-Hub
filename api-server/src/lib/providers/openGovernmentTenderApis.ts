@@ -85,7 +85,9 @@ async function getJson(url: string, signal: AbortSignal | undefined, label: stri
 /** The next-page cursor of an OCDS release package, wherever the publisher puts it. */
 export function ocdsNextCursor(pkg: Json): string | undefined {
   const links = asObject(pkg.links);
-  const next = text(links?.next) ?? text(pkg.nextCursor) ?? text(pkg.cursor);
+  // `cursor` is the current page's token, not a guarantee of a next page.
+  // Prefer the explicit nextCursor; some publishers expose it only in links.next.
+  const next = text(pkg.nextCursor) ?? text(links?.next);
   if (!next) return undefined;
   if (/^[A-Za-z0-9=]+$/.test(next)) return next;
   try {

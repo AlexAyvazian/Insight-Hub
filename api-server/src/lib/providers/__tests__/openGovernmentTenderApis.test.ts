@@ -97,6 +97,8 @@ test("OCDS next cursor is read from links.next as a token or a URL", () => {
     "Zm9vYg==",
   );
   assert.equal(ocdsNextCursor({}), undefined);
+  assert.equal(ocdsNextCursor({ cursor: "current-page" }), undefined);
+  assert.equal(ocdsNextCursor({ cursor: "current-page", nextCursor: "next123==" }), "next123==");
 });
 
 test("Find a Tender pages with the cursor and keeps only relevant open tenders", async () => {

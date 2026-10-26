@@ -1,25 +1,6 @@
 import { ReactNode } from "react";
-import {
-  ArrowLeft,
-  CalendarRange,
-  Newspaper,
-  RefreshCcw,
-  Search,
-  Settings,
-} from "lucide-react";
+import { ArrowLeft, Settings } from "lucide-react";
 import { Link, useLocation } from "wouter";
-
-const PORTAL_NAV_ITEMS = [
-  { href: "/portal/opportunities", label: "Opportunities", icon: Search },
-  { href: "/portal/forecasts", label: "Forecasts", icon: CalendarRange },
-  { href: "/portal/recompete-watch", label: "Recompete Watch", icon: RefreshCcw },
-  { href: "/portal/relevant-news", label: "Relevant News", icon: Newspaper },
-  { href: "/portal/company-watch", label: "Company Watch", icon: Search },
-] as const;
-
-export function isPortalNavActive(pathname: string, href: string): boolean {
-  return pathname === href || pathname.startsWith(`${href}/`);
-}
 
 const GlowBackground = () => (
   <>
@@ -181,7 +162,7 @@ export function PortalLayout({ children }: { children: ReactNode }) {
             </Link>
 
             <div className="ml-auto flex min-w-0 items-center gap-2 sm:gap-3">
-              <Link
+              {(pathname === "/portal/opportunities" || pathname === "/portal/settings") && <Link
                 href="/portal/settings"
                 aria-current={pathname === "/portal/settings" ? "page" : undefined}
                 className={`inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-full border px-3 py-2 text-sm transition-colors ${
@@ -192,7 +173,7 @@ export function PortalLayout({ children }: { children: ReactNode }) {
               >
                 <Settings className="h-4 w-4" />
                 <span className="hidden lg:inline">Procurement Operations</span>
-              </Link>
+              </Link>}
               <div
                 aria-hidden="true"
                 className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/10 bg-gradient-to-tr from-primary/40 to-primary/20"
@@ -202,32 +183,6 @@ export function PortalLayout({ children }: { children: ReactNode }) {
             </div>
           </header>
 
-          <nav
-            aria-label="Intelligence workspaces"
-            className="ui-scroll-x border-t border-white/[0.04] px-3 sm:px-4 md:px-8"
-          >
-            <div className="mx-auto flex min-w-max max-w-7xl items-center gap-2 py-2">
-              {PORTAL_NAV_ITEMS.map((item) => {
-                const Icon = item.icon;
-                const active = isPortalNavActive(pathname, item.href);
-                return (
-                  <Link
-                    key={item.href}
-                    href={item.href}
-                    aria-current={active ? "page" : undefined}
-                    className={`inline-flex min-h-11 items-center gap-2 rounded-full border px-5 py-3 text-lg font-semibold leading-snug tracking-[0.01em] transition-colors ${
-                      active
-                        ? "border-primary/40 bg-primary/20 text-white shadow-[0_0_24px_rgba(70,155,255,0.16)]"
-                        : "border-white/10 bg-white/[0.045] text-white/75 hover:border-primary/30 hover:bg-primary/10 hover:text-white"
-                    }`}
-                  >
-                    <Icon className="h-4 w-4 shrink-0" />
-                    <span>{item.label}</span>
-                  </Link>
-                );
-              })}
-            </div>
-          </nav>
         </div>
 
         <main
