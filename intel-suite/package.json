@@ -12,7 +12,7 @@
     "test:quality": "node --import tsx --test src/pages/portal/__tests__/opportunityRunView.test.ts src/pages/portal/__tests__/opportunityGroups.test.ts src/pages/portal/__tests__/opportunityQualityView.test.tsx src/pages/portal/__tests__/opportunityDecisionView.test.tsx src/lib/__tests__/stableFetchHardening.test.ts src/lib/__tests__/settings-form.test.ts"
   },
   "devDependencies": {
-    "@hookform/resolvers": "^5.9.2",
+    "@hookform/resolvers": "^6.0.0",
     "@radix-ui/react-accordion": "^1.3.1",
     "@radix-ui/react-alert-dialog": "^1.2.1",
     "@radix-ui/react-aspect-ratio": "^1.2.0",
