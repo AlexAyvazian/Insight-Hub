@@ -10,7 +10,7 @@ import { promoteDeferredDocuments, registerAttachments, DEFERRED_PRIORITY } from
 import { isSeparateProcurement } from "../../ingestion/pipelineRules";
 import { corpusEvidence } from "../passages";
 import { classifyWithDocumentEvidence } from "../documentEvidence";
-import { changedFields, recordOpportunityVersion, listOpportunityVersions, releaseTag, versionSnapshot } from "../versions";
+import { changedFields, crossSourceTag, recordOpportunityVersion, listOpportunityVersions, releaseTag, versionSnapshot } from "../versions";
 import { documentState } from "../../../routes/opportunity-evidence";
 import { rcPool } from "../db";
 import { ensureReleaseCSchema } from "../schema";
@@ -124,6 +124,19 @@ describe("procurement identity and versions", () => {
     assert.equal(releaseTag(first, contact), "update");
   });
 
+  it("detects a new source's cancellation independently of the previous source", () => {
+    const active = versionSnapshot(notice());
+    const cancelled = { ...active, status: "cancelled" };
+    for (const previous of [cancelled, active, null]) {
+      for (const field of ["status", "type", "title"] as const) {
+        for (const marker of ["cancelled", "withdrawn", "rescinded", "terminated"]) {
+          assert.equal(crossSourceTag(previous, { ...active, [field]: marker }), "cancellation", `${field}: ${marker}`);
+        }
+      }
+      assert.equal(crossSourceTag(previous, { ...active, title: "Revised occupational health solicitation" }), "update");
+    }
+  });
+
   it("records each materially different observation once, with its history", { skip: !hasDb }, async () => {
     await ensureReleaseCSchema();
     const opportunityId = `opp-${run}`;
@@ -148,6 +161,73 @@ describe("procurement identity and versions", () => {
     assert.equal(await observe("samGov", notice()), null, "the first source's unchanged view adds nothing");
     assert.equal(await observe("tango", reworded), null);
     assert.equal(await observe("tango", { ...reworded, responseDeadline: new Date("2026-12-22T17:00:00Z") }), "amendment");
+  });
+
+  it("keeps aggregate portal tenants separate even when native ids and URLs coincide", { skip: !hasDb }, async () => {
+    const opportunityId = `opp-${run}-tenants`;
+    const a = notice({ rawData: { sourceId: "portal-a" } });
+    const b = notice({ description: "The same procurement, described by a second portal.", rawData: { sourceId: "portal-b" } });
+    const observe = (record: NormalizedOpportunity) => recordOpportunityVersion({
+      opportunityId, provider: "publicPortalProviders", providerNativeId: record.externalId, rawRecordId: null, record,
+    });
+    assert.equal(await observe(a), "tender");
+    assert.equal(await observe(b), "update");
+    for (let index = 0; index < 2; index += 1) {
+      assert.equal(await observe(a), null, "alternating portals must not manufacture amendments");
+      assert.equal(await observe(b), null);
+    }
+    assert.equal(await observe({ ...a, responseDeadline: new Date("2026-12-22T17:00:00Z") }), "amendment");
+    assert.equal(await observe(b), null, "the other tenant's baseline must still be used");
+    const versions = await listOpportunityVersions(opportunityId);
+    assert.equal(versions.length, 3);
+    assert.deepEqual(versions[0]!.changedFields, ["deadline"], "lineage metadata is not a content change");
+  });
+
+  it("starts an identified tenant conservatively when legacy history has no source identity", { skip: !hasDb }, async () => {
+    const opportunityId = `opp-${run}-legacy-tenant`;
+    const observe = (record: NormalizedOpportunity) => recordOpportunityVersion({
+      opportunityId, provider: "publicPortalProviders", providerNativeId: record.externalId, rawRecordId: null, record,
+    });
+    assert.equal(await observe(notice()), "tender");
+    await (await rcPool()).query("UPDATE opportunity_versions SET snapshot = snapshot - 'sourceId' WHERE opportunity_id = $1", [opportunityId]);
+    const tenant = notice({ description: "Portal-specific wording.", rawData: { sourceId: "portal-a" } });
+    assert.equal(await observe(tenant), "update", "unknown legacy provenance cannot establish the tenant's baseline");
+    assert.equal(await observe(tenant), null);
+    assert.equal(await observe({ ...tenant, responseDeadline: new Date("2026-12-22T17:00:00Z") }), "amendment");
+  });
+
+  it("continues legacy provider-only history when the provider has no tenant identity", { skip: !hasDb }, async () => {
+    const opportunityId = `opp-${run}-legacy-provider`;
+    const observe = (record: NormalizedOpportunity) => recordOpportunityVersion({
+      opportunityId, provider: "samGov", providerNativeId: record.externalId, rawRecordId: null, record,
+    });
+    assert.equal(await observe(notice()), "tender");
+    await (await rcPool()).query("UPDATE opportunity_versions SET snapshot = snapshot - 'sourceId' WHERE opportunity_id = $1", [opportunityId]);
+    assert.equal(await observe(notice()), null);
+    assert.equal(await observe(notice({ responseDeadline: new Date("2026-12-22T17:00:00Z") })), "amendment");
+  });
+
+  it("records cancellation from a new portal even when another portal was already cancelled", { skip: !hasDb }, async () => {
+    const opportunityId = `opp-${run}-cross-cancelled`;
+    const observe = (record: NormalizedOpportunity) => recordOpportunityVersion({
+      opportunityId, provider: "publicPortalProviders", providerNativeId: record.externalId, rawRecordId: null, record,
+    });
+    assert.equal(await observe(notice({ status: status("cancelled"), rawData: { sourceId: "portal-a" } })), "cancellation");
+    const b = notice({ status: status("withdrawn"), description: "Withdrawal confirmed by the second portal.", rawData: { sourceId: "portal-b" } });
+    assert.equal(await observe(b), "cancellation");
+    assert.equal(await observe(b), null);
+    assert.deepEqual((await listOpportunityVersions(opportunityId)).map((version) => version.releaseTag), ["cancellation", "cancellation"]);
+  });
+
+  it("records a new provider's cancellation after an already-cancelled source", { skip: !hasDb }, async () => {
+    const opportunityId = `opp-${run}-provider-cancelled`;
+    const observe = (provider: string, record: NormalizedOpportunity) => recordOpportunityVersion({
+      opportunityId, provider, providerNativeId: record.externalId, rawRecordId: null, record,
+    });
+    assert.equal(await observe("samGov", notice({ status: status("cancelled") })), "cancellation");
+    const second = notice({ status: status("cancelled"), description: "Cancellation confirmed independently." });
+    assert.equal(await observe("tango", second), "cancellation", "the previous provider's cancellation must not suppress this evidence");
+    assert.equal(await observe("tango", second), null);
   });
 });
 

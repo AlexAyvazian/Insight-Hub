@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
+import { settingsFormSchema as formSchema } from "@/lib/settings-form";
 import { 
   ShieldAlert, 
   Save, 
@@ -348,12 +349,6 @@ function IntelKeyCard({
   );
 }
 
-const formSchema = z.object({
-  organizationName: z.string().min(2, "Organization name is required").optional().or(z.literal("")),
-  defaultKeywords: z.string().optional(),
-  defaultDateRange: z.coerce.number().min(1).max(365).optional(),
-});
-
 export default function SettingsPage() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -380,7 +375,7 @@ export default function SettingsPage() {
     }
   });
 
-  const form = useForm<z.infer<typeof formSchema>>({
+  const form = useForm<z.input<typeof formSchema>, unknown, z.output<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       organizationName: "",

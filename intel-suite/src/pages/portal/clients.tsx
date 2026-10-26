@@ -8,9 +8,10 @@ import {
   Briefcase, Server, TrendingUp, TrendingDown, Minus,
   ArrowLeft, Calendar, Loader2, DollarSign, Scale, ShieldAlert,
   AlertTriangle, CheckCircle, Lock, Crown, Users, Package,
-  MessageSquare, Target, Linkedin, Trash2, Filter, Clock,
+  MessageSquare, Target, Trash2, Filter, Clock,
   BarChart3,
 } from "lucide-react";
+import { FaLinkedinIn as Linkedin } from "react-icons/fa";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,

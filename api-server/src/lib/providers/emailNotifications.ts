@@ -37,6 +37,12 @@ interface EmailMessage {
 const MAX_EMAIL_SOURCE_BYTES = 64 * 1024;
 const MAX_EMAIL_MESSAGES = 50;
 
+// IMAP envelope dates can be Date objects or raw date strings in ImapFlow 2.
+export function emailEnvelopeDate(value: Date | string | undefined, fallback = new Date()): Date {
+  const parsed = value instanceof Date ? value : value ? new Date(value) : fallback;
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed;
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
 
@@ -165,7 +171,7 @@ export class EmailNotificationProvider implements DataSourceProvider {
           from: message.envelope.from?.[0]?.address || message.envelope.sender?.[0]?.address || "",
           subject: message.envelope.subject || "",
           body,
-          date: message.envelope.date || new Date(),
+          date: emailEnvelopeDate(message.envelope.date),
           messageId: message.envelope.messageId || `imap-${message.uid}`,
         });
       }
