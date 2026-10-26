@@ -34,7 +34,7 @@
     "multer": "^2.5.0",
     "pg": "^8.23.1",
     "pino": "^9",
-    "pino-http": "^10",
+    "pino-http": "^11",
     "unpdf": "1.9.0"
   },
   "devDependencies": {
